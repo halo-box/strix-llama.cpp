@@ -10,7 +10,7 @@ namespace ggml_fork { // hooks: the fork code is namespaced, see hooks/apps/READ
 #include "ggml-cpp.h"
 #include "llama.h"
 #include "log.h"
-#include "llama-ext.h" // the fork resident NextN hand-over (C++ API) // hooks: the fork libllama header
+#include "../../llama/fork-src/llama-ext.h" // the fork resident NextN hand-over (C++ API) // hooks: the fork libllama header
 #include "ngram-cache.h"
 #include "ngram-map.h"
 #include "ngram-mod.h"

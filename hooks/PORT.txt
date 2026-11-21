@@ -74,10 +74,10 @@ adapted  ggml/src/CMakeLists.txt:204         exl3.c in ggml-base with GGML_EXL3:
 adapted  ggml/src/CMakeLists.txt:202         rocmfp4.c and rocmfpx.c in ggml-base: hooks/ggml/ggml-hooks.cmake
 adapted  ggml/CMakeLists.txt:190             GGML_TRELLIS and GGML_EXL3: GGML_EXL3 is declared by hooks/hooks.cmake; there is no GGML_TRELLIS, the trellis types always have their CPU kernels and the backend wrapper refuses them where no kernel exists
 adapted  ggml/src/CMakeLists.txt:226         GGML_USE_TRELLIS: same, no option
-pending  ggml/src/CMakeLists.txt:234         the OpenMP installer of LLVM 22 on Windows: upstream sets these variables unconditionally and the hooks are off with MSVC; with the build and CI stage
-pending  ggml/src/CMakeLists.txt:236         same
-pending  ggml/src/CMakeLists.txt:245         same
-pending  ggml/src/CMakeLists.txt:249         same
+restored ggml/src/CMakeLists.txt:234         the OpenMP fetch keeps LLVM 20.1.8; the fork LLVM 22 branch is in hooks/cmake/openmp-fetch-llvm22.cmake (not built)
+restored ggml/src/CMakeLists.txt:236         the OpenMP fetch keeps LLVM 20.1.8; the fork LLVM 22 branch is in hooks/cmake/openmp-fetch-llvm22.cmake (not built)
+restored ggml/src/CMakeLists.txt:245         the OpenMP fetch keeps LLVM 20.1.8; the fork LLVM 22 branch is in hooks/cmake/openmp-fetch-llvm22.cmake (not built)
+restored ggml/src/CMakeLists.txt:249         the OpenMP fetch keeps LLVM 20.1.8; the fork LLVM 22 branch is in hooks/cmake/openmp-fetch-llvm22.cmake (not built)
 
 # FA hints, selected keys, DSV4 hc_pre f16 (hooks/ggml/src/ggml-fork-ops.c, hooks/ggml/kernels/cpu/fork-fa*.{inc,cpp})
 adapted  ggml/include/ggml.h:285             GGML_HINT_EXACT_BATCH = 2: a define in ggml-hook-points.h
@@ -1294,3 +1294,321 @@ variant  tools/server/server-schema.cpp:397  fork_tools: the fork version in hoo
 variant  tools/server/server-schema.cpp:523  fork_tools: the fork version in hooks/apps, upstream by default
 variant  tools/server/server-slot-sched.cpp:212  fork_tools: the fork version in hooks/apps, upstream by default
 variant  tools/server/tests/unit/test_kv_keep_only_active.py:13  fork_tools: the fork version in hooks/apps, upstream by default
+
+# tests: hooks/apps/fork-tests (test-<name>-fork, cmake --build build --target hooks-fork-tests)
+adapted  tests/CMakeLists.txt:171  the fork tests: built as test-<name>-fork by hooks/apps/fork-apps.cmake (the codec and EXL3 tests by hooks/ggml/ggml-hooks.cmake)
+adapted  tests/CMakeLists.txt:192  the fork tests: built as test-<name>-fork by hooks/apps/fork-apps.cmake (the codec and EXL3 tests by hooks/ggml/ggml-hooks.cmake)
+adapted  tests/CMakeLists.txt:232  the fork tests: built as test-<name>-fork by hooks/apps/fork-apps.cmake (the codec and EXL3 tests by hooks/ggml/ggml-hooks.cmake)
+adapted  tests/CMakeLists.txt:314  the fork tests: built as test-<name>-fork by hooks/apps/fork-apps.cmake (the codec and EXL3 tests by hooks/ggml/ggml-hooks.cmake)
+adapted  tests/CMakeLists.txt:391  the fork tests: built as test-<name>-fork by hooks/apps/fork-apps.cmake (the codec and EXL3 tests by hooks/ggml/ggml-hooks.cmake)
+adapted  tests/CMakeLists.txt:392  the fork tests: built as test-<name>-fork by hooks/apps/fork-apps.cmake (the codec and EXL3 tests by hooks/ggml/ggml-hooks.cmake)
+adapted  tests/CMakeLists.txt:435  the fork tests: built as test-<name>-fork by hooks/apps/fork-apps.cmake (the codec and EXL3 tests by hooks/ggml/ggml-hooks.cmake)
+adapted  tests/test-batch-alloc.cpp:9  the ../src includes: the fork libllama headers (hooks/llama/fork-src)
+adapted  tests/test-mtp-draft-vocab.cpp:0  the ../src includes: the fork libllama headers (hooks/llama/fork-src)
+adapted  tests/test-ple-disk.cpp:0  the ../src includes: the fork libllama headers (hooks/llama/fork-src)
+adapted  tests/test-qsa-fast.cpp:0  the ../src includes: the fork libllama headers (hooks/llama/fork-src)
+adapted  tests/test-qsa-prefix.cpp:0  the ../src includes: the fork libllama headers (hooks/llama/fork-src)
+adapted  tests/test-qsa-recover.cpp:0  the ../src includes: the fork libllama headers (hooks/llama/fork-src)
+
+# the files that are not built here: hooks/python (runs as is), hooks/fork-files (kept, not active)
+variant  .devops/rocm.Dockerfile:1  the fork version in hooks/fork-files/.devops/rocm.Dockerfile, not active; the upstream file stays
+variant  .devops/rocm.Dockerfile:4  the fork version in hooks/fork-files/.devops/rocm.Dockerfile, not active; the upstream file stays
+variant  .devops/rocm.Dockerfile:8  the fork version in hooks/fork-files/.devops/rocm.Dockerfile, not active; the upstream file stays
+variant  .github/ISSUE_TEMPLATE/010-bug-compilation.yml:16  the fork version in hooks/fork-files/.github/ISSUE_TEMPLATE/010-bug-compilation.yml, not active; the upstream file stays
+variant  .github/ISSUE_TEMPLATE/011-bug-results.yml:16  the fork version in hooks/fork-files/.github/ISSUE_TEMPLATE/011-bug-results.yml, not active; the upstream file stays
+variant  .github/ISSUE_TEMPLATE/019-bug-misc.yml:14  the fork version in hooks/fork-files/.github/ISSUE_TEMPLATE/019-bug-misc.yml, not active; the upstream file stays
+variant  .github/ISSUE_TEMPLATE/020-enhancement.yml:11  the fork version in hooks/fork-files/.github/ISSUE_TEMPLATE/020-enhancement.yml, not active; the upstream file stays
+variant  .github/ISSUE_TEMPLATE/030-research.yml:11  the fork version in hooks/fork-files/.github/ISSUE_TEMPLATE/030-research.yml, not active; the upstream file stays
+variant  .github/ISSUE_TEMPLATE/040-refactor.yml:12  the fork version in hooks/fork-files/.github/ISSUE_TEMPLATE/040-refactor.yml, not active; the upstream file stays
+variant  .github/ISSUE_TEMPLATE/config.yml:1  the fork version in hooks/fork-files/.github/ISSUE_TEMPLATE/config.yml, not active; the upstream file stays
+variant  .github/pull_request_template.md:13  the fork version in hooks/fork-files/.github/pull_request_template.md, not active; the upstream file stays
+variant  .github/pull_request_template.md:16  the fork version in hooks/fork-files/.github/pull_request_template.md, not active; the upstream file stays
+variant  .github/workflows/build-3rd-party.yml:1  the fork version in hooks/fork-files/.github/workflows/build-3rd-party.yml, not active; the upstream file stays
+variant  .github/workflows/build-and-test-snapdragon.yml:1  the fork version in hooks/fork-files/.github/workflows/build-and-test-snapdragon.yml, not active; the upstream file stays
+variant  .github/workflows/build-android.yml:1  the fork version in hooks/fork-files/.github/workflows/build-android.yml, not active; the upstream file stays
+variant  .github/workflows/build-apple.yml:1  the fork version in hooks/fork-files/.github/workflows/build-apple.yml, not active; the upstream file stays
+variant  .github/workflows/build-cache.yml:1  the fork version in hooks/fork-files/.github/workflows/build-cache.yml, not active; the upstream file stays
+variant  .github/workflows/build-cann.yml:1  the fork version in hooks/fork-files/.github/workflows/build-cann.yml, not active; the upstream file stays
+variant  .github/workflows/build-cross.yml:1  the fork version in hooks/fork-files/.github/workflows/build-cross.yml, not active; the upstream file stays
+variant  .github/workflows/build-cuda-ubuntu.yml:1  the fork version in hooks/fork-files/.github/workflows/build-cuda-ubuntu.yml, not active; the upstream file stays
+variant  .github/workflows/build-cuda-windows.yml:1  the fork version in hooks/fork-files/.github/workflows/build-cuda-windows.yml, not active; the upstream file stays
+variant  .github/workflows/build-ibm.yml:1  the fork version in hooks/fork-files/.github/workflows/build-ibm.yml, not active; the upstream file stays
+variant  .github/workflows/build-msys.yml:1  the fork version in hooks/fork-files/.github/workflows/build-msys.yml, not active; the upstream file stays
+variant  .github/workflows/build-opencl.yml:1  the fork version in hooks/fork-files/.github/workflows/build-opencl.yml, not active; the upstream file stays
+variant  .github/workflows/build-openvino.yml:1  the fork version in hooks/fork-files/.github/workflows/build-openvino.yml, not active; the upstream file stays
+variant  .github/workflows/build-riscv.yml:1  the fork version in hooks/fork-files/.github/workflows/build-riscv.yml, not active; the upstream file stays
+variant  .github/workflows/build-sycl.yml:1  the fork version in hooks/fork-files/.github/workflows/build-sycl.yml, not active; the upstream file stays
+variant  .github/workflows/build-virtgpu.yml:1  the fork version in hooks/fork-files/.github/workflows/build-virtgpu.yml, not active; the upstream file stays
+variant  .github/workflows/build-wasm.yml:1  the fork version in hooks/fork-files/.github/workflows/build-wasm.yml, not active; the upstream file stays
+variant  .github/workflows/build-webgpu.yml:1  the fork version in hooks/fork-files/.github/workflows/build-webgpu.yml, not active; the upstream file stays
+variant  .github/workflows/ci-self-hosted-cuda.yml:1  the fork version in hooks/fork-files/.github/workflows/ci-self-hosted-cuda.yml, not active; the upstream file stays
+variant  .github/workflows/ci-self-hosted-kleidiai.yml:1  the fork version in hooks/fork-files/.github/workflows/ci-self-hosted-kleidiai.yml, not active; the upstream file stays
+variant  .github/workflows/ci-self-hosted-metal.yml:1  the fork version in hooks/fork-files/.github/workflows/ci-self-hosted-metal.yml, not active; the upstream file stays
+variant  .github/workflows/ci-self-hosted-openvino.yml:1  the fork version in hooks/fork-files/.github/workflows/ci-self-hosted-openvino.yml, not active; the upstream file stays
+variant  .github/workflows/ci-self-hosted-webgpu.yml:1  the fork version in hooks/fork-files/.github/workflows/ci-self-hosted-webgpu.yml, not active; the upstream file stays
+variant  .github/workflows/docker.yml:94  the fork version in hooks/fork-files/.github/workflows/docker.yml, not active; the upstream file stays
+variant  .github/workflows/docker.yml:102  the fork version in hooks/fork-files/.github/workflows/docker.yml, not active; the upstream file stays
+variant  .github/workflows/docker.yml:118  the fork version in hooks/fork-files/.github/workflows/docker.yml, not active; the upstream file stays
+variant  .github/workflows/hip-quality-check.yml:14  the fork version in hooks/fork-files/.github/workflows/hip-quality-check.yml, not active; the upstream file stays
+variant  .github/workflows/hip-quality-check.yml:25  the fork version in hooks/fork-files/.github/workflows/hip-quality-check.yml, not active; the upstream file stays
+variant  .github/workflows/hip-quality-check.yml:46  the fork version in hooks/fork-files/.github/workflows/hip-quality-check.yml, not active; the upstream file stays
+variant  .github/workflows/hip-quality-check.yml:55  the fork version in hooks/fork-files/.github/workflows/hip-quality-check.yml, not active; the upstream file stays
+variant  .github/workflows/hip-quality-check.yml:69  the fork version in hooks/fork-files/.github/workflows/hip-quality-check.yml, not active; the upstream file stays
+variant  .github/workflows/hip-quality-check.yml:78  the fork version in hooks/fork-files/.github/workflows/hip-quality-check.yml, not active; the upstream file stays
+variant  .github/workflows/hip-quality-check.yml:86  the fork version in hooks/fork-files/.github/workflows/hip-quality-check.yml, not active; the upstream file stays
+variant  .github/workflows/hip-quality-check.yml:91  the fork version in hooks/fork-files/.github/workflows/hip-quality-check.yml, not active; the upstream file stays
+variant  .github/workflows/hip-quality-check.yml:98  the fork version in hooks/fork-files/.github/workflows/hip-quality-check.yml, not active; the upstream file stays
+variant  .github/workflows/hip-quality-check.yml:106  the fork version in hooks/fork-files/.github/workflows/hip-quality-check.yml, not active; the upstream file stays
+variant  .github/workflows/make-release.yml:161  the fork version in hooks/fork-files/.github/workflows/make-release.yml, not active; the upstream file stays
+variant  .github/workflows/models-check.yml:52  the fork version in hooks/fork-files/.github/workflows/models-check.yml, not active; the upstream file stays
+variant  .github/workflows/models-check.yml:170  the fork version in hooks/fork-files/.github/workflows/models-check.yml, not active; the upstream file stays
+variant  .github/workflows/models-check.yml:380  the fork version in hooks/fork-files/.github/workflows/models-check.yml, not active; the upstream file stays
+variant  .github/workflows/release-publish.yml:1  the fork version in hooks/fork-files/.github/workflows/release-publish.yml, not active; the upstream file stays
+variant  .github/workflows/release.yml:1  the fork version in hooks/fork-files/.github/workflows/release.yml, not active; the upstream file stays
+variant  .github/workflows/server-self-hosted.yml:1  the fork version in hooks/fork-files/.github/workflows/server-self-hosted.yml, not active; the upstream file stays
+variant  AGENTS.md:1  the fork version in hooks/fork-files/AGENTS.md, not active; the upstream file stays
+variant  AGENTS.md:5  the fork version in hooks/fork-files/AGENTS.md, not active; the upstream file stays
+variant  AGENTS.md:9  the fork version in hooks/fork-files/AGENTS.md, not active; the upstream file stays
+variant  AGENTS.md:14  the fork version in hooks/fork-files/AGENTS.md, not active; the upstream file stays
+variant  AGENTS.md:36  the fork version in hooks/fork-files/AGENTS.md, not active; the upstream file stays
+variant  AGENTS.md:42  the fork version in hooks/fork-files/AGENTS.md, not active; the upstream file stays
+variant  AGENTS.md:44  the fork version in hooks/fork-files/AGENTS.md, not active; the upstream file stays
+variant  AGENTS.md:46  the fork version in hooks/fork-files/AGENTS.md, not active; the upstream file stays
+variant  AGENTS.md:60  the fork version in hooks/fork-files/AGENTS.md, not active; the upstream file stays
+variant  AGENTS.md:70  the fork version in hooks/fork-files/AGENTS.md, not active; the upstream file stays
+variant  AGENTS.md:72  the fork version in hooks/fork-files/AGENTS.md, not active; the upstream file stays
+variant  AGENTS.md:74  the fork version in hooks/fork-files/AGENTS.md, not active; the upstream file stays
+variant  AGENTS.md:76  the fork version in hooks/fork-files/AGENTS.md, not active; the upstream file stays
+variant  AGENTS.md:83  the fork version in hooks/fork-files/AGENTS.md, not active; the upstream file stays
+variant  AGENTS.md:85  the fork version in hooks/fork-files/AGENTS.md, not active; the upstream file stays
+variant  AGENTS.md:88  the fork version in hooks/fork-files/AGENTS.md, not active; the upstream file stays
+variant  AGENTS.md:91  the fork version in hooks/fork-files/AGENTS.md, not active; the upstream file stays
+variant  AGENTS.md:93  the fork version in hooks/fork-files/AGENTS.md, not active; the upstream file stays
+variant  AGENTS.md:95  the fork version in hooks/fork-files/AGENTS.md, not active; the upstream file stays
+variant  AGENTS.md:101  the fork version in hooks/fork-files/AGENTS.md, not active; the upstream file stays
+variant  AGENTS.md:103  the fork version in hooks/fork-files/AGENTS.md, not active; the upstream file stays
+variant  AGENTS.md:105  the fork version in hooks/fork-files/AGENTS.md, not active; the upstream file stays
+variant  AGENTS.md:107  the fork version in hooks/fork-files/AGENTS.md, not active; the upstream file stays
+variant  AGENTS.md:110  the fork version in hooks/fork-files/AGENTS.md, not active; the upstream file stays
+variant  AGENTS.md:169  the fork version in hooks/fork-files/AGENTS.md, not active; the upstream file stays
+variant  AGENTS.md:171  the fork version in hooks/fork-files/AGENTS.md, not active; the upstream file stays
+variant  AGENTS.md:178  the fork version in hooks/fork-files/AGENTS.md, not active; the upstream file stays
+variant  AGENTS.md:180  the fork version in hooks/fork-files/AGENTS.md, not active; the upstream file stays
+variant  AGENTS.md:193  the fork version in hooks/fork-files/AGENTS.md, not active; the upstream file stays
+variant  AGENTS.md:198  the fork version in hooks/fork-files/AGENTS.md, not active; the upstream file stays
+variant  AGENTS.md:200  the fork version in hooks/fork-files/AGENTS.md, not active; the upstream file stays
+variant  AGENTS.md:203  the fork version in hooks/fork-files/AGENTS.md, not active; the upstream file stays
+variant  AGENTS.md:208  the fork version in hooks/fork-files/AGENTS.md, not active; the upstream file stays
+variant  AGENTS.md:215  the fork version in hooks/fork-files/AGENTS.md, not active; the upstream file stays
+variant  AGENTS.md:220  the fork version in hooks/fork-files/AGENTS.md, not active; the upstream file stays
+variant  AGENTS.md:222  the fork version in hooks/fork-files/AGENTS.md, not active; the upstream file stays
+variant  AGENTS.md:225  the fork version in hooks/fork-files/AGENTS.md, not active; the upstream file stays
+variant  AGENTS.md:232  the fork version in hooks/fork-files/AGENTS.md, not active; the upstream file stays
+variant  AGENTS.md:234  the fork version in hooks/fork-files/AGENTS.md, not active; the upstream file stays
+variant  AGENTS.md:236  the fork version in hooks/fork-files/AGENTS.md, not active; the upstream file stays
+variant  AGENTS.md:240  the fork version in hooks/fork-files/AGENTS.md, not active; the upstream file stays
+variant  CONTRIBUTING.md:7  the fork version in hooks/fork-files/CONTRIBUTING.md, not active; the upstream file stays
+variant  CONTRIBUTING.md:13  the fork version in hooks/fork-files/CONTRIBUTING.md, not active; the upstream file stays
+variant  CONTRIBUTING.md:15  the fork version in hooks/fork-files/CONTRIBUTING.md, not active; the upstream file stays
+variant  CONTRIBUTING.md:19  the fork version in hooks/fork-files/CONTRIBUTING.md, not active; the upstream file stays
+variant  CONTRIBUTING.md:21  the fork version in hooks/fork-files/CONTRIBUTING.md, not active; the upstream file stays
+variant  CONTRIBUTING.md:23  the fork version in hooks/fork-files/CONTRIBUTING.md, not active; the upstream file stays
+variant  CONTRIBUTING.md:29  the fork version in hooks/fork-files/CONTRIBUTING.md, not active; the upstream file stays
+variant  CONTRIBUTING.md:31  the fork version in hooks/fork-files/CONTRIBUTING.md, not active; the upstream file stays
+variant  CONTRIBUTING.md:45  the fork version in hooks/fork-files/CONTRIBUTING.md, not active; the upstream file stays
+variant  CONTRIBUTING.md:56  the fork version in hooks/fork-files/CONTRIBUTING.md, not active; the upstream file stays
+variant  CONTRIBUTING.md:58  the fork version in hooks/fork-files/CONTRIBUTING.md, not active; the upstream file stays
+variant  CONTRIBUTING.md:74  the fork version in hooks/fork-files/CONTRIBUTING.md, not active; the upstream file stays
+variant  CONTRIBUTING.md:82  the fork version in hooks/fork-files/CONTRIBUTING.md, not active; the upstream file stays
+variant  CONTRIBUTING.md:86  the fork version in hooks/fork-files/CONTRIBUTING.md, not active; the upstream file stays
+variant  CONTRIBUTING.md:91  the fork version in hooks/fork-files/CONTRIBUTING.md, not active; the upstream file stays
+variant  CONTRIBUTING.md:95  the fork version in hooks/fork-files/CONTRIBUTING.md, not active; the upstream file stays
+variant  CONTRIBUTING.md:204  the fork version in hooks/fork-files/CONTRIBUTING.md, not active; the upstream file stays
+variant  CONTRIBUTING.md:219  the fork version in hooks/fork-files/CONTRIBUTING.md, not active; the upstream file stays
+variant  README.md:1  the fork version in hooks/fork-files/README.md, not active; the upstream file stays
+variant  README.md:3  the fork version in hooks/fork-files/README.md, not active; the upstream file stays
+variant  README.md:5  the fork version in hooks/fork-files/README.md, not active; the upstream file stays
+variant  README.md:10  the fork version in hooks/fork-files/README.md, not active; the upstream file stays
+variant  README.md:16  the fork version in hooks/fork-files/README.md, not active; the upstream file stays
+variant  README.md:18  the fork version in hooks/fork-files/README.md, not active; the upstream file stays
+variant  README.md:20  the fork version in hooks/fork-files/README.md, not active; the upstream file stays
+variant  README.md:22  the fork version in hooks/fork-files/README.md, not active; the upstream file stays
+variant  README.md:24  the fork version in hooks/fork-files/README.md, not active; the upstream file stays
+variant  README.md:28  the fork version in hooks/fork-files/README.md, not active; the upstream file stays
+variant  README.md:30  the fork version in hooks/fork-files/README.md, not active; the upstream file stays
+variant  README.md:34  the fork version in hooks/fork-files/README.md, not active; the upstream file stays
+variant  README.md:38  the fork version in hooks/fork-files/README.md, not active; the upstream file stays
+variant  README.md:43  the fork version in hooks/fork-files/README.md, not active; the upstream file stays
+variant  README.md:46  the fork version in hooks/fork-files/README.md, not active; the upstream file stays
+variant  README.md:49  the fork version in hooks/fork-files/README.md, not active; the upstream file stays
+variant  README.md:53  the fork version in hooks/fork-files/README.md, not active; the upstream file stays
+variant  README.md:80  the fork version in hooks/fork-files/README.md, not active; the upstream file stays
+variant  README.md:84  the fork version in hooks/fork-files/README.md, not active; the upstream file stays
+variant  README.md:87  the fork version in hooks/fork-files/README.md, not active; the upstream file stays
+variant  README.md:91  the fork version in hooks/fork-files/README.md, not active; the upstream file stays
+variant  conversion/qwen.py:322  the fork version in hooks/python/conversion/qwen.py (python3 hooks/python/convert_hf_to_gguf.py), upstream by default
+variant  conversion/qwen.py:361  the fork version in hooks/python/conversion/qwen.py (python3 hooks/python/convert_hf_to_gguf.py), upstream by default
+variant  conversion/qwen.py:426  the fork version in hooks/python/conversion/qwen.py (python3 hooks/python/convert_hf_to_gguf.py), upstream by default
+variant  conversion/qwen4exp.py:3  the fork version in hooks/python/conversion/qwen4exp.py (python3 hooks/python/convert_hf_to_gguf.py), upstream by default
+variant  conversion/qwen4exp.py:11  the fork version in hooks/python/conversion/qwen4exp.py (python3 hooks/python/convert_hf_to_gguf.py), upstream by default
+variant  conversion/qwen4exp.py:69  the fork version in hooks/python/conversion/qwen4exp.py (python3 hooks/python/convert_hf_to_gguf.py), upstream by default
+variant  conversion/qwen4exp.py:76  the fork version in hooks/python/conversion/qwen4exp.py (python3 hooks/python/convert_hf_to_gguf.py), upstream by default
+variant  conversion/qwen4exp.py:99  the fork version in hooks/python/conversion/qwen4exp.py (python3 hooks/python/convert_hf_to_gguf.py), upstream by default
+variant  conversion/qwen4exp.py:122  the fork version in hooks/python/conversion/qwen4exp.py (python3 hooks/python/convert_hf_to_gguf.py), upstream by default
+variant  conversion/qwen4exp.py:146  the fork version in hooks/python/conversion/qwen4exp.py (python3 hooks/python/convert_hf_to_gguf.py), upstream by default
+variant  conversion/qwen4exp.py:149  the fork version in hooks/python/conversion/qwen4exp.py (python3 hooks/python/convert_hf_to_gguf.py), upstream by default
+variant  conversion/qwen4exp.py:152  the fork version in hooks/python/conversion/qwen4exp.py (python3 hooks/python/convert_hf_to_gguf.py), upstream by default
+variant  conversion/qwen4exp.py:155  the fork version in hooks/python/conversion/qwen4exp.py (python3 hooks/python/convert_hf_to_gguf.py), upstream by default
+variant  conversion/qwen4exp.py:162  the fork version in hooks/python/conversion/qwen4exp.py (python3 hooks/python/convert_hf_to_gguf.py), upstream by default
+variant  conversion/qwen4exp.py:164  the fork version in hooks/python/conversion/qwen4exp.py (python3 hooks/python/convert_hf_to_gguf.py), upstream by default
+variant  conversion/qwen4exp.py:170  the fork version in hooks/python/conversion/qwen4exp.py (python3 hooks/python/convert_hf_to_gguf.py), upstream by default
+variant  conversion/qwen4exp.py:177  the fork version in hooks/python/conversion/qwen4exp.py (python3 hooks/python/convert_hf_to_gguf.py), upstream by default
+variant  conversion/qwen4exp.py:181  the fork version in hooks/python/conversion/qwen4exp.py (python3 hooks/python/convert_hf_to_gguf.py), upstream by default
+variant  conversion/qwen4exp.py:186  the fork version in hooks/python/conversion/qwen4exp.py (python3 hooks/python/convert_hf_to_gguf.py), upstream by default
+variant  docs/build.md:393  the fork version in hooks/fork-files/docs/build.md, not active; the upstream file stays
+variant  docs/build.md:396  the fork version in hooks/fork-files/docs/build.md, not active; the upstream file stays
+variant  docs/build.md:413  the fork version in hooks/fork-files/docs/build.md, not active; the upstream file stays
+variant  docs/build.md:417  the fork version in hooks/fork-files/docs/build.md, not active; the upstream file stays
+variant  docs/build.md:420  the fork version in hooks/fork-files/docs/build.md, not active; the upstream file stays
+variant  docs/build.md:423  the fork version in hooks/fork-files/docs/build.md, not active; the upstream file stays
+variant  docs/build.md:428  the fork version in hooks/fork-files/docs/build.md, not active; the upstream file stays
+variant  docs/models.md:42  the fork version in hooks/fork-files/docs/models.md, not active; the upstream file stays
+variant  docs/speculative.md:485  the fork version in hooks/fork-files/docs/speculative.md, not active; the upstream file stays
+variant  gguf-py/gguf/gguf_writer.py:48  the fork version in hooks/python/gguf-py/gguf/gguf_writer.py (python3 hooks/python/convert_hf_to_gguf.py), upstream by default
+variant  gguf-py/gguf/gguf_writer.py:147  the fork version in hooks/python/gguf-py/gguf/gguf_writer.py (python3 hooks/python/convert_hf_to_gguf.py), upstream by default
+variant  gguf-py/gguf/gguf_writer.py:384  the fork version in hooks/python/gguf-py/gguf/gguf_writer.py (python3 hooks/python/convert_hf_to_gguf.py), upstream by default
+variant  scripts/hip/gcn-cdna-vgpr-check.py:3  the fork version in hooks/fork-files/scripts/hip/gcn-cdna-vgpr-check.py, not active; the upstream file stays
+variant  scripts/hip/gcn-cdna-vgpr-check.py:7  the fork version in hooks/fork-files/scripts/hip/gcn-cdna-vgpr-check.py, not active; the upstream file stays
+variant  scripts/hip/gcn-cdna-vgpr-check.py:67  the fork version in hooks/fork-files/scripts/hip/gcn-cdna-vgpr-check.py, not active; the upstream file stays
+variant  scripts/hip/gcn-cdna-vgpr-check.py:71  the fork version in hooks/fork-files/scripts/hip/gcn-cdna-vgpr-check.py, not active; the upstream file stays
+variant  scripts/ui-assets.cmake:44  the fork version in hooks/fork-files/scripts/ui-assets.cmake, not active; the upstream file stays
+variant  scripts/ui-assets.cmake:101  the fork version in hooks/fork-files/scripts/ui-assets.cmake, not active; the upstream file stays
+variant  scripts/ui-assets.cmake:103  the fork version in hooks/fork-files/scripts/ui-assets.cmake, not active; the upstream file stays
+variant  scripts/ui-assets.cmake:128  the fork version in hooks/fork-files/scripts/ui-assets.cmake, not active; the upstream file stays
+variant  scripts/ui-assets.cmake:131  the fork version in hooks/fork-files/scripts/ui-assets.cmake, not active; the upstream file stays
+variant  tests/test-alloc.cpp:384  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-arg-parser.cpp:275  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-backend-ops.cpp:84  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-backend-ops.cpp:98  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-backend-ops.cpp:103  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-backend-ops.cpp:1384  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-backend-ops.cpp:1520  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-backend-ops.cpp:1628  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-backend-ops.cpp:4062  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-backend-ops.cpp:4072  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-backend-ops.cpp:4078  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-backend-ops.cpp:4084  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-backend-ops.cpp:4091  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-backend-ops.cpp:4097  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-backend-ops.cpp:4115  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-backend-ops.cpp:4118  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-backend-ops.cpp:4122  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-backend-ops.cpp:4125  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-backend-ops.cpp:4127  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-backend-ops.cpp:4137  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-backend-ops.cpp:4154  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-backend-ops.cpp:4162  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-backend-ops.cpp:4165  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-backend-ops.cpp:4170  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-backend-ops.cpp:4174  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-backend-ops.cpp:4176  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-backend-ops.cpp:4181  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-backend-ops.cpp:4186  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-backend-ops.cpp:4190  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-backend-ops.cpp:4701  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-backend-ops.cpp:4708  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-backend-ops.cpp:4761  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-backend-ops.cpp:4765  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-backend-ops.cpp:4769  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-backend-ops.cpp:4772  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-backend-ops.cpp:5237  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-backend-ops.cpp:5242  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-backend-ops.cpp:5244  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-backend-ops.cpp:5281  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-backend-ops.cpp:5853  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-backend-ops.cpp:5969  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-backend-ops.cpp:5971  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-backend-ops.cpp:5978  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-backend-ops.cpp:5986  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-backend-ops.cpp:5992  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-backend-ops.cpp:6004  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-backend-ops.cpp:7385  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-backend-ops.cpp:7399  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-backend-ops.cpp:7582  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-backend-ops.cpp:7600  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-backend-ops.cpp:7661  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-backend-ops.cpp:7666  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-backend-ops.cpp:7672  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-backend-ops.cpp:7676  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-backend-ops.cpp:7679  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-backend-ops.cpp:7687  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-backend-ops.cpp:7706  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-backend-ops.cpp:7712  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-backend-ops.cpp:7716  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-backend-ops.cpp:7723  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-backend-ops.cpp:7725  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-backend-ops.cpp:7730  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-backend-ops.cpp:7739  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-backend-ops.cpp:7795  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-backend-ops.cpp:7933  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-backend-ops.cpp:7939  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-backend-ops.cpp:7944  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-backend-ops.cpp:7949  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-backend-ops.cpp:7953  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-backend-ops.cpp:7956  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-backend-ops.cpp:7960  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-backend-ops.cpp:7963  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-backend-ops.cpp:7965  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-backend-ops.cpp:9028  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-backend-ops.cpp:9128  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-backend-ops.cpp:9130  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-backend-ops.cpp:9154  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-backend-ops.cpp:9156  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-backend-ops.cpp:9161  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-backend-ops.cpp:9165  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-backend-ops.cpp:9168  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-backend-ops.cpp:9170  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-backend-ops.cpp:9172  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-backend-ops.cpp:9177  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-backend-ops.cpp:9182  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-backend-ops.cpp:9185  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-backend-ops.cpp:9189  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-backend-ops.cpp:9192  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-backend-ops.cpp:11549  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-backend-ops.cpp:13551  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-backend-ops.cpp:14173  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-backend-ops.cpp:14422  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-backend-ops.cpp:14530  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-backend-ops.cpp:14665  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-backend-ops.cpp:14675  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-backend-ops.cpp:14783  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-backend-ops.cpp:14830  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-grammar-parser.cpp:149  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-grammar-parser.cpp:157  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-grammar-parser.cpp:161  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-grammar-parser.cpp:165  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-grammar-parser.cpp:183  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-grammar-parser.cpp:199  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-llama-archs.cpp:849  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-quantize-fns.cpp:347  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-quantize-fns.cpp:363  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-quantize-fns.cpp:367  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-reasoning-budget.cpp:46  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-reasoning-budget.cpp:159  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-reasoning-budget.cpp:178  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-reasoning-budget.cpp:198  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-reasoning-budget.cpp:219  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-reasoning-budget.cpp:229  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-reasoning-budget.cpp:243  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-reasoning-budget.cpp:267  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-reasoning-budget.cpp:290  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-reasoning-budget.cpp:305  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-reasoning-budget.cpp:323  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-reasoning-budget.cpp:338  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-reasoning-budget.cpp:515  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-server-component.cpp:760  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-server-component.cpp:878  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
+variant  ui/apps/chat/README.md:131  the fork version in hooks/fork-files/ui/apps/chat/README.md, not active; the upstream file stays
+variant  ui/apps/chat/src/lib/components/app/navigation/SidebarNavigation/SidebarNavigationActions.svelte:96  the fork version in hooks/fork-files/ui/apps/chat/src/lib/components/app/navigation/SidebarNavigation/SidebarNavigationActions.svelte, not active; the upstream file stays
+variant  ui/apps/chat/src/lib/components/app/navigation/SidebarNavigation/SidebarNavigationActions.svelte:109  the fork version in hooks/fork-files/ui/apps/chat/src/lib/components/app/navigation/SidebarNavigation/SidebarNavigationActions.svelte, not active; the upstream file stays
+variant  ui/apps/chat/src/lib/constants/ui.constants.ts:8  the fork version in hooks/fork-files/ui/apps/chat/src/lib/constants/ui.constants.ts, not active; the upstream file stays

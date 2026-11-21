@@ -26,7 +26,7 @@ namespace ggml_fork { // hooks: the fork code is namespaced, see hooks/apps/READ
 #include "sampling.h"
 #include "speculative.h"
 #include "speculative-prefill.h"
-#include "llama-ext.h" // hooks: the fork libllama header
+#include "../../llama/fork-src/llama-ext.h" // hooks: the fork libllama header
 #include "mtmd.h"
 #include "mtmd-helper.h"
 #include "base64.hpp"

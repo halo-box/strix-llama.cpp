@@ -29,6 +29,10 @@ ggml/                       ggml-base registry, backend wrapper, CPU/CUDA/Vulkan
   kernels/<backend>/        kernel files, globbed
   fork-cuda/                the fork ggml-cuda tree, namespace ggml_fork, built into ggml-hip
   fork-vulkan/              the fork ggml-vulkan tree and shaders, namespace ggml_fork, built into ggml-vulkan
+llama/fork-src, fork-include  the fork libllama (fork_llama)
+apps/                       the fork common, tools, example and tests (fork_tools)
+python/                     the fork converter
+fork-files/                 the fork version of the files that are not built here
   src/fork-sched/           the fork scheduler, graph allocator and sanitizer (fork_sched)
 llama/                      libllama hooks (models/, passes/ globbed), common and server wiring
 common/, server/            common and server hooks (args/, handlers/ globbed)
@@ -90,6 +94,11 @@ switch selects it. Upstream stays the default.
   generated `llama/src/llama-fork-dispatch.cpp` calls one side.
 - Tools: `apps/` holds the fork common, mtmd, server, llama-bench, quantize and the example speculative-prefill
   (`hooks/tools/import-fork-apps.py`). `fork_tools` (switch, off) runs the fork tools from the upstream programs.
+- Tests: `apps/fork-tests` holds the fork tests that are new or changed, built as `test-<name>-fork`
+  (`cmake --build build --target hooks-fork-tests`). The upstream tests are unchanged.
+- Files that are not built here: `python/` is the fork converter with its `conversion/` and `gguf-py/`
+  (`python3 hooks/python/convert_hf_to_gguf.py`); `fork-files/<path>` keeps the fork version of the docs, CI
+  workflows, UI sources, scripts and repository files, not active (`hooks/tools/import-fork-files.py`).
 - Upstream files that the hooks must reach inside are compiled through a hooks file that includes them
   (`ggml/src/ggml-backend-upstream.cpp`, `ggml/src/ggml-cuda-upstream.cu`); the original is marked as a header.
 

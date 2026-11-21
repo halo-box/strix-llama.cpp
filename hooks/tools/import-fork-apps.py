@@ -35,7 +35,7 @@ def git(*a):
 FORK = git('rev-parse', '--short=9', REF).strip()
 
 
-def namespaced(path, src, state):
+def namespaced(path, src, state, out_path=None, global_main=False):
     lines = src.split('\n')
     if lines and lines[-1] == '':
         lines.pop()
@@ -47,10 +47,44 @@ def namespaced(path, src, state):
     out.append(GLOBAL_DECLS)
     out.append(OPEN)
     depth_extern_c = 0
-    for l in lines[start:]:
+    body = lines[start:]
+    skip = 0
+    main_seen = False
+    in_main = False
+    for idx, l in enumerate(body):
+        if skip:
+            skip -= 1
+            continue
+        if global_main and re.match(r'^int main\(', l):
+            # main stays global (falling off its end returns 0), and sees the fork code; the namespace reopens after it
+            out.append(CLOSE)
+            out.append('using namespace ggml_fork; // hooks: main is global')
+            out.append(l)
+            main_seen = True
+            in_main = True
+            continue
+        if global_main and main_seen and in_main:
+            out.append(l)
+            if l == '}':
+                out.append(OPEN)
+                in_main = False
+            continue
+        if re.match(r'^\s*extern "C" \{\s*$', l):
+            j = idx + 1
+            while j < len(body) and (re.match(r'\s*#\s*include\b', body[j]) or not body[j].strip()):
+                j += 1
+            if j < len(body) and body[j].strip() == '}' and j > idx + 1:
+                # an extern "C" around includes of C headers: global, as it is
+                out.append(CLOSE)
+                out += body[idx:j + 1]
+                out.append(OPEN)
+                skip = j - idx
+                continue
         if re.match(r'\s*#\s*include\b', l):
             # the libllama headers: the fork ones (hooks/llama/fork-src, on the include path)
-            l2 = re.sub(r'#include "(\.\./)*src/', '#include "', l)
+            src_dir = os.path.relpath('hooks/llama/fork-src', os.path.dirname(out_path)) if out_path else ''
+            l2 = re.sub(r'#include "(\.\./)*src/', f'#include "{src_dir}/' if src_dir else '#include "', l)
+            l2 = re.sub(r'#include "(\.\./)+(tools/(server|mtmd)|common)/', '#include "', l2)
             out.append(CLOSE)
             out.append(l2 + (' // hooks: the fork libllama header' if l2 != l else ''))
             out.append(OPEN)
@@ -91,7 +125,8 @@ for src_dir, dst_dir in TREES:
         if f == 'common/build-info.h':
             pass  # the build info of upstream (build-info.cpp, generated): global
         elif f.endswith(('.cpp', '.h', '.hpp')):
-            src = namespaced(f, src, 'new' if f not in upstream else ('changed' if src != git('show', f'{BASE}:{f}') else 'unchanged'))
+            src = namespaced(f, src, 'new' if f not in upstream else ('changed' if src != git('show', f'{BASE}:{f}') else 'unchanged'), out,
+                             global_main=f.startswith('examples/'))
         open(out, 'w').write(src)
 print('copied')
 
@@ -102,9 +137,18 @@ def adapt(path, old, new, count=1):
     open(path, 'w').write(s.replace(old, new))
 
 
-# the entry of the example: a global main
-p = 'hooks/apps/fork-speculative-prefill/speculative-prefill.cpp'
-s = open(p).read().rstrip('\n')
-s += '\n\n// hooks: the program entry of the namespaced fork example\nint main(int argc, char ** argv) {\n    return ggml_fork::main(argc, argv);\n}\n'
-open(p, 'w').write(s)
+# the tests of the fork that are new or changed (and the helper headers), each with a global main
+tdir = 'hooks/apps/fork-tests'
+os.makedirs(tdir, exist_ok=True)
+changed = set(git('diff', '--name-only', BASE, REF, '--', 'tests').split())
+for f in [x for x in git('ls-tree', '--name-only', REF, 'tests/').split() if x.endswith(('.cpp', '.h'))]:
+    if f.endswith('.cpp') and f not in changed:
+        continue
+    if f == 'tests/test-quantize-fns.cpp':
+        continue  # hooks/tests/test-quantize-fns-hooks.cpp
+    up = set(git('ls-tree', '-r', '--name-only', BASE, 'tests/').split())
+    src = namespaced(f, git('show', f'{REF}:{f}'), 'new' if f not in up else 'changed', os.path.join(tdir, os.path.basename(f)),
+                     global_main=True)
+    open(os.path.join(tdir, os.path.basename(f)), 'w').write(src)
+
 print('adapted')

@@ -8,7 +8,7 @@ struct ggml_tensor; struct ggml_context; struct ggml_cgraph; struct gguf_context
 #include "sampling.h"
 #include "speculative.h"
 #include "speculative-prefill.h"
-#include "llama-ext.h" // hooks: the fork libllama header
+#include "../../llama/fork-src/llama-ext.h" // hooks: the fork libllama header
 namespace ggml_fork { // hooks: the fork code is namespaced, see hooks/apps/README.md
 
 } // namespace ggml_fork
@@ -23,6 +23,8 @@ namespace ggml_fork { // hooks: the fork code is namespaced, see hooks/apps/READ
 
 #define SPEC_VOCAB_MAX_SIZE_DIFFERENCE 128
 
+} // namespace ggml_fork
+using namespace ggml_fork; // hooks: main is global
 int main(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
 
@@ -270,10 +272,4 @@ int main(int argc, char ** argv) {
     llama_backend_free();
 
     return 0;
-}
-} // namespace ggml_fork
-
-// hooks: the program entry of the namespaced fork example
-int main(int argc, char ** argv) {
-    return ggml_fork::main(argc, argv);
 }

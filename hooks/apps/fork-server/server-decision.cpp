@@ -5,7 +5,7 @@ struct ggml_tensor; struct ggml_context; struct ggml_cgraph; struct gguf_context
 namespace ggml_fork { // hooks: the fork code is namespaced, see hooks/apps/README.md
 
 } // namespace ggml_fork
-#include "llama-ext.h" // staging API: llama_decision_order // hooks: the fork libllama header
+#include "../../llama/fork-src/llama-ext.h" // staging API: llama_decision_order // hooks: the fork libllama header
 namespace ggml_fork { // hooks: the fork code is namespaced, see hooks/apps/README.md
 
 } // namespace ggml_fork

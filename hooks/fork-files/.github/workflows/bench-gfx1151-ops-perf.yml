@@ -1,0 +1,330 @@
+# On-demand test-backend-ops perf lane for the AMD DevLab Dispatch pool. It was the perf half of
+# bench-gfx1151-history.yml, and is separate so that a 150 min perf subset, or the Vulkan device reset
+# it has hit on this pool, cannot cost that lane a 6 h run.
+#
+# Dispatch: Actions -> "Benchmark gfx1151 test-backend-ops perf (on-demand)" -> "Use workflow from:
+# master", then set `ref` to the branch, tag or SHA to measure. The `ref` input drives the checkout, so
+# any ref can be measured, also one that does not carry this file. With `ref` empty the lane measures
+# the commit it was dispatched on. workflow_dispatch only works once this file is on the default branch.
+#
+# One run does:
+#   1. builds test-backend-ops for HIP (gfx1151) and Vulkan, with the bench-gfx1151.yml recipe
+#   2. runs the perf subset on ROCm0, then on Vulkan0 (scripts/bench-history/ops-perf.sh)
+#   3. writes one line per device to the job summary and uploads the raw logs as an artifact
+#
+# Subset: MUL_MAT and MUL_MAT_ID for every type at n = 1, 8 and 512, plus the cases listed in
+# scripts/bench-history/perf-cases.txt (an even sample of every other op). The full suite took more
+# than 150 min per device in run 39469034755, mostly CPU-side weight setup of trellis MUL_MAT_ID cases.
+#
+# The full Vulkan perf suite ended in vk::DeviceLostError on this pool on 2026-10-17 (RADV, after the
+# SUM [8192,8192] case), so Vulkan0 runs last: a device reset cannot touch the ROCm0 numbers. Such a
+# run keeps its ROCm0 rows and its log.
+#
+# Results stay in the Actions artifact. They are not added to the bench-results branch or the Pages
+# site: that branch belongs to bench-gfx1151-history.yml, and its runs carry the llama-bench and
+# perplexity numbers of the same commit.
+#
+# Both lanes take the same concurrency group, because they share one GPU: a perf run and a history run
+# must never overlap, or both sets of numbers are worthless.
+#
+# Runner labels: `devlab-dispatch` reaches the AMD Ryzen AI Dev Lab pool, `strix-halo` selects Strix
+# Halo hosts in it. Keep both. A wrong label does not fail, the job queues silently.
+
+name: Benchmark gfx1151 test-backend-ops perf (on-demand)
+run-name: ops-perf / ${{ inputs.ref || github.ref_name }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Branch, tag or SHA to build and measure (empty = the commit this workflow runs from)'
+        required: false
+        default: ''
+      rocm:
+        description: 'Run the perf subset on ROCm0 (HIP)'
+        required: false
+        default: true
+        type: boolean
+      vulkan:
+        description: 'Run the perf subset on Vulkan0'
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+env:
+  VULKAN_SDK_VERSION: 1.4.363.0
+  VULKAN_SDK_SHA256: 197962f5cbf80baf2775a03336a01cee7c8745686c65aaa70d3f751ade4d7e43
+
+jobs:
+  perf:
+    name: ops-perf / ${{ inputs.ref || github.ref_name }}
+    runs-on: [self-hosted, Linux, devlab-dispatch, strix-halo]
+    # the subset took 90 min per device, and each build up to 45 min: 2 x 120 + 2 x 90
+    timeout-minutes: 420
+    # one benchmark at a time on the pool; GitHub keeps one pending run per group and cancels an older pending one
+    concurrency:
+      group: bench-gfx1151-devlab
+      cancel-in-progress: false
+    env:
+      LLAMA_ARG_LOG_COLORS: 0
+      LLAMA_ARG_LOG_PREFIX: 1
+      LLAMA_ARG_LOG_TIMESTAMPS: 1
+
+    steps:
+      - name: Validate inputs
+        id: validate
+        env:
+          INPUT_REF: ${{ inputs.ref }}
+          DISPATCH_REF: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          err() { echo "::error::$*" >&2; exit 2; }
+
+          ref="$INPUT_REF"
+          case "$ref" in *[!A-Za-z0-9._/+@-]*) err "ref '$ref' has characters outside [A-Za-z0-9._/+@-]" ;; esac
+          [ "${#ref}" -le 200 ] || err "ref is longer than 200 characters"
+
+          echo "BENCH_STARTED_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
+          echo "BENCH_REF=${ref:-$DISPATCH_REF}" >> "$GITHUB_ENV"
+          echo "ref=${ref:-$DISPATCH_REF} rocm=${{ inputs.rocm }} vulkan=${{ inputs.vulkan }}"
+
+      - name: Checkout
+        id: checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+
+      # the lane's own scripts and case list, which the measured ref may not have
+      - name: Checkout the lane scripts
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+          path: .bench-lane
+          sparse-checkout: scripts/bench-history
+          persist-credentials: false
+
+      - name: Record run metadata
+        run: |
+          set -euo pipefail
+          logs="$RUNNER_TEMP/logs"
+          mkdir -p "$logs"
+          : > "$logs/commands.tsv"
+          : > "$logs/results.tsv"
+          cp .bench-lane/scripts/bench-history/perf-cases.txt "$logs/perf-cases.txt"
+          git log -1 --format='%H%n%cI%n%s' > "$logs/commit.txt"
+          {
+            echo "schema=1"
+            echo "started_utc=$BENCH_STARTED_UTC"
+            echo "ref=$BENCH_REF"
+            echo "commit=$(git rev-parse HEAD)"
+            echo "runner_name=$RUNNER_NAME"
+            echo "runner_os=$RUNNER_OS"
+            echo "runner_arch=$RUNNER_ARCH"
+            echo "rocm=${{ inputs.rocm }}"
+            echo "vulkan=${{ inputs.vulkan }}"
+            echo "vulkan_sdk_version=$VULKAN_SDK_VERSION"
+            echo "kernel=$(uname -r)"
+            echo "nproc=$(nproc)"
+            echo "mem_total_kib=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)"
+            echo "hip_version=$(hipconfig --version 2> /dev/null | head -1 || true)"
+            echo "cmake_version=$(cmake --version | head -1)"
+          } > "$logs/meta.env"
+          cat "$logs/meta.env"
+
+          # diagnostics only, so a missing probe does not fail the job
+          {
+            git log --oneline -1
+            uname -a
+            nproc
+            free -g
+            df -h "$RUNNER_TEMP" .
+            rocminfo | grep -E '^  Name|Marketing Name' | head -6
+            rocm-smi --showproductname | head -8
+            cmake --version | head -1
+            hipconfig --version
+          } > "$logs/environment.log" 2>&1 || true
+
+          {
+            echo "### Benchmark gfx1151 test-backend-ops perf"
+            echo
+            echo "- ref: \`$BENCH_REF\`"
+            echo "- commit: \`$(git rev-parse HEAD)\`"
+            echo "- runner: \`$RUNNER_NAME\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Provide the Vulkan toolchain
+        id: vulkan_sdk
+        if: ${{ !cancelled() && inputs.vulkan && steps.checkout.outcome == 'success' }}
+        timeout-minutes: 20
+        run: |
+          # the pool has Mesa and the loader but no glslc, headers, SPIRV-Headers config or
+          # passwordless sudo, so unpack the Lunarg SDK into $RUNNER_TEMP (recipe from bench-gfx1151)
+          set -euo pipefail
+          logs="$RUNNER_TEMP/logs"
+          log="$logs/vulkan-env.log"
+          tarball="$RUNNER_TEMP/vulkan_sdk.tar.xz"
+          curl -fsSL --retry 5 --retry-delay 5 -o "$tarball" \
+            "https://sdk.lunarg.com/sdk/download/$VULKAN_SDK_VERSION/linux/vulkan_sdk.tar.xz"
+          echo "$VULKAN_SDK_SHA256  $tarball" | sha256sum -c - | tee "$log"
+          mkdir -p "$RUNNER_TEMP/vulkan_sdk"
+          tar -xJf "$tarball" -C "$RUNNER_TEMP/vulkan_sdk"
+          glslc_path=$(find "$RUNNER_TEMP/vulkan_sdk" -type f -name glslc -print -quit)
+          if [ -z "$glslc_path" ]; then
+            echo "::error::no glslc in the SDK tarball" >&2
+            exit 1
+          fi
+          sdk_root=$(dirname "$(dirname "$glslc_path")")
+          echo "VULKAN_SDK=$sdk_root" >> "$GITHUB_ENV"
+          # FindVulkan wants an unversioned libvulkan.so; the runner has only the versioned loader
+          vk_lib=""
+          for lib in "$sdk_root/lib/libvulkan.so" "$sdk_root"/x86_64/lib/libvulkan.so /usr/lib/x86_64-linux-gnu/libvulkan.so /lib/x86_64-linux-gnu/libvulkan.so; do
+            if [ -f "$lib" ]; then
+              vk_lib="$lib"
+              break
+            fi
+          done
+          if [ -z "$vk_lib" ]; then
+            for lib in "$sdk_root"/lib/libvulkan.so.1 "$sdk_root"/x86_64/lib/libvulkan.so.1 /usr/lib/x86_64-linux-gnu/libvulkan.so.1 /lib/x86_64-linux-gnu/libvulkan.so.1; do
+              if [ -f "$lib" ]; then
+                mkdir -p "$RUNNER_TEMP/vkdev"
+                ln -sf "$lib" "$RUNNER_TEMP/vkdev/libvulkan.so"
+                vk_lib="$RUNNER_TEMP/vkdev/libvulkan.so"
+                break
+              fi
+            done
+          fi
+          if [ -z "$vk_lib" ]; then
+            echo "::error::no Vulkan loader found in the SDK or system library paths" >&2
+            exit 1
+          fi
+          echo "VULKAN_LIBRARY=$vk_lib" >> "$GITHUB_ENV"
+          {
+            echo "VULKAN_SDK=$sdk_root"
+            echo "VULKAN_LIBRARY=$vk_lib"
+            "$sdk_root/bin/glslc" --version | head -2
+            if [ -x "$sdk_root/bin/vulkaninfo" ]; then
+              "$sdk_root/bin/vulkaninfo" --summary 2>&1 | head -40 || true
+            fi
+          } 2>&1 | tee -a "$log"
+
+      - name: Build (HIP)
+        id: build_hip
+        if: ${{ !cancelled() && inputs.rocm }}
+        timeout-minutes: 45
+        run: |
+          set -euo pipefail
+          logs="$RUNNER_TEMP/logs"
+          quote() { local s; s=$(printf '%q ' "$@"); printf '%s' "${s% }"; }
+
+          # same flags as the hip branch of bench-gfx1151.yml
+          configure=(cmake -B build-hip -S .
+            -DCMAKE_BUILD_TYPE=Release
+            -DGGML_HIP=ON -DGGML_VULKAN=OFF -DGGML_CUDA=OFF
+            "-DCMAKE_HIP_COMPILER=$(hipconfig -l)/clang"
+            -DGPU_TARGETS=gfx1151
+            -DGGML_HIP_EXPORT_METRICS=Off
+            -DLLAMA_BUILD_COMMON=ON -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_TESTS=ON
+            -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_SERVER=OFF)
+          build=(cmake --build build-hip --config Release -j "$(nproc)" --target test-backend-ops)
+
+          printf 'build-hip-configure\t%s\n' "$(quote "${configure[@]}")" >> "$logs/commands.tsv"
+          printf 'build-hip\t%s\n' "$(quote "${build[@]}")" >> "$logs/commands.tsv"
+          "${configure[@]}" 2>&1 | tee "$logs/build-hip-configure.log"
+          "${build[@]}" > "$logs/build-hip-make.log" 2>&1 || { tail -100 "$logs/build-hip-make.log"; exit 1; }
+          tail -5 "$logs/build-hip-make.log"
+
+      # no device probe here: test-backend-ops has no --list-devices, and `-b` with a name that matches
+      # nothing exits 0, so ops-perf.sh proves the device ran from its own log instead
+      - name: Build (Vulkan)
+        id: build_vulkan
+        if: ${{ !cancelled() && inputs.vulkan && steps.vulkan_sdk.outcome == 'success' }}
+        timeout-minutes: 45
+        run: |
+          set -euo pipefail
+          export PATH="$VULKAN_SDK/bin:$PATH"
+          export LD_LIBRARY_PATH="$VULKAN_SDK/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          logs="$RUNNER_TEMP/logs"
+          quote() { local s; s=$(printf '%q ' "$@"); printf '%s' "${s% }"; }
+
+          # same flags as the vulkan branch of bench-gfx1151.yml
+          configure=(cmake -B build-vulkan -S .
+            -DCMAKE_BUILD_TYPE=Release
+            -DGGML_VULKAN=ON -DGGML_HIP=OFF -DGGML_CUDA=OFF
+            "-DVulkan_LIBRARY=$VULKAN_LIBRARY"
+            -DLLAMA_BUILD_COMMON=ON -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_TESTS=ON
+            -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_SERVER=OFF)
+          build=(cmake --build build-vulkan --config Release -j "$(nproc)" --target test-backend-ops)
+
+          printf 'build-vulkan-configure\t%s\n' "$(quote "${configure[@]}")" >> "$logs/commands.tsv"
+          printf 'build-vulkan\t%s\n' "$(quote "${build[@]}")" >> "$logs/commands.tsv"
+          "${configure[@]}" 2>&1 | tee "$logs/build-vulkan-configure.log"
+          "${build[@]}" > "$logs/build-vulkan-make.log" 2>&1 || { tail -100 "$logs/build-vulkan-make.log"; exit 1; }
+          tail -5 "$logs/build-vulkan-make.log"
+
+      - name: test-backend-ops perf (ROCm0)
+        id: ops_rocm
+        if: ${{ !cancelled() && inputs.rocm && steps.build_hip.outcome == 'success' }}
+        timeout-minutes: 120
+        env:
+          # SOLVE_TRI aborts under HIP graph capture (hipBLAS CUBLAS_STATUS_INTERNAL_ERROR in
+          # solve_tri_f32_cublas), seen on ROCm 7.2.1 on this pool, see bench-gfx1151.yml. These
+          # perf numbers are graphs-off; remove this once the capture issue is fixed.
+          GGML_CUDA_DISABLE_GRAPHS: "1"
+        run: |
+          bash .bench-lane/scripts/bench-history/ops-perf.sh ./build-hip/bin/test-backend-ops ROCm0 \
+            "$RUNNER_TEMP/logs/ops-perf-ROCm0.log" .bench-lane/scripts/bench-history/perf-cases.txt
+
+      # last, because this is where a device reset has happened
+      - name: test-backend-ops perf (Vulkan0)
+        id: ops_vulkan
+        if: ${{ !cancelled() && inputs.vulkan && steps.build_vulkan.outcome == 'success' }}
+        timeout-minutes: 120
+        run: |
+          export LD_LIBRARY_PATH="$VULKAN_SDK/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          bash .bench-lane/scripts/bench-history/ops-perf.sh ./build-vulkan/bin/test-backend-ops Vulkan0 \
+            "$RUNNER_TEMP/logs/ops-perf-Vulkan0.log" .bench-lane/scripts/bench-history/perf-cases.txt
+
+      - name: Write run manifest
+        if: ${{ always() }}
+        env:
+          S_VALIDATE: ${{ steps.validate.outcome }}
+          S_VULKAN_SDK: ${{ steps.vulkan_sdk.outcome }}
+          S_BUILD_HIP: ${{ steps.build_hip.outcome }}
+          S_BUILD_VULKAN: ${{ steps.build_vulkan.outcome }}
+          S_OPS_ROCM: ${{ steps.ops_rocm.outcome }}
+          S_OPS_VULKAN: ${{ steps.ops_vulkan.outcome }}
+        run: |
+          logs="$RUNNER_TEMP/logs"
+          mkdir -p "$logs"
+          {
+            printf 'validate\t%s\n' "$S_VALIDATE"
+            printf 'vulkan-sdk\t%s\n' "$S_VULKAN_SDK"
+            printf 'build-hip\t%s\n' "$S_BUILD_HIP"
+            printf 'build-vulkan\t%s\n' "$S_BUILD_VULKAN"
+            printf 'ops-perf-ROCm0\t%s\n' "$S_OPS_ROCM"
+            printf 'ops-perf-Vulkan0\t%s\n' "$S_OPS_VULKAN"
+          } > "$logs/steps.tsv"
+          echo "finished_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$logs/meta.env"
+          cat "$logs/steps.tsv"
+
+          # one summary line per device, from what ops-perf.sh recorded
+          {
+            echo
+            echo '| device | exit | perf rows | failed to allocate or compute |'
+            echo '|---|---:|---:|---:|'
+            awk -F'\t' '$1 == "ops-perf" { printf "| %s | %s | %s | %s |\n", $2, $3, $4, $5 }' "$logs/results.tsv" || true
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload raw logs
+        id: upload
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: ops-perf-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/logs
+          retention-days: 90
+          if-no-files-found: warn

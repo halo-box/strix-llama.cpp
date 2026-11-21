@@ -12,7 +12,7 @@ namespace ggml_fork { // hooks: the fork code is namespaced, see hooks/apps/READ
 namespace ggml_fork { // hooks: the fork code is namespaced, see hooks/apps/README.md
 
 } // namespace ggml_fork
-#include "llama-ext.h" // hooks: the fork libllama header
+#include "../../llama/fork-src/llama-ext.h" // hooks: the fork libllama header
 namespace ggml_fork { // hooks: the fork code is namespaced, see hooks/apps/README.md
 
 } // namespace ggml_fork
