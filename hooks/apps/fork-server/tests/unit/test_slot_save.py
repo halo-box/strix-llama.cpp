@@ -924,3 +924,52 @@ def test_prompt_cache_swa_window(swa_window_server):
 
     assert cached["cache_n"]  == direct["cache_n"]
     assert cached["prompt_n"] == direct["prompt_n"]
+
+
+# the byte counts of a slot file that holds the draft state appendix, and the place of the appendix in the file;
+# upstream's test_slot_restore_draft_state checks that the draft state comes back, not what save and restore report
+SLOT_DRAFT_MAGIC = struct.pack("<I", 0x54464453)  # "SDFT"
+
+
+def test_slot_save_restore_draft_state_bytes(swa_server):
+    server = swa_server
+    server.model_draft_hf_repo = "ggml-org-dev/tinygemma3-GGUF:Q8_0"  # the target's own file, already in the HF cache
+    server.spec_type = "draft-simple"
+    server.start()
+
+    filename = "draft_slot1.bin"
+    res = server.make_request("POST", "/completion", data={
+        "prompt": "The quick brown fox jumps over the lazy dog. " * 20,
+        "id_slot": 1,
+        "n_predict": 16,
+        "cache_prompt": True,
+    })
+    assert res.status_code == 200
+
+    res = server.make_request("POST", "/slots/1?action=save", data={"filename": filename})
+    assert res.status_code == 200
+    n_written = res.body["n_written"]
+
+    with open(os.path.join(server.slot_save_path, filename), "rb") as f:
+        data = f.read()
+    assert n_written == len(data)
+
+    # the appendix ends the file: read it at its offset and check that it stops exactly at EOF, so a stray
+    # "SDFT" inside the state payload cannot pass for it
+    offset = data.rfind(SLOT_DRAFT_MAGIC)
+    assert offset > 0
+    pos = offset + len(SLOT_DRAFT_MAGIC)
+    version, = struct.unpack_from("<I", data, pos)
+    assert version == 1
+    pos += 4
+    for _ in range(2):  # the draft context state, then the speculative state
+        n_buf, = struct.unpack_from("<Q", data, pos)
+        pos += 8 + n_buf
+    assert pos == len(data)
+
+    res = server.make_request("POST", "/slots/1?action=erase")
+    assert res.status_code == 200
+
+    res = server.make_request("POST", "/slots/1?action=restore", data={"filename": filename})
+    assert res.status_code == 200
+    assert res.body["n_read"] == n_written
