@@ -6,8 +6,10 @@ get_target_property(GGML_HOOKS_GGML_SRC ggml-base SOURCE_DIR) # ggml/src
 
 # registry and generic backend wrapper: in ggml-base, shared by all backends, tests and plugins
 target_sources(ggml-base PRIVATE ${GGML_HOOKS_DIR}/src/ggml-hooks-registry.cpp ${GGML_HOOKS_DIR}/src/ggml-hooks-wrap.cpp
-                                 ${GGML_HOOKS_DIR}/src/ggml-hooks-types.c)
+                                 ${GGML_HOOKS_DIR}/types/types.c ${GGML_HOOKS_DIR}/types/ggml-quants-ext.c
+                                 ${GGML_HOOKS_DIR}/types/rocmfp4/rocmfp4.c ${GGML_HOOKS_DIR}/types/rocmfpx/rocmfpx.c)
 target_include_directories(ggml-base PUBLIC $<BUILD_INTERFACE:${GGML_HOOKS_DIR}/include>)
+target_include_directories(ggml-base PRIVATE ${GGML_HOOKS_DIR}/types)
 # hooks enabled, for every user of ggml: ggml-hook-points.h (included by ggml.h) and the headers included by the
 # hook lines of common and server are empty or no-ops without it, so the same tree builds as pure upstream
 target_compile_definitions(ggml-base PUBLIC GGML_HOOKS)
@@ -25,13 +27,16 @@ hooks_wrap(ggml API SYMBOLS
 # CPU, every variant: the variants are created from ggml/src or from ggml/src/ggml-cpu
 if (GGML_CPU)
     file(GLOB GGML_HOOK_CPU_KERNELS CONFIGURE_DEPENDS ${GGML_HOOKS_DIR}/kernels/cpu/*.cpp)
+    file(GLOB GGML_HOOK_CPU_TYPES CONFIGURE_DEPENDS ${GGML_HOOKS_DIR}/types/cpu/*.c)
     get_property(cpu_targets     DIRECTORY ${GGML_HOOKS_GGML_SRC}          PROPERTY BUILDSYSTEM_TARGETS)
     get_property(cpu_targets_sub DIRECTORY ${GGML_HOOKS_GGML_SRC}/ggml-cpu PROPERTY BUILDSYSTEM_TARGETS)
     foreach (target ${cpu_targets} ${cpu_targets_sub})
         get_target_property(type ${target} TYPE)
         # skip the helper targets of GGML_CPU_ALL_VARIANTS (feature detection objects)
         if (target MATCHES "^ggml-cpu" AND NOT target MATCHES "feats" AND type MATCHES "LIBRARY")
-            target_include_directories(${target} PRIVATE ${GGML_HOOKS_GGML_SRC}/ggml-cpu)
+            target_include_directories(${target} PRIVATE ${GGML_HOOKS_GGML_SRC}/ggml-cpu ${GGML_HOOKS_DIR}/types)
+            # CPU traits of the hook types (C files: the trait table of ggml-cpu.c references them, static links keep them)
+            target_sources(${target} PRIVATE ${GGML_HOOK_CPU_TYPES})
             hooks_link(${target} UNITS ${GGML_HOOKS_DIR}/src/ggml-hooks-cpu.cpp ${GGML_HOOK_CPU_KERNELS})
         endif()
     endforeach()

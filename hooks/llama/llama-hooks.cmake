@@ -49,3 +49,19 @@ if (TARGET llama-common)
     # the test declares ggml kernels: they need the registrar of the executable
     hooks_link(test-llama-hooks UNITS)
 endif()
+
+# upstream tests that loop over every ggml type: built without GGML_HOOKS, they see the upstream types only.
+# The fork types are tested by the fork versions in hooks/tests.
+foreach (t test-quantize-fns test-quantize-perf)
+    if (TARGET ${t})
+        target_compile_options(${t} PRIVATE -UGGML_HOOKS)
+    endif()
+endforeach()
+
+if (TARGET test-quantize-fns)
+    add_executable(test-quantize-fns-hooks EXCLUDE_FROM_ALL ${HOOKS_DIR}/tests/test-quantize-fns.cpp)
+    target_link_libraries(test-quantize-fns-hooks PRIVATE ggml)
+    target_include_directories(test-quantize-fns-hooks PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
+    target_compile_definitions(test-quantize-fns-hooks PRIVATE GGML_USE_TRELLIS)
+    target_compile_features(test-quantize-fns-hooks PRIVATE cxx_std_17)
+endif()

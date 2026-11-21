@@ -41,6 +41,9 @@ struct ggml_hook_driver {
 GGML_API void ggml_hook_register_driver(const struct ggml_hook_driver * driver, const void * module);
 
 // called by the generated registrar of each library (hooks/cmake/hooks-link.cmake)
+// removes the drivers and extensions of a module (ggml_hook_unregister_module)
+void ggml_hook_wrap_unregister_module(const void * module);
+
 GGML_API void ggml_hook_register_section(int kind, const void * const * begin, const void * const * end, const void * module);
 
 // wrap reg if a driver matches it. Safe to call many times, from any thread.

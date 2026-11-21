@@ -401,7 +401,6 @@ void ggml_hook_register_kernel(const ggml_hook_kernel * kernel, const void * mod
     }
 }
 
-void ggml_hook_wrap_unregister_module(const void * module); // ggml-hooks-wrap.cpp
 
 void ggml_hook_unregister_module(const void * module) {
     if (!module) {

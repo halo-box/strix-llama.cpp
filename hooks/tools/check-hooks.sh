@@ -7,6 +7,7 @@
 #
 # Each changed hunk outside hooks/ must hold HOOK(name) markers of HOOKS.txt entries for its file, and exactly the
 # number of changed lines of those entries. Each entry must be found once. Compares the working tree.
+# Only files that exist in base count: new files cannot conflict.
 set -euo pipefail
 export LC_ALL=C
 
@@ -69,7 +70,7 @@ while IFS= read -r file; do
         }
         END { flush() }
     ')
-done < <(git diff --name-only "$base" -- . ':!hooks')
+done < <(git diff --name-only --diff-filter=MDRT "$base" -- . ':!hooks')
 
 for name in "${!want_file[@]}"; do
     if [ "${seen[$name]:-0}" -ne 1 ]; then
@@ -78,7 +79,11 @@ for name in "${!want_file[@]}"; do
     fi
 done
 
+# new files outside hooks/ (docs, scripts of the fork): they cannot conflict with an upstream file that exists,
+# only with one that upstream adds later at the same path
+n_new=$(git diff --name-only --diff-filter=A "$base" -- . ':!hooks' | wc -l)
 echo "hook points: ${#want_file[@]}, changed lines in upstream files: $total (base $(git rev-parse --short "$base"))"
+echo "new files outside hooks/: $n_new" 
 if [ "$fail" != 0 ]; then
     echo "FAIL: move the change to hooks/, or add the hook point to $manifest"
     exit 1
