@@ -16,6 +16,7 @@ server-slot-start      tools/server/server-context.cpp   1      server_context_i
 server-token           tools/server/server-context.cpp   1      server_context_impl is local to server-context.cpp
 server-task-params     tools/server/server-task.h        1      a request field must travel with the task: a struct field
 sched-realloc-sync     ggml/src/ggml-backend.cpp         1      the scheduler sync before a re-reserve is inside ggml_backend_sched_alloc_splits
+gguf-type              ggml/src/gguf.cpp                 1      gguf_init_from_reader is static, the type check is inside its tensor loop
 context-include        src/llama-context.cpp             1      for the llama_context hook points
 fused-ops              src/llama-context.cpp             1      resolve_fused_ops is called from its own file
 sched-reserve          src/llama-context.cpp             1      sched_reserve is called from its own file

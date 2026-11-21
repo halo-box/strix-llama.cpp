@@ -163,6 +163,85 @@ GGML_API bool ggml_hook_skip_realloc_sync(struct ggml_backend * backend);
 #endif
 #define GGML_HOOK_SKIP_REALLOC_SYNC(backend) ggml_hook_skip_realloc_sync(backend)
 
+// gguf: a type id inside [0, GGML_TYPE_COUNT) that no type uses (the hooks raise GGML_TYPE_COUNT). Logs and returns true.
+#ifdef __cplusplus
+extern "C" {
+#endif
+GGML_API bool ggml_hook_gguf_type_unassigned(const char * name, enum ggml_type type);
+#ifdef __cplusplus
+}
+#endif
+#define GGML_HOOK_GGUF_TYPE_UNASSIGNED(name, type) ggml_hook_gguf_type_unassigned(name, type)
+
+// The scheduler and graph allocator functions of the fork (fork_sched switch, hooks/ggml/src/ggml-fork-sched.cpp):
+// the declarations of ggml/include/ggml-alloc.h and ggml-backend.h of the fork (1fe05fa45), verbatim. Without the
+// switch they keep the upstream behavior (see ggml-fork-sched.cpp).
+// The fork replaces the usage comment of the scheduler in ggml-backend.h by a pointer to its document:
+    // see docs/development/backend-scheduler.md
+#ifdef __cplusplus
+extern "C" {
+#endif
+typedef struct ggml_gallocr * ggml_gallocr_t;
+typedef struct ggml_backend_sched * ggml_backend_sched_t;
+// called right before a reserve frees an existing buffer to replace it (e.g. to wait for work that still uses it)
+GGML_API void ggml_gallocr_set_free_callback(ggml_gallocr_t galloc, void (*cb)(void * user_data), void * user_data);
+GGML_API bool ggml_gallocr_alloc_graph_n(
+    ggml_gallocr_t galloc,
+    struct ggml_cgraph * graph,
+    const int * node_buffer_ids,
+    const int * leaf_buffer_ids);
+GGML_API void ggml_gallocr_pin_tensor(ggml_gallocr_t galloc, struct ggml_tensor * t);
+GGML_API void ggml_gallocr_clear_pins(ggml_gallocr_t galloc);
+
+GGML_API void ggml_backend_tensor_set_direct(struct ggml_tensor * tensor, size_t offset, size_t size);
+
+GGML_API int                  ggml_backend_sched_get_n_graph_nodes(ggml_backend_sched_t sched);
+GGML_API void                 ggml_backend_sched_prepare_inputs(ggml_backend_sched_t sched);
+// Skip the backend synchronization before a graph re-allocation that keeps every buffer (a buffer that is replaced
+// still waits for the backends). The caller then has to synchronize before it writes the graph inputs.
+GGML_API void                 ggml_backend_sched_set_lazy_realloc_sync(ggml_backend_sched_t sched, bool lazy);
+
+#ifdef __cplusplus
+}
+#endif
+
+// FA hints and the f16 DSV4 hc_pre of the fork: the declarations of ggml/include/ggml.h (after upstream lines
+// 2281 and 2486, fork 1fe05fa45), verbatim. The builders are in hooks/ggml/src/ggml-fork-ops.c.
+#define GGML_HINT_EXACT_BATCH ((enum ggml_op_hint) 2) // enum ggml_op_hint of the fork
+#ifdef __cplusplus
+extern "C" {
+#endif
+    // hint: the mask is the plain causal one over the key index (n_kv == n_q per stream, key j visible to query i
+    // iff j <= i), so a backend may skip reading it. The mask must still be supplied and correct.
+    GGML_API void ggml_flash_attn_ext_set_causal_prefix(
+            struct ggml_tensor * a,
+            bool                 causal_prefix);
+
+    GGML_API bool ggml_flash_attn_ext_get_causal_prefix(
+            const struct ggml_tensor * a);
+
+    // sparse attention hint: attend only to the first n_kv_raw keys (dense prefix) plus the
+    // keys selected by top_k. top_k is I32 [n_top_k, n_tokens, 1, n_streams]; each index i
+    // selects absolute key n_kv_raw + i. Negative or out-of-range indices are ignored.
+    // Backends may ignore the hint: the kq_mask must still encode the same selection, so a
+    // dense fallback computes the identical result.
+    GGML_API void ggml_flash_attn_ext_add_top_k(
+            struct ggml_tensor * a,
+            struct ggml_tensor * top_k,
+                     int64_t     n_kv_raw);
+
+    // the gated form with an f32 or f16 output (out_type): the mixed stream as an f16 matmul B
+    GGML_API struct ggml_tensor * ggml_dsv4_hc_pre_gated_ext(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * gate,
+            float                 scale,
+            enum ggml_type        out_type);
+
+#ifdef __cplusplus
+}
+#endif
+
 // EXL3 ops of the fork: the declarations of ggml/include/ggml.h (after upstream line 2500, fork 1fe05fa45), verbatim.
 // The nodes are GGML_OP_CUSTOM nodes (hooks/ggml/exl3/ggml-exl3-ops.c): the fork op ids GGML_OP_EXL3_* are not
 // ggml ops here. ggml_hook_exl3_op() tells which EXL3 op a node is; only hook kernels compute them.
@@ -224,5 +303,6 @@ GGML_API bool ggml_hook_is_hook_custom(const struct ggml_tensor * t);
 #define GGML_HOOK_TYPE_QUANTIZE(type, src, dst, nrows, n_per_row, imatrix, result) false
 #define GGML_HOOK_TYPE_VALIDATE(type, data, nbytes, ok) false
 #define GGML_HOOK_SKIP_REALLOC_SYNC(backend) false
+#define GGML_HOOK_GGUF_TYPE_UNASSIGNED(name, type) false
 
 #endif

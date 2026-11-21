@@ -78,3 +78,69 @@ pending  ggml/src/CMakeLists.txt:234         the OpenMP installer of LLVM 22 on 
 pending  ggml/src/CMakeLists.txt:236         same
 pending  ggml/src/CMakeLists.txt:245         same
 pending  ggml/src/CMakeLists.txt:249         same
+
+# FA hints, selected keys, DSV4 hc_pre f16 (hooks/ggml/src/ggml-fork-ops.c, hooks/ggml/kernels/cpu/fork-fa*.{inc,cpp})
+adapted  ggml/include/ggml.h:285             GGML_HINT_EXACT_BATCH = 2: a define in ggml-hook-points.h
+adapted  ggml/src/ggml.c:6452                ggml_dsv4_hc_pre_impl with f16 and out_type: the fork impl and builders in ggml-fork-ops.c, the upstream ggml_dsv4_hc_pre and ggml_dsv4_hc_pre_gated renamed
+adapted  ggml/src/ggml.c:6473                same
+adapted  ggml/src/ggml.c:6489                same
+adapted  ggml/src/ggml.c:6497                same
+adapted  ggml/src/ggml-cpu/ops.cpp:8897      the selected-key loop: hook kernel fork_cpu_fa_selected_keys (fork-fa.inc) for the nodes with src[6]; upstream for the others
+adapted  ggml/src/ggml-cpu/ops.cpp:9477      the tiled condition with selected keys: same kernel
+adapted  ggml/src/ggml-cpu/ops.cpp:11410     f16 hc_pre: hook kernel fork_cpu_dsv4_hc_pre_f16 (fork-fa.inc) for the f16 forms; upstream for f32
+adapted  ggml/src/ggml-cpu/ops.cpp:11419     same
+adapted  ggml/src/ggml-cpu/ops.cpp:11450     same
+adapted  ggml/src/ggml-cpu/ops.cpp:11453     same
+adapted  ggml/src/ggml-cpu/ops.cpp:11461     same
+
+# fork_sched switch: scheduler, graph allocator, sanitizer (hooks/ggml/src/ggml-fork-sched.cpp, hooks/ggml/src/fork-sched)
+restored ggml/include/ggml-backend.h:283  the usage comment of the scheduler stays; the fork pointer to docs/development/backend-scheduler.md is in ggml-hook-points.h
+variant  ggml/src/ggml-alloc.c:93  fork_sched: the fork graph allocator in fork-sched/fork-alloc.c, upstream by default
+variant  ggml/src/ggml-alloc.c:121  fork_sched: the fork graph allocator in fork-sched/fork-alloc.c, upstream by default
+variant  ggml/src/ggml-alloc.c:158  fork_sched: the fork graph allocator in fork-sched/fork-alloc.c, upstream by default
+variant  ggml/src/ggml-alloc.c:164  fork_sched: the fork graph allocator in fork-sched/fork-alloc.c, upstream by default
+variant  ggml/src/ggml-alloc.c:169  fork_sched: the fork graph allocator in fork-sched/fork-alloc.c, upstream by default
+variant  ggml/src/ggml-alloc.c:252  fork_sched: the fork graph allocator in fork-sched/fork-alloc.c, upstream by default
+variant  ggml/src/ggml-alloc.c:350  fork_sched: the fork graph allocator in fork-sched/fork-alloc.c, upstream by default
+variant  ggml/src/ggml-alloc.c:369  fork_sched: the fork graph allocator in fork-sched/fork-alloc.c, upstream by default
+variant  ggml/src/ggml-alloc.c:396  fork_sched: the fork graph allocator in fork-sched/fork-alloc.c, upstream by default
+variant  ggml/src/ggml-alloc.c:403  fork_sched: the fork graph allocator in fork-sched/fork-alloc.c, upstream by default
+variant  ggml/src/ggml-alloc.c:410  fork_sched: the fork graph allocator in fork-sched/fork-alloc.c, upstream by default
+variant  ggml/src/ggml-alloc.c:415  fork_sched: the fork graph allocator in fork-sched/fork-alloc.c, upstream by default
+variant  ggml/src/ggml-alloc.c:446  fork_sched: the fork graph allocator in fork-sched/fork-alloc.c, upstream by default
+variant  ggml/src/ggml-alloc.c:601  fork_sched: the fork graph allocator in fork-sched/fork-alloc.c, upstream by default
+variant  ggml/src/ggml-alloc.c:658  fork_sched: the fork graph allocator in fork-sched/fork-alloc.c, upstream by default
+variant  ggml/src/ggml-alloc.c:668  fork_sched: the fork graph allocator in fork-sched/fork-alloc.c, upstream by default
+variant  ggml/src/ggml-alloc.c:681  fork_sched: the fork graph allocator in fork-sched/fork-alloc.c, upstream by default
+variant  ggml/src/ggml-alloc.c:698  fork_sched: the fork graph allocator in fork-sched/fork-alloc.c, upstream by default
+variant  ggml/src/ggml-alloc.c:822  fork_sched: the fork graph allocator in fork-sched/fork-alloc.c, upstream by default
+variant  ggml/src/ggml-alloc.c:843  fork_sched: the fork graph allocator in fork-sched/fork-alloc.c, upstream by default
+variant  ggml/src/ggml-alloc.c:865  fork_sched: the fork graph allocator in fork-sched/fork-alloc.c, upstream by default
+variant  ggml/src/ggml-alloc.c:877  fork_sched: the fork graph allocator in fork-sched/fork-alloc.c, upstream by default
+variant  ggml/src/ggml-alloc.c:897  fork_sched: the fork graph allocator in fork-sched/fork-alloc.c, upstream by default
+variant  ggml/src/ggml-alloc.c:1049  fork_sched: the fork graph allocator in fork-sched/fork-alloc.c, upstream by default
+variant  ggml/src/ggml-backend.cpp:111  fork_sched: the fork function in fork-sched/fork-backend.cpp, upstream by default
+variant  ggml/src/ggml-backend.cpp:115  fork_sched: the fork function in fork-sched/fork-backend.cpp, upstream by default
+variant  ggml/src/ggml-backend.cpp:138  fork_sched: the fork function in fork-sched/fork-backend.cpp, upstream by default
+variant  ggml/src/ggml-backend.cpp:359  fork_sched: the fork function in fork-sched/fork-backend.cpp, upstream by default
+variant  ggml/src/ggml-backend.cpp:807  fork_sched: the fork function in fork-sched/fork-backend.cpp, upstream by default
+variant  ggml/src/ggml-backend.cpp:917  fork_sched: the fork function in fork-sched/fork-backend.cpp, upstream by default
+variant  ggml/src/ggml-backend.cpp:1698  fork_sched: the fork function in fork-sched/fork-backend.cpp, upstream by default
+variant  ggml/src/ggml-backend.cpp:2052  fork_sched: the fork function in fork-sched/fork-backend.cpp, upstream by default
+variant  ggml/src/ggml-backend.cpp:2076  fork_sched: the fork function in fork-sched/fork-backend.cpp, upstream by default
+variant  ggml/src/ggml-backend.cpp:2081  fork_sched: the fork function in fork-sched/fork-backend.cpp, upstream by default
+variant  ggml/src/ggml-backend.cpp:2085  fork_sched: the fork function in fork-sched/fork-backend.cpp, upstream by default
+variant  ggml/src/ggml-backend.cpp:2141  fork_sched: the fork function in fork-sched/fork-backend.cpp, upstream by default
+variant  ggml/src/ggml-backend.cpp:2326  fork_sched: the fork function in fork-sched/fork-backend.cpp, upstream by default
+variant  ggml/src/ggml-backend.cpp:2455  fork_sched: the fork function in fork-sched/fork-backend.cpp, upstream by default
+adapted  ggml/src/CMakeLists.txt:197         the sanitizer sources in ggml-base: hooks/ggml/ggml-hooks.cmake (fork_sched)
+
+# other ggml core
+adapted  ggml/src/gguf.cpp:735               the check of the unassigned type ids: HOOK(gguf-type), ggml_hook_gguf_type_unassigned in ggml-fork-ops.c
+restored ggml/include/ggml-rpc.h:11          RPC_PROTO_PATCH_VERSION 3: no new op id with the hooks (EXL3 ops are custom nodes), so the protocol is unchanged
+restored ggml/include/ggml-rpc.h:14          static_assert(GGML_OP_COUNT == 102): the upstream count stays
+adapted  ggml/cmake/ggml-config.cmake.in:150 GGML_TRELLIS and GGML_USE_TRELLIS for the installed package: there is no GGML_TRELLIS option with the hooks
+adapted  ggml/src/ggml-metal/ggml-metal-device.m:1512 the trellis types have no Metal kernels: the backend wrapper refuses hook types where no kernel exists
+adapted  ggml/src/ggml-metal/ggml-metal-device.m:1533 same
+adapted  ggml/src/ggml-metal/ggml-metal-device.m:1993 same
+pending  ggml/src/ggml-impl.h:809            ggml_can_fuse_subgraph with 32 nodes: the fork fusions that need it get a copy, with the HIP and Vulkan stages

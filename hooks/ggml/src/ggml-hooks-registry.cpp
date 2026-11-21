@@ -550,6 +550,22 @@ void ggml_hook_register_section(int kind, const void * const * begin, const void
     }
 }
 
+bool ggml_hook_switch(const char * name, bool default_on) {
+    init_once();
+    auto & r = registry();
+    std::lock_guard<std::mutex> lock(r.mutex);
+    bool on = default_on;
+    for (const auto & rule : r.rules) {
+        if (rule.arch.empty() && glob_match(rule.pattern.c_str(), name)) {
+            on = rule.enable;
+        }
+    }
+    if (r.log) {
+        GGML_LOG_INFO("ggml-hooks: switch %s %s\n", name, on ? "on" : "off");
+    }
+    return on;
+}
+
 int ggml_hook_kernel_set_enabled(const char * pattern, bool enabled) {
     init_once();
     auto & r = registry();

@@ -154,6 +154,9 @@ GGML_API const ggml_hook_kernel * ggml_hook_find_op    (const ggml_hook_dev * de
 GGML_API const ggml_hook_kernel * ggml_hook_find_fusion(const ggml_hook_dev * dev, const ggml_cgraph * cgraph, int i, int * n_nodes);
 GGML_API void                     ggml_hook_kernel_used(const ggml_hook_kernel * kernel, const ggml_tensor * node);
 
+// a switch that is not a kernel (a replaced upstream subsystem): the GGML_HOOKS rules without an arch over its name
+GGML_API bool ggml_hook_switch(const char * name, bool default_on);
+
 // tests and A/B runs
 GGML_API int      ggml_hook_kernel_set_enabled(const char * pattern, bool enabled); // returns the number of kernels changed
 GGML_API uint64_t ggml_hook_kernel_hits(const char * name);

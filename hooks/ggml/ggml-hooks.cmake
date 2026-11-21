@@ -8,7 +8,7 @@ get_target_property(GGML_HOOKS_GGML_SRC ggml-base SOURCE_DIR) # ggml/src
 target_sources(ggml-base PRIVATE ${GGML_HOOKS_DIR}/src/ggml-hooks-registry.cpp ${GGML_HOOKS_DIR}/src/ggml-hooks-wrap.cpp
                                  ${GGML_HOOKS_DIR}/types/types.c ${GGML_HOOKS_DIR}/types/ggml-quants-ext.c
                                  ${GGML_HOOKS_DIR}/types/rocmfp4/rocmfp4.c ${GGML_HOOKS_DIR}/types/rocmfpx/rocmfpx.c
-                                 ${GGML_HOOKS_DIR}/exl3/ggml-exl3-ops.c)
+                                 ${GGML_HOOKS_DIR}/exl3/ggml-exl3-ops.c ${GGML_HOOKS_DIR}/src/ggml-fork-ops.c)
 # EXL3: the decoder library of the fork, as ggml/src/CMakeLists.txt of the fork
 if (GGML_EXL3)
     target_sources(ggml-base PRIVATE ${GGML_HOOKS_DIR}/exl3/exl3.c)
@@ -20,8 +20,23 @@ target_include_directories(ggml-base PRIVATE ${GGML_HOOKS_DIR}/types)
 target_compile_definitions(ggml-base PUBLIC GGML_HOOKS)
 target_link_libraries(ggml-base PRIVATE ${CMAKE_DL_LIBS})
 
+# the fork_sched switch: the scheduler, graph allocator and sanitizer of the fork beside the upstream ones
+# (hooks/ggml/src/ggml-fork-sched.cpp). The upstream ggml-backend.cpp is compiled through ggml-backend-upstream.cpp.
+include(${GGML_HOOKS_DIR}/src/fork-sched/symbols.cmake)
+set(fork_sched_dir ${GGML_HOOKS_DIR}/src/fork-sched)
+target_sources(ggml-base PRIVATE ${fork_sched_dir}/fork-alloc.c ${fork_sched_dir}/fork-backend.cpp
+                                 ${fork_sched_dir}/ggml-backend-sanitize.cpp ${GGML_HOOKS_DIR}/src/ggml-fork-sched.cpp
+                                 ${GGML_HOOKS_DIR}/src/ggml-backend-upstream.cpp)
+set_source_files_properties(${GGML_HOOKS_GGML_SRC}/ggml-backend.cpp TARGET_DIRECTORY ggml-base PROPERTIES HEADER_FILE_ONLY ON)
+foreach (sym ${GGML_FORK_SCHED_SYMBOLS})
+    set_property(SOURCE ${fork_sched_dir}/fork-alloc.c ${fork_sched_dir}/fork-backend.cpp TARGET_DIRECTORY ggml-base
+                 APPEND PROPERTY COMPILE_DEFINITIONS "${sym}=fork_${sym}")
+endforeach()
+hooks_rename(ggml-base SOURCE ${GGML_HOOKS_GGML_SRC}/ggml-alloc.c SYMBOLS ${GGML_FORK_SCHED_ALLOC_UPSTREAM})
+hooks_rename(ggml-base SOURCE ${GGML_HOOKS_DIR}/src/ggml-backend-upstream.cpp SYMBOLS ${GGML_FORK_SCHED_BACKEND_UPSTREAM})
+
 # the fork ftypes, for the users of ggml-base
-hooks_rename(ggml-base SOURCE ${GGML_HOOKS_GGML_SRC}/ggml.c SYMBOLS ggml_ftype_to_ggml_type)
+hooks_rename(ggml-base SOURCE ${GGML_HOOKS_GGML_SRC}/ggml.c SYMBOLS ggml_ftype_to_ggml_type ggml_dsv4_hc_pre ggml_dsv4_hc_pre_gated)
 
 # activation: the public functions that list devices and create backends install the wrapper first
 target_sources(ggml PRIVATE ${GGML_HOOKS_DIR}/src/ggml-hooks-activate.cpp)
