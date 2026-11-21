@@ -2300,6 +2300,9 @@ void llama_model_base::load_hparams_hadamard(llama_model_loader & ml) {
             // build_lora_mm_id (gate / up / gate_up / down); llama_verify_hadamard_graph
             // still throws if any folded weight reaches a matmul without its transform.
             case LLM_ARCH_QWEN4EXP:
+            // inkling2_loop (Inkling-2-Mini): routed experts (fused gate_up + down) go through build_moe_ffn ->
+            // build_lora_mm_id, every pass of the looped core included; llama_verify_hadamard_graph is the backstop.
+            case LLM_ARCH_INKLING2_LOOP:
                 break;
             default:
                 throw std::runtime_error(format(
