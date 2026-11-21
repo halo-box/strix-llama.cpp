@@ -5,7 +5,53 @@
 
 adapted  ggml/src/ggml-quants.c:4        include paths of rocmfp4.h and rocmfpx.h, now under hooks/ggml/types
 adapted  ggml/src/ggml-quants.h:7        include paths of rocmfp4.h and rocmfpx.h, now under hooks/ggml/types
-restored ggml/src/ggml-cpu/arch/x86/quants.c:864  (const char *) casts on two _mm_prefetch calls of the q4_0 kernel: same generated code; upstream rewrote these lines after 9048bad8d
-restored ggml/src/ggml-cpu/arch/x86/quants.c:882  same, two more casts
 adapted  ggml/include/ggml.h:263         the fork type ids, with their comments, as defines in hooks/ggml/include/ggml-hook-points.h; GGML_TYPE_COUNT is 160 there
 adapted  ggml/include/ggml.h:317         the fork ftype ids, with their comments, as defines in hooks/ggml/include/ggml-hook-points.h
+
+# CPU (hooks/ggml/kernels/cpu)
+variant  ggml/src/ggml-cpu/ggml-cpu.c:1349   mul_mat with an F16 src1 into a quantized vec_dot_type: fork-mul-mat.c, kernel fork_cpu_mul_mat_f16_act (on)
+variant  ggml/src/ggml-cpu/ggml-cpu.c:1352   same
+variant  ggml/src/ggml-cpu/ggml-cpu.c:1378   same
+variant  ggml/src/ggml-cpu/ggml-cpu.c:1488   compact MUL_MAT_ID row map: fork-mul-mat.c, kernels fork_cpu_mul_mat_id_f16_act (on, F16 src1) and fork_cpu_mul_mat_id (variant, off)
+variant  ggml/src/ggml-cpu/ggml-cpu.c:1499   same
+variant  ggml/src/ggml-cpu/ggml-cpu.c:1506   same
+variant  ggml/src/ggml-cpu/ggml-cpu.c:1528   same
+variant  ggml/src/ggml-cpu/ggml-cpu.c:1612   same
+variant  ggml/src/ggml-cpu/ggml-cpu.c:1633   same
+variant  ggml/src/ggml-cpu/ggml-cpu.c:1652   same
+variant  ggml/src/ggml-cpu/ggml-cpu.c:1665   same
+variant  ggml/src/ggml-cpu/ggml-cpu.c:1744   same
+variant  ggml/src/ggml-cpu/ggml-cpu.c:1746   same
+variant  ggml/src/ggml-cpu/ggml-cpu.c:2917   the MUL_MAT_ID work size of the compact map: cpu_work_size of the fork_cpu_mul_mat_id kernels
+variant  ggml/src/ggml-cpu/arch/x86/quants.c:864  the q4_0 casts: fork-q4_0-x86.c, kernel fork_cpu_q4_0_prefetch_casts (variant, off)
+variant  ggml/src/ggml-cpu/arch/x86/quants.c:882  same
+adapted  ggml/src/ggml-cpu/tiled/tiled.cpp:630   the src1 check for IQ1_M too: fork_tiled_src1_ok in fork-mul-mat.c, before the tiled path of the fork kernels; upstream nodes never give tiled another src1
+adapted  ggml/src/ggml-cpu/ggml-cpu.cpp:431  the GGML_TRELLIS=OFF guard of supports_op: the hooks have no such option, and the backend wrapper refuses a hook type that no kernel takes
+adapted  ggml/src/ggml-cpu/ggml-cpu.cpp:458  supports_op of MUL_MAT with an F16 src1: the supports of fork_cpu_mul_mat_f16_act
+adapted  ggml/src/ggml-cpu/ggml-cpu.cpp:462  same
+adapted  ggml/src/ggml-cpu/ops.cpp:677   the fork type labels of ggml_compute_forward_add: kernel fork_cpu_add_q runs the same ggml_compute_forward_add_q_f32 (fork-ops-q.inc)
+adapted  ggml/src/ggml-cpu/ops.cpp:684   same
+restored ggml/src/ggml-cpu/ops.cpp:1134  the fork type labels of ggml_compute_forward_add1: GGML_OP_ADD1 is not an op of upstream 9048bad8d, the function is never called
+restored ggml/src/ggml-cpu/ops.cpp:1142  same
+restored ggml/src/ggml-cpu/ops.cpp:1266  the fork type labels of ggml_compute_forward_acc: they are in the GGML_ABORT group, the same as default
+restored ggml/src/ggml-cpu/ops.cpp:1274  same
+adapted  ggml/src/ggml-cpu/ops.cpp:4859  the fork type labels of ggml_compute_forward_out_prod: kernel fork_cpu_out_prod_q (fork-ops-q.inc)
+adapted  ggml/src/ggml-cpu/ops.cpp:4866  same
+restored ggml/src/ggml-cpu/ops.cpp:5184  the fork type labels of ggml_compute_forward_set: in the GGML_ABORT group, the same as default
+restored ggml/src/ggml-cpu/ops.cpp:5192  same
+adapted  ggml/src/ggml-cpu/ops.cpp:5410  the fork type labels of ggml_compute_forward_get_rows: kernel fork_cpu_get_rows_q (fork-ops-q.inc)
+adapted  ggml/src/ggml-cpu/ops.cpp:5418  same
+restored ggml/src/ggml-cpu/ops.cpp:6083  the fork type labels of ggml_compute_forward_clamp: in the GGML_ABORT group, the same as default
+restored ggml/src/ggml-cpu/ops.cpp:6091  same
+adapted  ggml/src/ggml-cpu/ggml-cpu.c:18    the rocmfp4/rocmfpx includes: hooks/ggml/types/cpu; the exl3-ops.h include goes with the EXL3 stage
+adapted  ggml/src/ggml-cpu/ggml-cpu.c:242   the type_traits_cpu entries of the trellis types: GGML_HOOK_TYPE_TRAITS_CPU (HOOK(type-traits-cpu)), wrappers in hooks/ggml/types/cpu/types-cpu.c
+adapted  ggml/src/ggml-cpu/ggml-cpu.c:252   the type_traits_cpu entries of the ROCm types: same
+adapted  ggml/src/ggml-cpu/ggml-cpu.c:3934  ggml_cpu_tq_init: run once before the first trellis kernel (tq_init_once, types-cpu.c), after ggml_cpu_init as in the fork
+adapted  ggml/src/ggml.c:13                  the rocmfp4/rocmfpx includes: hooks/ggml/types
+adapted  ggml/src/ggml.c:699                 the type_traits entries of the trellis types: GGML_HOOK_TYPE_TRAITS (HOOK(type-traits)), wrappers in hooks/ggml/types/types.c
+adapted  ggml/src/ggml.c:707                 the type_traits entries of the ROCm types: same
+adapted  ggml/src/ggml.c:8031                the quantize cases of the ROCm types: ggml_hook_type_quantize (HOOK(type-quantize)), types.c
+adapted  ggml/src/ggml.c:8043                the quantize cases of the trellis types: same
+adapted  ggml/src/ggml.c:1442                the ftype cases: ggml_ftype_to_ggml_type of types.c, upstream renamed (hooks_rename)
+adapted  ggml/src/ggml-quants.c:5531         the validate cases of the ROCm types: ggml_hook_type_validate (HOOK(type-validate)), types.c
+adapted  ggml/src/ggml-quants.c:5604         the validate cases of the trellis types: same

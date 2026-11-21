@@ -3,6 +3,12 @@
 #   The registrar is an object library built without the compile options of <target>: it runs when the library is
 #   loaded, also in a GGML_BACKEND_DL CPU variant that the CPU cannot run. Call it once per target, UNITS can be empty.
 #
+# hooks_rename(<target> SOURCE <upstream file> SYMBOLS <symbols...>)
+#   For public C functions: the upstream file is compiled with <symbol>=<symbol>__upstream, and a hooks file defines
+#   <symbol> and calls <symbol>__upstream. Every caller gets the hooks version, also programs built outside this tree
+#   against the libraries, which link-time wrapping cannot reach. A call inside the upstream file itself goes to the
+#   upstream version. If upstream moves the function to another file, the link fails (<symbol>__upstream undefined).
+#
 # hooks_wrap(<target> [API] SYMBOLS <symbols...>)
 #   Link-time wrapping: every call to <symbol> from another object file goes to __wrap_<symbol>, which can call
 #   __real_<symbol>. Applies to the link of <target> and of everything that links it.
@@ -83,5 +89,13 @@ function(hooks_wrap target)
     foreach (sym ${ARG_SYMBOLS})
         target_link_options(${target} ${scope} "LINKER:--wrap=${sym}")
         set_property(GLOBAL APPEND PROPERTY HOOKS_WRAPPED_SYMBOLS "${kind}:${target}:${sym}")
+    endforeach()
+endfunction()
+
+function(hooks_rename target)
+    cmake_parse_arguments(ARG "" "SOURCE" "SYMBOLS" ${ARGN})
+    foreach (sym ${ARG_SYMBOLS})
+        set_property(SOURCE ${ARG_SOURCE} TARGET_DIRECTORY ${target} APPEND PROPERTY COMPILE_DEFINITIONS "${sym}=${sym}__upstream")
+        set_property(GLOBAL APPEND PROPERTY HOOKS_WRAPPED_SYMBOLS "rename:${target}:${sym}")
     endforeach()
 endfunction()

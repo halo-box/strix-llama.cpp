@@ -16,12 +16,12 @@ target_compile_definitions(ggml-base PUBLIC GGML_HOOKS)
 target_link_libraries(ggml-base PRIVATE ${CMAKE_DL_LIBS})
 
 # the fork ftypes, for the users of ggml-base
-hooks_wrap(ggml-base API SYMBOLS ggml_ftype_to_ggml_type)
+hooks_rename(ggml-base SOURCE ${GGML_HOOKS_GGML_SRC}/ggml.c SYMBOLS ggml_ftype_to_ggml_type)
 
 # activation: the public functions that list devices and create backends install the wrapper first
 target_sources(ggml PRIVATE ${GGML_HOOKS_DIR}/src/ggml-hooks-activate.cpp)
 target_include_directories(ggml PRIVATE ${GGML_HOOKS_GGML_SRC})
-hooks_wrap(ggml API SYMBOLS
+hooks_rename(ggml SOURCE ${GGML_HOOKS_GGML_SRC}/ggml-backend-reg.cpp SYMBOLS
     ggml_backend_reg_count ggml_backend_reg_get ggml_backend_reg_by_name
     ggml_backend_dev_count ggml_backend_dev_get ggml_backend_dev_by_name ggml_backend_dev_by_type
     ggml_backend_init_by_name ggml_backend_init_by_type ggml_backend_init_best
@@ -30,7 +30,7 @@ hooks_wrap(ggml API SYMBOLS
 # CPU, every variant: the variants are created from ggml/src or from ggml/src/ggml-cpu
 if (GGML_CPU)
     file(GLOB GGML_HOOK_CPU_KERNELS CONFIGURE_DEPENDS ${GGML_HOOKS_DIR}/kernels/cpu/*.cpp)
-    file(GLOB GGML_HOOK_CPU_TYPES CONFIGURE_DEPENDS ${GGML_HOOKS_DIR}/types/cpu/*.c)
+    file(GLOB GGML_HOOK_CPU_TYPES CONFIGURE_DEPENDS ${GGML_HOOKS_DIR}/types/cpu/*.c ${GGML_HOOKS_DIR}/kernels/cpu/*.c)
     get_property(cpu_targets     DIRECTORY ${GGML_HOOKS_GGML_SRC}          PROPERTY BUILDSYSTEM_TARGETS)
     get_property(cpu_targets_sub DIRECTORY ${GGML_HOOKS_GGML_SRC}/ggml-cpu PROPERTY BUILDSYSTEM_TARGETS)
     foreach (target ${cpu_targets} ${cpu_targets_sub})

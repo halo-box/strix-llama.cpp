@@ -13,8 +13,17 @@ namespace {
 constexpr ggml_hook_dev cpu_dev = { GGML_HOOK_BACKEND_CPU, 0, 0, 0, "CPU", false };
 
 class hook_traits : public ggml::cpu::tensor_traits {
-    bool work_size(int, const ggml_tensor *, size_t &) override {
-        return false; // the op keeps the work size of the upstream kernel
+    bool work_size(int n_threads, const ggml_tensor * op, size_t & size) override {
+        const ggml_hook_kernel * k = ggml_hook_find_op(&cpu_dev, op);
+        if (!k || !k->cpu_work_size) {
+            return false; // the op keeps the work size of the upstream kernel
+        }
+        const size_t n = k->cpu_work_size(n_threads, op);
+        if (n == 0) {
+            return false;
+        }
+        size = n;
+        return true;
     }
 
     bool compute_forward(ggml_compute_params * params, ggml_tensor * op) override {

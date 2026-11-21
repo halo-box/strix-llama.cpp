@@ -393,67 +393,67 @@ LLAMA_HOOK_WRAP ggml_tensor * LLAMA_HOOK_WRAPPED(LLAMA_HOOK_CREATE_TENSOR)(llama
     return t;
 }
 
-// public C API
+// public C API: renamed to <name>__upstream in its upstream file (hooks_rename, llama-hooks.cmake)
 
-extern "C" llama_model * __real_llama_model_load_from_file(const char * path, llama_model_params params);
-LLAMA_HOOK_WRAP llama_model * __wrap_llama_model_load_from_file(const char * path, llama_model_params params) {
+extern "C" LLAMA_API llama_model * llama_model_load_from_file__upstream(const char * path, llama_model_params params);
+llama_model * llama_model_load_from_file(const char * path, llama_model_params params) {
     load_scope scope;
     if (llama_model * model = load_model_hooks({ path }, params)) {
         return model;
     }
-    return __real_llama_model_load_from_file(path, params);
+    return llama_model_load_from_file__upstream(path, params);
 }
 
-extern "C" llama_model * __real_llama_model_load_from_splits(const char ** paths, size_t n_paths, llama_model_params params);
-LLAMA_HOOK_WRAP llama_model * __wrap_llama_model_load_from_splits(const char ** paths, size_t n_paths, llama_model_params params) {
+extern "C" LLAMA_API llama_model * llama_model_load_from_splits__upstream(const char ** paths, size_t n_paths, llama_model_params params);
+llama_model * llama_model_load_from_splits(const char ** paths, size_t n_paths, llama_model_params params) {
     load_scope scope;
     if (llama_model * model = load_model_hooks(paths_of(paths, n_paths), params)) {
         return model;
     }
-    return __real_llama_model_load_from_splits(paths, n_paths, params);
+    return llama_model_load_from_splits__upstream(paths, n_paths, params);
 }
 
-extern "C" llama_model * __real_llama_model_load_from_file_ptr(FILE * file, llama_model_params params);
-LLAMA_HOOK_WRAP llama_model * __wrap_llama_model_load_from_file_ptr(FILE * file, llama_model_params params) {
+extern "C" LLAMA_API llama_model * llama_model_load_from_file_ptr__upstream(FILE * file, llama_model_params params);
+llama_model * llama_model_load_from_file_ptr(FILE * file, llama_model_params params) {
     load_scope scope;
     if (llama_model * model = load_model_hooks({}, params)) {
         return model;
     }
-    return __real_llama_model_load_from_file_ptr(file, params);
+    return llama_model_load_from_file_ptr__upstream(file, params);
 }
 
-extern "C" llama_model * __real_llama_model_init_from_user(gguf_context * metadata, llama_model_set_tensor_data_t set_tensor_data, void * ud, llama_model_params params);
-LLAMA_HOOK_WRAP llama_model * __wrap_llama_model_init_from_user(gguf_context * metadata, llama_model_set_tensor_data_t set_tensor_data, void * ud, llama_model_params params) {
+extern "C" LLAMA_API llama_model * llama_model_init_from_user__upstream(gguf_context * metadata, llama_model_set_tensor_data_t set_tensor_data, void * ud, llama_model_params params);
+llama_model * llama_model_init_from_user(gguf_context * metadata, llama_model_set_tensor_data_t set_tensor_data, void * ud, llama_model_params params) {
     load_scope scope;
     for (hook_entry * e : entries_with(&llama_hook::model_params)) {
         e->h.model_params({}, params);
         e->hits++;
     }
-    return __real_llama_model_init_from_user(metadata, set_tensor_data, ud, params);
+    return llama_model_init_from_user__upstream(metadata, set_tensor_data, ud, params);
 }
 
-extern "C" uint32_t __real_llama_model_quantize(const char * fname_inp, const char * fname_out, const llama_model_quantize_params * params);
-LLAMA_HOOK_WRAP uint32_t __wrap_llama_model_quantize(const char * fname_inp, const char * fname_out, const llama_model_quantize_params * params) {
+extern "C" LLAMA_API uint32_t llama_model_quantize__upstream(const char * fname_inp, const char * fname_out, const llama_model_quantize_params * params);
+uint32_t llama_model_quantize(const char * fname_inp, const char * fname_out, const llama_model_quantize_params * params) {
     // the quantizer creates the model through llama_model_create, which sets the model tag
     load_scope scope;
-    return __real_llama_model_quantize(fname_inp, fname_out, params);
+    return llama_model_quantize__upstream(fname_inp, fname_out, params);
 }
 
-extern "C" void __real_llama_model_free(llama_model * model);
-LLAMA_HOOK_WRAP void __wrap_llama_model_free(llama_model * model) {
+extern "C" LLAMA_API void llama_model_free__upstream(llama_model * model);
+void llama_model_free(llama_model * model) {
     if (model) {
         for (hook_entry * e : entries_with(&llama_hook::model_free)) {
             e->h.model_free(*model);
             e->hits++;
         }
     }
-    __real_llama_model_free(model);
+    llama_model_free__upstream(model);
 }
 
-extern "C" llama_context * __real_llama_init_from_model(llama_model * model, llama_context_params params);
-LLAMA_HOOK_WRAP llama_context * __wrap_llama_init_from_model(llama_model * model, llama_context_params params) {
+extern "C" LLAMA_API llama_context * llama_init_from_model__upstream(llama_model * model, llama_context_params params);
+llama_context * llama_init_from_model(llama_model * model, llama_context_params params) {
     if (!model) {
-        return __real_llama_init_from_model(model, params);
+        return llama_init_from_model__upstream(model, params);
     }
     const std::string arch = arch_of(*model);
     for (hook_entry * e : entries_with(&llama_hook::context_params)) {
@@ -466,7 +466,7 @@ LLAMA_HOOK_WRAP llama_context * __wrap_llama_init_from_model(llama_model * model
     {
         // the constructor reserves the graphs: the kernels see the model
         process_scope scope(*model, nullptr);
-        ctx = __real_llama_init_from_model(model, params);
+        ctx = llama_init_from_model__upstream(model, params);
     }
     if (!ctx) {
         return ctx;
@@ -485,8 +485,8 @@ LLAMA_HOOK_WRAP llama_context * __wrap_llama_init_from_model(llama_model * model
     return ctx;
 }
 
-extern "C" void __real_llama_free(llama_context * ctx);
-LLAMA_HOOK_WRAP void __wrap_llama_free(llama_context * ctx) {
+extern "C" LLAMA_API void llama_free__upstream(llama_context * ctx);
+void llama_free(llama_context * ctx) {
     if (ctx) {
         const std::string arch = arch_of(ctx->get_model());
         for (hook_entry * e : entries_with(&llama_hook::context_free)) {
@@ -499,7 +499,7 @@ LLAMA_HOOK_WRAP void __wrap_llama_free(llama_context * ctx) {
         std::lock_guard<std::mutex> lock(r.ctx_mutex);
         r.contexts.erase(llama_hooks_context_key(*ctx));
     }
-    __real_llama_free(ctx);
+    llama_free__upstream(ctx);
 }
 
 template <typename F>
@@ -525,63 +525,63 @@ static int32_t run_process(llama_context * ctx, int type, F && real) {
     return ret;
 }
 
-extern "C" int32_t __real_llama_process(llama_context * ctx, enum llama_process_type type, llama_batch_ext * batch);
-LLAMA_HOOK_WRAP int32_t __wrap_llama_process(llama_context * ctx, enum llama_process_type type, llama_batch_ext * batch) {
-    return run_process(ctx, type, [&] { return __real_llama_process(ctx, type, batch); });
+extern "C" LLAMA_API int32_t llama_process__upstream(llama_context * ctx, enum llama_process_type type, llama_batch_ext * batch);
+int32_t llama_process(llama_context * ctx, enum llama_process_type type, llama_batch_ext * batch) {
+    return run_process(ctx, type, [&] { return llama_process__upstream(ctx, type, batch); });
 }
 
-extern "C" int32_t __real_llama_decode(llama_context * ctx, llama_batch batch);
-LLAMA_HOOK_WRAP int32_t __wrap_llama_decode(llama_context * ctx, llama_batch batch) {
-    return run_process(ctx, LLAMA_PROCESS_TYPE_DECODE, [&] { return __real_llama_decode(ctx, batch); });
+extern "C" LLAMA_API int32_t llama_decode__upstream(llama_context * ctx, llama_batch batch);
+int32_t llama_decode(llama_context * ctx, llama_batch batch) {
+    return run_process(ctx, LLAMA_PROCESS_TYPE_DECODE, [&] { return llama_decode__upstream(ctx, batch); });
 }
 
-extern "C" int32_t __real_llama_encode(llama_context * ctx, llama_batch batch);
-LLAMA_HOOK_WRAP int32_t __wrap_llama_encode(llama_context * ctx, llama_batch batch) {
-    return run_process(ctx, LLAMA_PROCESS_TYPE_ENCODE, [&] { return __real_llama_encode(ctx, batch); });
+extern "C" LLAMA_API int32_t llama_encode__upstream(llama_context * ctx, llama_batch batch);
+int32_t llama_encode(llama_context * ctx, llama_batch batch) {
+    return run_process(ctx, LLAMA_PROCESS_TYPE_ENCODE, [&] { return llama_encode__upstream(ctx, batch); });
 }
 
-extern "C" void __real_llama_memory_clear(llama_memory_t mem, bool data);
-LLAMA_HOOK_WRAP void __wrap_llama_memory_clear(llama_memory_t mem, bool data) {
-    __real_llama_memory_clear(mem, data);
+extern "C" LLAMA_API void llama_memory_clear__upstream(llama_memory_t mem, bool data);
+void llama_memory_clear(llama_memory_t mem, bool data) {
+    llama_memory_clear__upstream(mem, data);
     llama_hook_memory_op op = make_op(LLAMA_HOOK_MEMORY_CLEAR, -1, -1, -1);
     op.data = data;
     memory_op(mem, op);
 }
 
-extern "C" bool __real_llama_memory_seq_rm(llama_memory_t mem, llama_seq_id seq_id, llama_pos p0, llama_pos p1);
-LLAMA_HOOK_WRAP bool __wrap_llama_memory_seq_rm(llama_memory_t mem, llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
-    const bool res = __real_llama_memory_seq_rm(mem, seq_id, p0, p1);
+extern "C" LLAMA_API bool llama_memory_seq_rm__upstream(llama_memory_t mem, llama_seq_id seq_id, llama_pos p0, llama_pos p1);
+bool llama_memory_seq_rm(llama_memory_t mem, llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    const bool res = llama_memory_seq_rm__upstream(mem, seq_id, p0, p1);
     llama_hook_memory_op op = make_op(LLAMA_HOOK_MEMORY_SEQ_RM, seq_id, p0, p1);
     op.result = res;
     memory_op(mem, op);
     return res;
 }
 
-extern "C" void __real_llama_memory_seq_cp(llama_memory_t mem, llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1);
-LLAMA_HOOK_WRAP void __wrap_llama_memory_seq_cp(llama_memory_t mem, llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
-    __real_llama_memory_seq_cp(mem, seq_id_src, seq_id_dst, p0, p1);
+extern "C" LLAMA_API void llama_memory_seq_cp__upstream(llama_memory_t mem, llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1);
+void llama_memory_seq_cp(llama_memory_t mem, llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
+    llama_memory_seq_cp__upstream(mem, seq_id_src, seq_id_dst, p0, p1);
     llama_hook_memory_op op = make_op(LLAMA_HOOK_MEMORY_SEQ_CP, seq_id_src, p0, p1);
     op.seq_id_dst = seq_id_dst;
     memory_op(mem, op);
 }
 
-extern "C" void __real_llama_memory_seq_keep(llama_memory_t mem, llama_seq_id seq_id);
-LLAMA_HOOK_WRAP void __wrap_llama_memory_seq_keep(llama_memory_t mem, llama_seq_id seq_id) {
-    __real_llama_memory_seq_keep(mem, seq_id);
+extern "C" LLAMA_API void llama_memory_seq_keep__upstream(llama_memory_t mem, llama_seq_id seq_id);
+void llama_memory_seq_keep(llama_memory_t mem, llama_seq_id seq_id) {
+    llama_memory_seq_keep__upstream(mem, seq_id);
     memory_op(mem, make_op(LLAMA_HOOK_MEMORY_SEQ_KEEP, seq_id, -1, -1));
 }
 
-extern "C" void __real_llama_memory_seq_add(llama_memory_t mem, llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos delta);
-LLAMA_HOOK_WRAP void __wrap_llama_memory_seq_add(llama_memory_t mem, llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos delta) {
-    __real_llama_memory_seq_add(mem, seq_id, p0, p1, delta);
+extern "C" LLAMA_API void llama_memory_seq_add__upstream(llama_memory_t mem, llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos delta);
+void llama_memory_seq_add(llama_memory_t mem, llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos delta) {
+    llama_memory_seq_add__upstream(mem, seq_id, p0, p1, delta);
     llama_hook_memory_op op = make_op(LLAMA_HOOK_MEMORY_SEQ_ADD, seq_id, p0, p1);
     op.shift = delta;
     memory_op(mem, op);
 }
 
-extern "C" void __real_llama_memory_seq_div(llama_memory_t mem, llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d);
-LLAMA_HOOK_WRAP void __wrap_llama_memory_seq_div(llama_memory_t mem, llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) {
-    __real_llama_memory_seq_div(mem, seq_id, p0, p1, d);
+extern "C" LLAMA_API void llama_memory_seq_div__upstream(llama_memory_t mem, llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d);
+void llama_memory_seq_div(llama_memory_t mem, llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) {
+    llama_memory_seq_div__upstream(mem, seq_id, p0, p1, d);
     llama_hook_memory_op op = make_op(LLAMA_HOOK_MEMORY_SEQ_DIV, seq_id, p0, p1);
     op.d = d;
     memory_op(mem, op);

@@ -19,7 +19,7 @@
 #include <cstdint>
 #include <memory>
 
-#define GGML_HOOK_ABI_VERSION 4
+#define GGML_HOOK_ABI_VERSION 5
 
 enum ggml_hook_backend {
     GGML_HOOK_BACKEND_CPU,
@@ -84,6 +84,8 @@ struct ggml_hook_kernel {
     ggml_hook_match_fn    match    = nullptr; // GGML_HOOK_KIND_FUSION
     ggml_hook_compute     compute;
     const char *          models   = nullptr; // nullptr: every model, else comma separated GGUF archs ("qwen35moe,llama")
+    // CPU: the work buffer the kernel needs (bytes for the whole node), 0 or nullptr: the size upstream computes for the op
+    size_t (*cpu_work_size)(int n_threads, const ggml_tensor * op) = nullptr;
     void *                internal = nullptr; // set by the registry in its copy
 };
 

@@ -11,10 +11,13 @@ hooks_wrap(llama SYMBOLS
     _ZNK11llama_model11build_graphERK16llm_graph_params
     _ZNK11llama_model13create_memoryERK19llama_memory_paramsRK13llama_cparams
     _ZN18llama_model_loader13create_tensorERK13llama_hparamsPKSt6vectorISt4pairIP19ggml_backend_deviceP24ggml_backend_buffer_typeESaIS9_EESD_SD_SD_RK11LLM_TN_IMPLRKSt16initializer_listIlEi)
-hooks_wrap(llama API SYMBOLS
-    llama_model_load_from_file llama_model_load_from_splits llama_model_load_from_file_ptr llama_model_init_from_user llama_model_quantize llama_model_free
-    llama_init_from_model llama_free
-    llama_process llama_decode llama_encode
+# the public C API: renamed in its upstream file, so programs built outside the tree get the hooks too
+hooks_rename(llama SOURCE ${CMAKE_SOURCE_DIR}/src/llama.cpp SYMBOLS
+    llama_model_load_from_file llama_model_load_from_splits llama_model_load_from_file_ptr llama_model_init_from_user)
+hooks_rename(llama SOURCE ${CMAKE_SOURCE_DIR}/src/llama-model.cpp SYMBOLS llama_model_free)
+hooks_rename(llama SOURCE ${CMAKE_SOURCE_DIR}/src/llama-quant.cpp SYMBOLS llama_model_quantize)
+hooks_rename(llama SOURCE ${CMAKE_SOURCE_DIR}/src/llama-context.cpp SYMBOLS
+    llama_init_from_model llama_free llama_process llama_decode llama_encode
     llama_memory_clear llama_memory_seq_rm llama_memory_seq_cp llama_memory_seq_keep llama_memory_seq_add llama_memory_seq_div)
 
 # common: CLI arguments (hooks/common/args)

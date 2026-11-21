@@ -141,6 +141,8 @@ if missing_path:
     with open(missing_path, 'w') as out:
         for path, l, text in missing:
             out.write(f'{path}:{l}: {text}\n')
+        for path, l, n in unlisted:
+            out.write(f'UNLISTED {path}:{l} ({n} upstream lines removed)\n')
 
 print(f'fork {git("rev-parse", "--short=9", fork).strip()} vs upstream {git("rev-parse", "--short=9", base).strip()}: {len(stats)} files')
 print(f'added lines kept: {found}/{total} ({100.0 * found / max(total, 1):.1f} %), files complete: {files_done}/{len(stats)}')

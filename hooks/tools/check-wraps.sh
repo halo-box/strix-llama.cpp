@@ -23,7 +23,7 @@ find "$build" -name '*.o' -not -path '*/hooks/*' -not -path '*hooks-registrar*' 
 fail=0
 n=0
 while read -r kind target sym; do
-    [ "$kind" = api ] && continue
+    [ "$kind" = internal ] || continue # api and rename: the link checks them
     n=$((n + 1))
     if ! grep -qxF "$sym" "$undef"; then
         echo "  NOT CALLED  $sym ($target): no upstream object calls it from another file, the wrapper never runs"
