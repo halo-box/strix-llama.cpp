@@ -680,8 +680,9 @@ hc_gate_mix_kernel(const uint8_t * __restrict__ W, const uint16_t * __restrict__
         // unconditional prefetch/store (the last ones are unused): a conditional def kept the staged registers out of
         // SROA (144 B/lane scratch, vmcnt(0) right after each load on gfx1151)
         load_regs(min(ks + 1, nks - 1));
-        // rolled: unrolled, the four kk slices keep 24 operand fragments live on top of the accumulators and the staged
-        // W/Lo registers; gfx1151 / ROCm 7.1 clang 20 spilled 140 VGPRs (308 B/lane scratch) over the 4800 blocks of a call
+        // rolled: unrolled, the four kk slices keep 24 operand fragments live over the accumulators and the staged W/Lo;
+        // gfx1151 ROCm 7.1 clang 20 spills 140 VGPRs (308 B/lane scratch), ROCm 10.1 clang 24 does not (unrolled 156, rolled
+        // 180 VGPRs, occupancy 6 both). Drop the pragma once the oldest supported ROCm compiles the unrolled loop without spills.
 #pragma unroll 1
         for (int kk = 0; kk < MMB_BK; kk += 16) {
             v16s a[HC], b[JT]; const int r = lane & 15;
