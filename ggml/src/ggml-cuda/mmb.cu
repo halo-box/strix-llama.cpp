@@ -780,8 +780,8 @@ __device__ __forceinline__ void mmb_tile_gemm_glu(const uint8_t * __restrict__ W
     for (int i = 0; i < B_ITEMS; ++i) { const int c = tid + i * MMB_NT; brow[i] = xrow(c >> 3); }
     // grid-based types (mmb_lb): prefetch each lane's raw block fields into registers during the WMMA loop, grid in
     // LDS, pack + decode in store_lds. Same fp32 math as dequantize_* -> bit-identical.
-    // The 3-value IQ2 grid types take the mmb_ms3 decoder instead: 4 lanes per row, a lane's 16 weights (groups 2 il,
-    // 2 il + 1 of 32-block sub) share one scale and one 3-value table. Same bf16 weights in the same LDS slots.
+    // Types with an mmb_ms3 decoder (the 3-value IQ2 grids, IQ3_S) take it instead on every tier: 4 lanes per row, a lane's
+    // 16 weights (groups 2 il, 2 il + 1 of 32-block sub) share one scale. Same bf16 weights in the same LDS slots.
     constexpr bool M3 = mmb_ms3<WTYPE>::ok;
     using LBT = std::conditional_t<M3, mmb_ms3<WTYPE>, mmb_lb<WTYPE>>;
     constexpr bool LB = LBT::ok;

@@ -216,8 +216,8 @@ __device__ __forceinline__ uint4 mmb_lb_decode(const typename mmb_lb<WTYPE>::gri
         return mmb_lb<WTYPE>::decode(g, f, sub, il);
     }
 }
-// M-split decoders for the 3-value IQ2 grids: one lane decodes 16 consecutive weights of a row (groups il = 2 pc, 2 pc + 1
-// of one 32-block, which share their scale). Every IQ2_XXS / IQ2_XS / IQ2_S grid byte is 8, 25 or 43, so the three
+// M-split (mmb_ms3) decoders: one lane decodes 16 consecutive weights of a row (groups il = 2 pc, 2 pc + 1 of one
+// 32-block, which share their scale). IQ3_S is below. Every IQ2_XXS / IQ2_XS / IQ2_S grid byte is 8, 25 or 43, so the three
 // values RNE_bf16(d * 8), RNE_bf16(d * 25), RNE_bf16(d * 43) are formed once per 16 weights and v_perm picks one per
 // weight from the grid's 2-bit codes; signs are the bf16 sign-bit XOR (RNE is sign-symmetric). Same fp32 d and products
 // as mmb_lb<>::decode / mmb_grid8_bf16 -> bit-identical.
@@ -277,10 +277,8 @@ template <> struct mmb_ms3<32 + GGML_TYPE_IQ2_XXS> {
         w1 = mmb_iq2_dec8(g[f[2] >> 8], lo, hi, mmb_ksigns((f[0] >> (14 * pc + 7)) & 127));
     }
 };
-// IQ3_S on the register-operand routed GLU kernel: a lane's 16 weights of 32-block q, piece pc, are the two 8-weight
-// grid groups il = 2 pc, 2 pc + 1 (one 4-byte qs read, the block's qh, their two sign bytes, the 32-block's scale
-// nibble pre-selected in fetch). decode() is mmb_lb<IQ3_S>::decode twice: the same fp32 d * (1 + 2 ls) and
-// mmb_grid8_bf16 -> the same bf16 weights as the LDS-tile path, bit-identical.
+// IQ3_S: a lane's 16 weights are grid groups il = 2 pc, 2 pc + 1 of 32-block q (one 4-byte qs read, qh, two sign bytes, the
+// scale nibble pre-selected in fetch); decode() is mmb_lb<IQ3_S>::decode twice (same fp32 d * (1 + 2 ls), mmb_grid8_bf16) -> bit-identical.
 template <> struct mmb_ms3<32 + GGML_TYPE_IQ3_S> {
     static constexpr bool ok = true; using grid_t = uint32_t; static constexpr int N = 512, NR = 3;
     static __device__ __forceinline__ grid_t entry(const int i) { return iq3s_grid[i]; }
