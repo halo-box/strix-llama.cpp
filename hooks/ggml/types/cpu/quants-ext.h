@@ -50,22 +50,4 @@ void ggml_cpu_tq_init(void);
 }
 #endif
 
-// the fork's additions to ggml/src/ggml-cpu/arch-fallback.h: the trellis kernels with no arch version
-#if defined(__x86_64__) || defined(__i386__) || defined(_M_IX86) || defined(_M_X64)
-#    if !defined(GGML_CPU_GENERIC)
-#        define ggml_vec_dot_ptq1_0_q8_0_generic ggml_vec_dot_ptq1_0_q8_0
-#    else
-#        define GGML_HOOK_TYPES_ALL_GENERIC
-#    endif
-#else
-#    define GGML_HOOK_TYPES_ALL_GENERIC
-#endif
-#ifdef GGML_HOOK_TYPES_ALL_GENERIC
-#    define ggml_vec_dot_ptq1_0_q8_0_generic ggml_vec_dot_ptq1_0_q8_0
-#    define ggml_vec_dot_tqp5_q8_0_generic   ggml_vec_dot_tqp5_q8_0
-#    define ggml_vec_dot_tqp6_q8_0_generic   ggml_vec_dot_tqp6_q8_0
-#    define ggml_vec_dot_tqp7_q8_0_generic   ggml_vec_dot_tqp7_q8_0
-#    define ggml_vec_dot_tq2_t_q8_0_generic  ggml_vec_dot_tq2_t_q8_0
-#    define ggml_vec_dot_tqk6_q8_0_generic   ggml_vec_dot_tqk6_q8_0
-#    define ggml_vec_dot_tqk7_q8_0_generic   ggml_vec_dot_tqk7_q8_0
-#endif
+#include "arch-fallback-ext.h"

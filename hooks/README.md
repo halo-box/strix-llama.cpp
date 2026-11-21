@@ -120,6 +120,9 @@ running `llama_process`.
 ## Checks
 
 - `hooks/tools/check-hooks.sh <upstream base>`: every changed line outside `hooks/` belongs to a hook point of `HOOKS.txt`.
+- `hooks/tools/check-port.py <upstream base> <fork>`: every line the fork added is in this branch, and every
+  fork change that is not kept as it is has an entry in `hooks/PORT.txt` (adapted, restored, variant, dropped,
+  pending) with its reason. `--files` gives the state of each file.
 - `hooks/tools/check-wraps.sh <build dir>`: every internal wrapped symbol is still called from another object file.
   A call from the file that defines the symbol is not wrapped, without any link error.
 - `cmake --build build --target test-ggml-hooks test-llama-hooks`: kernels on and off against the reference on each

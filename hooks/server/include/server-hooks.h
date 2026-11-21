@@ -90,6 +90,7 @@ void server_hooks_on_update(const std::function<common_json()> & slots);
 void server_hooks_on_usage(const server_task_result_cmpl_final & res, common_json & usage);
 void server_hooks_public_paths(std::unordered_set<std::string> & paths);
 bool server_hooks_model_hidden(const common_preset & preset);
+void server_hooks_register_routes(server_http_context & http);
 
 #define SERVER_HOOK_REGISTER(...) \
     static const bool GGML_HOOK_CONCAT(server_hooks_registered_, __LINE__) = [] { server_hooks h_ = __VA_ARGS__; server_hook_register(h_); return true; }()

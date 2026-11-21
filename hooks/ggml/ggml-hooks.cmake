@@ -15,6 +15,9 @@ target_include_directories(ggml-base PRIVATE ${GGML_HOOKS_DIR}/types)
 target_compile_definitions(ggml-base PUBLIC GGML_HOOKS)
 target_link_libraries(ggml-base PRIVATE ${CMAKE_DL_LIBS})
 
+# the fork ftypes, for the users of ggml-base
+hooks_wrap(ggml-base API SYMBOLS ggml_ftype_to_ggml_type)
+
 # activation: the public functions that list devices and create backends install the wrapper first
 target_sources(ggml PRIVATE ${GGML_HOOKS_DIR}/src/ggml-hooks-activate.cpp)
 target_include_directories(ggml PRIVATE ${GGML_HOOKS_GGML_SRC})

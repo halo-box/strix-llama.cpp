@@ -50,21 +50,57 @@ _Static_assert(GGML_TYPE_COUNT_UPSTREAM <= GGML_TYPE_HOOKS_FIRST, "upstream ggml
     X(TQP7,              149, tqp7,              128, 58, GGML_TYPE_Q8_0, 1) \
     X(Q8_0_HOOK_EXAMPLE, 159, q8_0_hook_example,  32, 34, GGML_TYPE_Q8_0, 1)
 
-// the type ids, the same values as in the fork (GGUF files store them). GGML_HOOK_TYPES_LIST checks each one.
-#define GGML_TYPE_Q4_0_ROCMFP4      ((enum ggml_type) 100)
-#define GGML_TYPE_Q4_0_ROCMFP4_FAST ((enum ggml_type) 101)
-#define GGML_TYPE_Q6_0_ROCMFPX      ((enum ggml_type) 102)
-#define GGML_TYPE_Q8_0_ROCMFPX      ((enum ggml_type) 103)
-#define GGML_TYPE_Q3_0_ROCMFPX      ((enum ggml_type) 104)
-#define GGML_TYPE_Q2_0_ROCMFPX      ((enum ggml_type) 107)
-#define GGML_TYPE_PTQ1_0            ((enum ggml_type) 143)
-#define GGML_TYPE_TQ2_T             ((enum ggml_type) 144)
-#define GGML_TYPE_TQK6              ((enum ggml_type) 145)
-#define GGML_TYPE_TQK7              ((enum ggml_type) 146)
-#define GGML_TYPE_TQP5              ((enum ggml_type) 147)
-#define GGML_TYPE_TQP6              ((enum ggml_type) 148)
-#define GGML_TYPE_TQP7              ((enum ggml_type) 149)
-#define GGML_TYPE_Q8_0_HOOK_EXAMPLE ((enum ggml_type) 159)
+// The type and ftype ids of the fork: its enum lines of ggml/include/ggml.h (upstream 9048bad8d, fork 1fe05fa45),
+// as defines. GGUF files store these values. GGML_HOOK_TYPES_LIST checks each type id.
+// ROCmFPx experimental AMD-native formats. These are kept in a high ID
+// range so upstream type IDs stay free for future ggml types.
+#define GGML_TYPE_Q4_0_ROCMFP4                       ((enum ggml_type) 100) // ROCmFP4 experimental UE4M3 scales + packed AMD FP4 blocks
+#define GGML_TYPE_Q4_0_ROCMFP4_FAST                  ((enum ggml_type) 101) // ROCmFP4 single-scale speed layout
+#define GGML_TYPE_Q6_0_ROCMFPX                       ((enum ggml_type) 102) // ROCmFPx experimental 6-bit UE4M3-scale reference layout
+#define GGML_TYPE_Q8_0_ROCMFPX                       ((enum ggml_type) 103) // ROCmFPx experimental 8-bit UE4M3-scale reference layout
+#define GGML_TYPE_Q3_0_ROCMFPX                       ((enum ggml_type) 104) // ROCmFPx experimental 3-bit UE4M3-scale reference layout
+// 105, 106 are TURBO3_0 / TURBO4_0 and 108 is Q4_0_ROCMI4 in charlie12345/ROCmFPX;
+// left unassigned here so a GGUF from that tree is rejected rather than misread.
+// Note ciru-ai/ROCmFPX diverges: it puts Q7_0_ROCMFPX at 107 and Q2_0_ROCMFPX at 108.
+#define GGML_TYPE_Q2_0_ROCMFPX                       ((enum ggml_type) 107) // ROCmFPx experimental 2-bit S40 codebook + dual UE4M3 scales
+// Prism-private ternary at group size 128, ported from PrismML-Eng/llama.cpp
+// (Ternary-Bonsai GGUFs). High id so it slots above upstream types; type_traits
+// is sized to COUNT with 44..99 and 108..142 unused (100..107 are ROCmFPx). PQ2_0 (142) is deliberately not ported:
+// it has no Vulkan kernels upstream of us either.
+#define GGML_TYPE_PTQ1_0                             ((enum ggml_type) 143)
+// Trellis-coded 2.125 bpw (QTIP-style bitshift trellis, L=16 K=8 V=4, hashed
+// 2-D "Hyb" codebook), group 128.
+#define GGML_TYPE_TQ2_T                              ((enum ggml_type) 144)
+// Bit-packed trellis siblings of TQ2_T (K = 6 / 7 new bits per 4-weight step,
+// same codebook): 1.625 / 1.875 bpw, group 128.
+#define GGML_TYPE_TQK6                               ((enum ggml_type) 145)
+#define GGML_TYPE_TQK7                               ((enum ggml_type) 146)
+// Pair trellis (V=2): 64 steps of 2 weights per 128-weight block, K = 5 / 6 / 7 new bits
+// per step, TQ2_T codebook (first pair of each state): 2.625 / 3.125 / 3.625 bpw.
+#define GGML_TYPE_TQP5                               ((enum ggml_type) 147)
+#define GGML_TYPE_TQP6                               ((enum ggml_type) 148)
+#define GGML_TYPE_TQP7                               ((enum ggml_type) 149)
+#define GGML_TYPE_Q8_0_HOOK_EXAMPLE                  ((enum ggml_type) 159) // test type of the hooks (a copy of q8_0)
+
+#define GGML_FTYPE_MOSTLY_Q4_0_ROCMFP4               ((enum ggml_ftype) 100) // except 1d tensors
+#define GGML_FTYPE_MOSTLY_Q4_0_ROCMFP4_LEAN          ((enum ggml_ftype) 101) // ROCmFP4 with Q5_K token embeddings
+#define GGML_FTYPE_MOSTLY_Q4_0_ROCMFP4_COHERENT      ((enum ggml_ftype) 102) // ROCmFP4 with Q6_K token embeddings
+#define GGML_FTYPE_MOSTLY_Q4_0_ROCMFP4_FAST          ((enum ggml_ftype) 103) // ROCmFP4 single-scale speed layout
+#define GGML_FTYPE_MOSTLY_Q4_0_ROCMFP4_FAST_COHERENT ((enum ggml_ftype) 104) // ROCmFP4 fast with Q6_K token embeddings
+#define GGML_FTYPE_MOSTLY_Q4_0_ROCMFP4_STRIX         ((enum ggml_ftype) 105) // ROCmFP4 Strix Halo quality/speed recipe
+#define GGML_FTYPE_MOSTLY_Q4_0_ROCMFP4_STRIX_LEAN    ((enum ggml_ftype) 106) // ROCmFP4 Strix Halo size-biased K/V recipe
+#define GGML_FTYPE_MOSTLY_Q6_0_ROCMFPX               ((enum ggml_ftype) 110) // ROCmFPx experimental 6-bit reference layout
+#define GGML_FTYPE_MOSTLY_Q8_0_ROCMFPX               ((enum ggml_ftype) 111) // ROCmFPx experimental 8-bit reference layout
+#define GGML_FTYPE_MOSTLY_Q3_0_ROCMFPX               ((enum ggml_ftype) 112) // ROCmFPx experimental 3-bit reference layout
+#define GGML_FTYPE_MOSTLY_Q2_0_ROCMFPX               ((enum ggml_ftype) 113) // ROCmFPx experimental 2-bit S40 codebook layout
+#define GGML_FTYPE_MOSTLY_PTQ1_0                     ((enum ggml_ftype) 129) // except 1d tensors (Prism-private group-128 ternary)
+#define GGML_FTYPE_MOSTLY_TQ2_T                      ((enum ggml_ftype) 130) // except 1d tensors (trellis-coded, group 128)
+#define GGML_FTYPE_MOSTLY_TQK6                       ((enum ggml_ftype) 131) // except 1d tensors (trellis-coded K=6, group 128)
+#define GGML_FTYPE_MOSTLY_TQK7                       ((enum ggml_ftype) 132) // except 1d tensors (trellis-coded K=7, group 128)
+#define GGML_FTYPE_MOSTLY_TQP5                       ((enum ggml_ftype) 133) // except 1d tensors (pair trellis K=5, group 128)
+#define GGML_FTYPE_MOSTLY_TQP6                       ((enum ggml_ftype) 134) // except 1d tensors (pair trellis K=6, group 128)
+#define GGML_FTYPE_MOSTLY_TQP7                       ((enum ggml_ftype) 135) // except 1d tensors (pair trellis K=7, group 128)
+
 #define GGML_HOOK_TYPE_ID(NAME, ID, ...) _Static_assert((int) GGML_TYPE_##NAME == ID, "id of " #NAME);
 #ifndef __cplusplus
 GGML_HOOK_TYPES_LIST(GGML_HOOK_TYPE_ID)
