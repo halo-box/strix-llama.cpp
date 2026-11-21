@@ -1262,6 +1262,52 @@ public:
         }
     }
 
+    // the target batch rows process() injects for one sequence and their draft positions
+    std::vector<int32_t>   inject_rows;
+    std::vector<llama_pos> inject_pos;
+
+    // one row per target position the pinned image occupies; false = not the absolute (y, x) layout, skip the image
+    bool pinned_image_rows(const common_batch & batch_in, llama_seq_id seq_id) {
+        const llama_pos t = inject_pos.front();
+        if (t == 0) {
+            return false; // a zero-based layout (SenseNova U1) looks the same here; skipping is safe on an empty draft cache
+        }
+
+        llama_pos end = t;
+        for (const int32_t row : inject_rows) {
+            const auto & pos = batch_in.tokens[row].pos;
+            if (pos[1] < t || pos[2] < t) {
+                return false;
+            }
+            end = std::max(end, std::max(pos[1], pos[2]));
+        }
+
+        // an image split over several target batches: an earlier batch may already cover this one's positions
+        const llama_pos beg = std::max(t, llama_memory_seq_pos_max(llama_get_memory(this->params.ctx_dft), seq_id) + 1);
+
+        std::vector<int32_t> pick(end >= beg ? end - beg + 1 : 0, -1);
+        for (const int32_t row : inject_rows) {
+            const auto & pos = batch_in.tokens[row].pos;
+            const llama_pos q = std::max(pos[1], pos[2]);
+            if (q >= beg) {
+                pick[q - beg] = row; // rows are row-major, so the last write is the shell's last row
+            }
+        }
+
+        // a position without a row of this batch (its shell started in an earlier batch) reuses the previous row,
+        // or the batch's first row, so no position is ever left out
+        int32_t prev = inject_rows.front();
+        inject_rows.clear();
+        inject_pos.clear();
+        for (size_t i = 0; i < pick.size(); ++i) {
+            prev = pick[i] >= 0 ? pick[i] : prev;
+            inject_rows.push_back(prev);
+            inject_pos.push_back(beg + (llama_pos) i);
+        }
+
+        return true;
+    }
+
     bool process(const common_batch & batch_in) override {
         if (batch_in.size() <= 0) {
             return true;
@@ -1302,15 +1348,24 @@ public:
             if (i_batch_beg[seq_id] < 0) {
                 continue;
             }
-            const int32_t n_rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
-
-            // an M-RoPE image pins all its rows to one position, so a windowed draft
-            // cache cannot free cells for it - skip it, the draft can jump over the gap
-            const bool pos_pinned = batch_in.tokens[i_batch_beg[seq_id]].pos[0] == batch_in.tokens[i_batch_end[seq_id]].pos[0];
-            if (has_embeddings && n_rows > 1 && pos_pinned) {
-                continue;
+            // target batch rows to inject and the draft position of each, by default every row at its target position
+            inject_rows.clear();
+            inject_pos.clear();
+            for (int32_t row = i_batch_beg[seq_id]; row <= i_batch_end[seq_id]; ++row) {
+                inject_rows.push_back(row);
+                inject_pos.push_back(batch_in.tokens[row].pos[0]);
             }
 
+            // an M-RoPE image pins its rows to t but occupies [t, t + max(nx, ny)): fill that span so a 1-D draft cache
+            // stays consecutive
+            const bool pos_pinned = inject_pos.front() == inject_pos.back();
+            if (has_embeddings && inject_rows.size() > 1 && pos_pinned) {
+                if (!pinned_image_rows(batch_in, seq_id)) {
+                    continue; // not the absolute (y, x) layout: leave the image out of the draft cache
+                }
+            }
+
+            const int32_t n_rows = (int32_t) inject_rows.size();
             for (int32_t offset = 0; offset < n_rows; offset += n_ubatch) {
                 const int32_t n_chunk = std::min(n_ubatch, n_rows - offset);
 
@@ -1318,8 +1373,8 @@ public:
                     // the features are the target batch rows in the target's device buffer
                     batch_inject.clear();
                     for (int32_t i = 0; i < n_chunk; ++i) {
-                        const int32_t   row        = i_batch_beg[seq_id] + offset + i;
-                        const llama_pos p          = batch_in.tokens[row].pos[0];
+                        const int32_t   row        = inject_rows[offset + i];
+                        const llama_pos p          = inject_pos[offset + i];
                         const llama_pos pos_arr[4] = { p, p, p, 0 };
                         batch_inject.add_embd_row(row, pos_arr, seq_id, false);
                     }
@@ -1343,14 +1398,14 @@ public:
                     }
                     for (int32_t i = 0; i < n_chunk; ++i) {
                         float       * dst = features_buf.data() + (size_t) i * n_embd_enc + k * (size_t) n_embd_tgt;
-                        const float * src = layer + (size_t) (i_batch_beg[seq_id] + offset + i) * n_embd_tgt;
+                        const float * src = layer + (size_t) inject_rows[offset + i] * n_embd_tgt;
                         std::memcpy(dst, src, (size_t) n_embd_tgt * sizeof(float));
                     }
                 }
 
                 batch_inject.clear();
                 for (int32_t i = 0; i < n_chunk; ++i) {
-                    const llama_pos p = batch_in.tokens[i_batch_beg[seq_id] + offset + i].pos[0];
+                    const llama_pos p = inject_pos[offset + i];
                     const llama_pos pos_arr[4] = { p, p, p, 0 };
                     batch_inject.add_embd({ features_buf.data() + (size_t) i * n_embd_enc, 1, (size_t) n_embd_enc }, pos_arr, seq_id, false);
                 }
