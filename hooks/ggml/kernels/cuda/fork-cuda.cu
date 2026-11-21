@@ -4,8 +4,8 @@
 //
 // fork_cuda_node  (on):  the nodes that upstream refuses and the fork accepts (the fork types, the EXL3 ops, ...) are
 //                        computed by the fork ggml_cuda_compute_forward.
-// fork_cuda_graph (off): the fork computes whole graphs: its graph_optimize after the upstream one, then its
-//                        graph_compute (fusions, kernel selection, CUDA graphs). GGML_HOOKS=+fork_cuda_graph.
+// fork_cuda_graph (off): the fork computes the graphs instead of upstream: its graph_optimize and graph_compute
+//                        (fusions, kernel selection, CUDA graphs). GGML_HOOKS=+fork_cuda_graph (a switch).
 
 #include "../../fork-cuda/common.cuh"
 
@@ -144,35 +144,22 @@ bool graph_on() {
     return on;
 }
 
-// the whole graph from its first node
-int graph_match(const ggml_hook_dev *, const ggml_cgraph * cgraph, int i) {
-    for (int j = 0; j < i; ++j) {
-        const ggml_tensor * n = cgraph->nodes[j];
-        if (!ggml_is_empty(n) && !ggml_op_is_empty(n->op) && (n->flags & GGML_TENSOR_FLAG_COMPUTE)) {
-            return 0; // a computed node before i: the graph was not taken at its start
-        }
-    }
-    return cgraph->n_nodes - i >= 2 ? cgraph->n_nodes - i : 0;
-}
-
-void graph_compute(::ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i, int n) {
-    fork_state & s = state_of(ctx);
-    GGML_ASSERT(s.shim.context && "fork_cuda_graph: the backend was not initialized through the hooks");
-    ggml_cgraph v = *cgraph;
-    v.nodes   = cgraph->nodes + i;
-    v.n_nodes = n;
-    if (i != 0 || n != cgraph->n_nodes) {
-        v.uid = 0;
-    }
-    GGML_ASSERT(ggml_fork::ggml_hook_fork_graph_compute(&s.shim, &v) == GGML_STATUS_SUCCESS);
-}
-
-void graph_optimize(ggml_backend_t backend, ggml_cgraph * cgraph, ggml_backend_graph_optimize_params * params) {
+bool graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph, ggml_status * status) {
     if (!graph_on()) {
-        return;
+        return false;
+    }
+    fork_state & s = state_of(*(::ggml_backend_cuda_context *) backend->context, backend);
+    *status = ggml_fork::ggml_hook_fork_graph_compute(&s.shim, cgraph);
+    return true;
+}
+
+bool graph_optimize(ggml_backend_t backend, ggml_cgraph * cgraph, ggml_backend_graph_optimize_params * params) {
+    if (!graph_on()) {
+        return false;
     }
     fork_state & s = state_of(*(::ggml_backend_cuda_context *) backend->context, backend);
     ggml_fork::ggml_hook_fork_graph_optimize(&s.shim, cgraph, params);
+    return true;
 }
 
 // the registry procs of the fork that libllama asks for: on the fork context of the upstream backend
@@ -200,18 +187,12 @@ void * proc_address(ggml_backend_reg_t, const char * name) {
 GGML_HOOK_REGISTER_KERNEL(ggml_hook_op_kernel("fork_cuda_node", GGML_HOOK_BACKEND_CUDA, GGML_OP_COUNT, -1000, node_supports,
                                               ggml_hook_fn(static_cast<ggml_hook_cuda_op_fn>(node_compute))));
 
-GGML_HOOK_REGISTER_KERNEL([] {
-    auto k = ggml_hook_fusion_kernel("fork_cuda_graph", GGML_HOOK_BACKEND_CUDA, GGML_OP_COUNT, 1000, graph_match,
-                                     ggml_hook_fn(static_cast<ggml_hook_cuda_fusion_fn>(graph_compute)));
-    k.enabled_by_default = false;
-    return k;
-}());
-
 GGML_HOOK_REGISTER_BACKEND_EXT([] {
     auto e = ggml_hook_ext("fork_cuda", GGML_HOOK_BACKEND_CUDA);
     e.backend_init   = fork_backend_init;
     e.backend_free   = fork_backend_free;
-    e.graph_optimize = graph_optimize;
+    e.replace_graph_compute  = graph_compute;
+    e.replace_graph_optimize = graph_optimize;
     e.proc_address   = proc_address;
     return e;
 }());

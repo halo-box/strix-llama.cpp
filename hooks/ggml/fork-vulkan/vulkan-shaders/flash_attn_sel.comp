@@ -1,0 +1,176 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+
+// Maskless selected-key flash attention (QSA complete-block selection), portable scalar kernel: each query's row names
+// the cells it may attend to. flash_attn_sel_prep.comp has already cleaned every row (invalid entries and repeated
+// cells dropped, survivors first in their original order, count at the end of the buffer). One workgroup per (query,
+// K/V head, stream), one subgroup per query head of that K/V head, so each K/V row is read once per query.
+// Keys go in blocks of BK: two lanes compute one key's dot product (half the dims each), so the softmax needs two
+// subgroup reductions per block instead of one per key. With n_split > 1 (few queries) each workgroup takes one
+// chunk of the cleaned row and writes a partial result in the layout of flash_attn_split_k_reduce.comp.
+// flash_attn_sel_cm.comp is the fast path on RDNA3; this kernel runs everywhere else.
+
+layout(constant_id = 0) const uint WORKGROUP_SIZE = 768;
+layout(constant_id = 1) const uint SUBGROUP_SIZE = 64;
+layout(constant_id = 2) const uint GQA = 12;
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly  buffer QBuf   { float     data_q[];   };
+layout(binding = 1) readonly  buffer KBuf   { float16_t data_k[];   };
+layout(binding = 2) readonly  buffer VBuf   { float16_t data_v[];   };
+layout(binding = 3) readonly  buffer ListBuf { uint      data_list[]; };
+layout(binding = 4) writeonly buffer DstBuf { float     data_dst[]; };
+
+layout(push_constant) uniform Parameters {
+    uint n_kv;
+    uint n_sel;
+    uint list_stride;
+    uint nbq1;
+    uint nbq2;
+    uint nbq3;
+    uint nbk1;
+    uint nbk2;
+    uint nbk3;
+    uint nbv1;
+    uint nbv2;
+    uint nbv3;
+    uint nbi1;
+    uint nbi3;
+    uint nb1;
+    uint nb2;
+    uint nb3;
+    float scale;
+    uint n_split;
+    uint chunk;
+    uint n_head;
+    uint n_tok;
+    uint n_stream;
+} p;
+
+// The pipeline is created with subgroup size 64 and head size 256 only (see ggml_vk_flash_attn_sel_pipeline).
+const uint HEAD_SIZE = 256;
+const uint LANES = 64;
+const uint PER_LANE = HEAD_SIZE / LANES;
+const uint BK = 32;
+const uint HALF = HEAD_SIZE / 2;
+const uint NONE = 0xffffffffu;
+const float FLT_MAX = 3.402823466e38;
+
+shared uint block_key[BK];
+shared float q_sh[GQA * HEAD_SIZE];
+shared float16_t kt_sh[HEAD_SIZE * BK]; // K block, transposed: [dim][key], so the per-lane key reads hit different banks
+shared float16_t v_sh[BK * HEAD_SIZE];  // V block: [key][dim]
+shared float p_sh[GQA * BK];
+
+void main() {
+    const float NEG_INF = uintBitsToFloat(0xff800000);
+    const uint tid = gl_LocalInvocationIndex;
+    const uint lane = gl_SubgroupInvocationID;
+    const uint sg = gl_SubgroupID;
+    const uint split = gl_WorkGroupID.x % p.n_split;
+    const uint query = gl_WorkGroupID.x / p.n_split;
+    const uint kv_head = gl_WorkGroupID.y;
+    const uint stream = gl_WorkGroupID.z;
+    const uint head = kv_head * GQA + sg;
+
+    // No early return: every invocation must reach every barrier below.
+
+    const uint row = stream * p.n_tok + query;
+    const uint list_base = row * p.list_stride;
+    const uint count = data_list[p.n_tok * p.n_stream * p.list_stride + row];
+    const uint q_base = stream * p.nbq3 + head * p.nbq2 + query * p.nbq1;
+    [[unroll]] for (uint i = 0; i < PER_LANE; ++i) {
+        q_sh[sg * HEAD_SIZE + lane + i * LANES] = data_q[q_base + lane + i * LANES];
+    }
+    barrier();
+
+    float acc[PER_LANE];
+    [[unroll]] for (uint i = 0; i < PER_LANE; ++i) {
+        acc[i] = 0.0;
+    }
+    float row_max = NEG_INF;
+    float row_sum = 0.0;
+
+    const uint k_base = stream * p.nbk3 + kv_head * p.nbk2;
+    const uint v_base = stream * p.nbv3 + kv_head * p.nbv2;
+    const uint kcol = lane % BK;   // the key this lane scores
+    const uint khalf = lane / BK;  // and which half of its dims
+
+    const uint kb_begin = split * p.chunk;
+    const uint kb_end = min(count, kb_begin + p.chunk);
+    for (uint kb = kb_begin; kb < kb_end; kb += BK) {
+        if (tid < BK) {
+            const uint s = kb + tid;
+            block_key[tid] = s < kb_end ? data_list[list_base + s] : NONE;
+        }
+        barrier();
+
+        for (uint idx = tid; idx < BK * HEAD_SIZE; idx += WORKGROUP_SIZE) {
+            const uint col = idx / HEAD_SIZE;
+            const uint dim = idx % HEAD_SIZE;
+            const uint key = block_key[col];
+            kt_sh[dim * BK + col] = key != NONE ? data_k[k_base + key * p.nbk1 + dim] : float16_t(0.0);
+            v_sh[idx] = key != NONE ? data_v[v_base + key * p.nbv1 + dim] : float16_t(0.0);
+        }
+        barrier();
+
+        float s = 0.0;
+        const uint qoff = sg * HEAD_SIZE + khalf * HALF;
+        const uint koff = khalf * HALF * BK + kcol;
+        for (uint d = 0; d < HALF; ++d) {
+            s += q_sh[qoff + d] * float(kt_sh[koff + d * BK]);
+        }
+        s += subgroupShuffleXor(s, BK);
+        const bool valid = block_key[kcol] != NONE;
+        s = valid ? s * p.scale : NEG_INF;
+
+        const float new_max = max(row_max, subgroupMax(s));
+        const float old_scale = new_max == row_max ? 1.0 : exp(row_max - new_max);
+        const float weight = valid ? exp(s - new_max) : 0.0;
+        row_sum = row_sum * old_scale + subgroupAdd(khalf == 0 ? weight : 0.0);
+        row_max = new_max;
+        if (khalf == 0) {
+            p_sh[sg * BK + kcol] = weight;
+        }
+        subgroupMemoryBarrierShared();
+        subgroupBarrier();
+
+        [[unroll]] for (uint i = 0; i < PER_LANE; ++i) {
+            acc[i] *= old_scale;
+        }
+        for (uint j = 0; j < BK; ++j) {
+            const float w = p_sh[sg * BK + j];
+            [[unroll]] for (uint i = 0; i < PER_LANE; ++i) {
+                acc[i] += w * float(v_sh[j * HEAD_SIZE + lane + i * LANES]);
+            }
+        }
+        barrier();
+    }
+
+    if (p.n_split == 1) {
+        const uint dst_base = stream * p.nb3 + query * p.nb2 + head * p.nb1;
+        const float inv_sum = row_sum == 0.0 ? 0.0 : 1.0 / row_sum;
+        [[unroll]] for (uint i = 0; i < PER_LANE; ++i) {
+            data_dst[dst_base + lane + i * LANES] = acc[i] * inv_sum;
+        }
+    } else {
+        // partial: unnormalized O, then L and M per head (an empty split writes M = -FLT_MAX, not -inf, so the
+        // reduce never computes exp(-inf - -inf))
+        const uint slot = split + p.n_split * (query + p.n_tok * stream);
+        const uint o_base = HEAD_SIZE * p.n_head * slot + HEAD_SIZE * head;
+        [[unroll]] for (uint i = 0; i < PER_LANE; ++i) {
+            data_dst[o_base + lane + i * LANES] = acc[i];
+        }
+        if (lane == 0) {
+            const uint lm = HEAD_SIZE * p.n_head * p.n_tok * p.n_stream * p.n_split + p.n_head * 2 * slot + head;
+            data_dst[lm] = row_sum;
+            data_dst[lm + p.n_head] = max(row_max, -FLT_MAX);
+        }
+    }
+}

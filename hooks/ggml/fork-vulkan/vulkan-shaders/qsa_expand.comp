@@ -1,0 +1,172 @@
+#version 450
+
+// QSA_EXPAND: qwen4exp_select_complete_blocks after its TOP_K, one workgroup per query row. The row's `budget` selected
+// block ids are put in ascending order, each one expands to its r cells (-1 for a block whose score + 1 is not > 0), and
+// the query's r-1 tail cells follow. Same output as the unfused CONT, CAST, ARGSORT, GET_ROWS x3, SCALE, STEP, MUL, CAST
+// and CONCAT chain: the ids are distinct, so the ascending order is unique, and the float arithmetic of the chain is
+// repeated op by op (exact for cells below 2^24, which n_kv <= 16777216 guarantees).
+//
+// RANK = 0 (prefill strips): bitonic sort of the ids in shared memory, 256 threads, one compare-exchange per thread per
+// stage. RANK = 1 (narrow batches, at most 8 rows): a row is split over 8 workgroups of 512 threads, so a decode token's
+// rows occupy 8 to 64 CUs instead of 1 to 8; each id's position is the count of the row's ids below it (8 threads per id),
+// and its score and cells are loaded before that count, so the gathers overlap the ranking.
+
+#extension GL_EXT_control_flow_attributes : enable
+
+layout(constant_id = 0) const uint BLOCK_SIZE = 256;
+layout(constant_id = 1) const uint RANK = 0;
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer B  {int   data_b[];};   // TOP_K ids [budget, n_query]
+layout (binding = 1) readonly buffer S  {float data_s[];};   // block scores [n_blocks, n_query]
+layout (binding = 2) readonly buffer C  {int   data_c[];};   // block cells [r, n_blocks]
+layout (binding = 3) readonly buffer T  {int   data_t[];};   // tail cells [r - 1, n_query]
+layout (binding = 4) writeonly buffer D {int   data_d[];};   // [budget*r + r - 1, n_query]
+
+layout (push_constant) uniform parameter {
+    uint n_query;
+    uint n_blocks;
+    uint budget;
+    uint r;
+    uint b_off; uint b_stride;
+    uint s_off; uint s_stride;
+    uint c_off; uint c_stride;
+    uint t_off; uint t_stride;
+    uint d_off; uint d_stride;
+} p;
+
+#define MAX_BUDGET 512
+#define MAX_R 8
+#define PAD_ID 0x7FFFFFFF
+
+#define RANK_SLICES 8
+#define RANK_IDS (MAX_BUDGET/RANK_SLICES)
+
+shared int ids[MAX_BUDGET];
+shared uint counts[MAX_BUDGET];   // RANK only
+
+// the chain's float steps: cell -> f32, + 1, * valid, - 1, -> i32 (valid is 0 or 1)
+int expand_cell(const int cell, const float valid) {
+    precise float f = float(cell);
+    f = f + 1.0;
+    f = f * valid;
+    f = f + -1.0;
+    return int(f);
+}
+
+// STEP(SCALE_BIAS(score, 1, 1)): step(x) is 1 for x > 0, else 0 (also for NaN)
+float block_valid(const float score) {
+    precise float x = score + 1.0;
+    return x > 0.0 ? 1.0 : 0.0;
+}
+
+void write_tail(const uint q, const uint tid) {
+    if (tid + 1 < p.r) {
+        data_d[p.d_off + q*p.d_stride + p.budget*p.r + tid] = data_t[p.t_off + q*p.t_stride + tid];
+    }
+}
+
+void expand_sorted(const uint q) {
+    const uint tid = gl_LocalInvocationID.x;
+    for (uint i = 0; i < MAX_BUDGET; i += BLOCK_SIZE) {
+        ids[i + tid] = i + tid < p.budget ? data_b[p.b_off + q*p.b_stride + i + tid] : PAD_ID;
+    }
+    barrier();
+    // ascending bitonic sort over MAX_BUDGET entries (the pad ids sort last)
+    [[unroll]] for (uint size = 2; size <= MAX_BUDGET; size <<= 1) {
+        [[unroll]] for (uint stride = size >> 1; stride > 0; stride >>= 1) {
+            for (uint t = tid; t < MAX_BUDGET/2; t += BLOCK_SIZE) {
+                const uint i = 2*t - (t & (stride - 1));
+                const uint j = i + stride;
+                const int a = ids[i];
+                const int b = ids[j];
+                if ((a > b) == ((i & size) == 0)) {
+                    ids[i] = b;
+                    ids[j] = a;
+                }
+            }
+            barrier();
+        }
+    }
+    const uint n_out = p.budget*p.r;
+    const uint d_row = p.d_off + q*p.d_stride;
+    const uint s_row = p.s_off + q*p.s_stride;
+    for (uint o = tid; o < n_out; o += BLOCK_SIZE) {
+        const uint slot = o / p.r;
+        const uint c = o - slot*p.r;
+        const int blk = ids[slot];
+        int v = -1;
+        if (blk >= 0 && uint(blk) < p.n_blocks) {
+            v = expand_cell(data_c[p.c_off + uint(blk)*p.c_stride + c], block_valid(data_s[s_row + uint(blk)]));
+        }
+        data_d[d_row + o] = v;
+    }
+    write_tail(q, tid);
+    barrier();   // ids is rewritten by the next row
+}
+
+// one slice of a row: RANK_SLICES workgroups share a row, each ranks RANK_IDS of its ids with 8 threads per id (each
+// thread compares against MAX_BUDGET / 8 of the row's ids, the 8 partial counts are summed through shared memory)
+void expand_rank(const uint q, const uint slice) {
+    const uint tid  = gl_LocalInvocationID.x;   // BLOCK_SIZE == MAX_BUDGET
+    const uint e    = tid >> 3;
+    const uint part = tid & 7;
+    const uint j    = slice*RANK_IDS + e;       // the id this thread group ranks
+    const bool own  = j < p.budget;
+    const uint b_row = p.b_off + q*p.b_stride;
+    ids[tid] = tid < p.budget ? data_b[b_row + tid] : PAD_ID;
+    const int blk = own ? data_b[b_row + j] : PAD_ID;
+    // the gathers do not depend on the rank: issue them before the barrier
+    int vals[MAX_R];
+    [[unroll]] for (uint c = 0; c < MAX_R; ++c) {
+        vals[c] = -1;
+    }
+    if (own && part == 0 && blk >= 0 && uint(blk) < p.n_blocks) {
+        const float valid = block_valid(data_s[p.s_off + q*p.s_stride + uint(blk)]);
+        [[unroll]] for (uint c = 0; c < MAX_R; ++c) {
+            if (c < p.r) {
+                vals[c] = expand_cell(data_c[p.c_off + uint(blk)*p.c_stride + c], valid);
+            }
+        }
+    }
+    if (slice == 0) {
+        write_tail(q, tid);
+    }
+    barrier();
+    // position of id j in the ascending order; equal ids (never produced by TOP_K) keep their input order
+    uint cnt = 0;
+    const uint i0 = part*(MAX_BUDGET/8);
+    [[unroll]] for (uint k = 0; k < MAX_BUDGET/8; ++k) {
+        const uint i = i0 + k;
+        const int u = ids[i];
+        cnt += (u < blk || (u == blk && i < j)) ? 1 : 0;   // pad ids never count: blk < PAD_ID, or i >= budget > j
+    }
+    counts[tid] = cnt;
+    barrier();
+    if (own && part == 0) {
+        uint rank = 0;
+        [[unroll]] for (uint k = 0; k < 8; ++k) {
+            rank += counts[tid + k];
+        }
+        const uint d_row = p.d_off + q*p.d_stride + rank*p.r;
+        [[unroll]] for (uint c = 0; c < MAX_R; ++c) {
+            if (c < p.r) {
+                data_d[d_row + c] = vals[c];
+            }
+        }
+    }
+    barrier();   // ids and counts are rewritten by the next slice
+}
+
+void main() {
+    if (RANK != 0) {
+        for (uint w = gl_WorkGroupID.x; w < p.n_query*RANK_SLICES; w += gl_NumWorkGroups.x) {
+            expand_rank(w / RANK_SLICES, w % RANK_SLICES);
+        }
+    } else {
+        for (uint q = gl_WorkGroupID.x; q < p.n_query; q += gl_NumWorkGroups.x) {
+            expand_sorted(q);
+        }
+    }
+}

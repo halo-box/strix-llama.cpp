@@ -1,0 +1,296 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+
+layout(constant_id = 0) const uint WORKGROUP_SIZE = 512;
+layout(constant_id = 1) const uint SUBGROUP_SIZE = 64;
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly  buffer QBuf    { float     data_q[];   };
+layout(binding = 1) readonly  buffer KBuf    { float16_t data_k[];   };
+layout(binding = 2) readonly  buffer MaskBuf { float16_t data_m[];   };
+layout(binding = 3) readonly  buffer SinkBuf { float     data_s[];   };
+layout(binding = 4) readonly  buffer TopBuf  { int       data_top[]; };
+layout(binding = 5) writeonly buffer DstBuf  { float     data_dst[]; };
+
+layout(push_constant) uniform Parameters {
+    uint n_batch;
+    uint n_kv;
+    uint n_kv_raw;
+    uint n_top_k;
+    uint n_head;
+    uint nbq1;
+    uint nbq2;
+    uint nbq3;
+    uint nbk1;
+    uint nbk3;
+    uint nbm1;
+    uint nbm3;
+    uint nbt1;
+    uint nbt3;
+    uint nb1;
+    uint nb2;
+    uint nb3;
+    float scale;
+    uint has_sinks;
+    uint split_mode;
+} p;
+
+// This shader is hard-wired to a 512-thread workgroup of eight 64-wide subgroups:
+// the softmax segments SUBGROUP_SIZE/4 = 16 lanes per head (so head_local stays < 32),
+// and the QK/PV tiling assumes gl_NumSubgroups == 8 via gl_SubgroupID % 4 / gl_SubgroupID / 4.
+// A different subgroup size indexes past row_max_sh/q_p_sh and corrupts the score tiles, so
+// the pipeline is only created under `device->subgroup_size == 64` in ggml_vk_load_shaders.
+// Keep that gate in sync with these constants.
+const uint TILE = 16;
+const uint HEAD_SIZE = 512;
+const uint HEADS_PER_GROUP = 32;
+const uint KEYS_PER_BLOCK = 64;
+const uint DIMS_PER_BLOCK = 64;
+const uint QK_STRIDE = TILE / 4 + 2;
+const uint SCORE_STRIDE = HEADS_PER_GROUP / 4 + 1;
+const uint P_STRIDE = KEYS_PER_BLOCK / 4 + 2;
+const uint V_STRIDE = DIMS_PER_BLOCK / 4 + 2;
+const uint PV_STRIDE = DIMS_PER_BLOCK / 4;
+const float MASK_NEG_INF = -65500.0;
+
+shared uint key_idx[KEYS_PER_BLOCK];
+shared float key_mask[KEYS_PER_BLOCK];
+shared f16vec4 q_p_sh[HEADS_PER_GROUP * P_STRIDE];
+shared f16vec4 k_v_sh[KEYS_PER_BLOCK * V_STRIDE];
+shared vec4 matrix_sh[KEYS_PER_BLOCK * SCORE_STRIDE];
+shared float old_scale_sh[HEADS_PER_GROUP];
+shared float row_max_sh[HEADS_PER_GROUP];
+shared float row_sum_sh[HEADS_PER_GROUP];
+
+void main() {
+    const uint tid = gl_LocalInvocationIndex;
+    const uint token = gl_WorkGroupID.x;
+    const uint head_base = gl_WorkGroupID.y * HEADS_PER_GROUP;
+    const uint stream = gl_WorkGroupID.z;
+    const uint mask_base = stream * p.nbm3 + token * p.nbm1;
+    const uint top_base = stream * p.nbt3 + token * p.nbt1;
+    const uint total_keys = p.split_mode != 0 ? p.n_top_k : p.n_kv_raw + p.n_top_k;
+
+    float accum[HEADS_PER_GROUP * HEAD_SIZE / WORKGROUP_SIZE];
+    [[unroll]] for (uint i = 0; i < accum.length(); ++i) {
+        accum[i] = 0.0;
+    }
+
+    if (tid < HEADS_PER_GROUP) {
+        row_max_sh[tid] = uintBitsToFloat(0xff800000);
+        row_sum_sh[tid] = 0.0;
+    }
+    barrier();
+
+    for (uint kb = 0; kb < total_keys; kb += KEYS_PER_BLOCK) {
+        if (tid < KEYS_PER_BLOCK) {
+            const uint selected = kb + tid;
+            uint key = p.n_kv;
+            if (p.split_mode == 0 && selected < p.n_kv_raw) {
+                key = selected;
+            } else if (selected < total_keys) {
+                const uint top_pos = p.split_mode != 0 ? selected : selected - p.n_kv_raw;
+                const int compressed = data_top[top_base + top_pos];
+                if (compressed >= 0 && uint(compressed) < p.n_kv - p.n_kv_raw) {
+                    key = p.n_kv_raw + uint(compressed);
+                }
+            }
+            key_idx[tid] = key;
+            key_mask[tid] = key < p.n_kv ? float(data_m[mask_base + key]) : uintBitsToFloat(0xff800000);
+        }
+        barrier();
+
+        coopmat<float, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseAccumulator> scores =
+            coopmat<float, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseAccumulator>(0.0);
+        coopmat<float16_t, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseA> kmat;
+        coopmat<float16_t, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseB> qmat;
+
+        [[unroll]] for (uint d = 0; d < HEAD_SIZE; d += TILE) {
+            if (tid < KEYS_PER_BLOCK * (TILE / 4)) {
+                const uint key_local = tid / (TILE / 4);
+                const uint d4 = tid % (TILE / 4);
+                const uint key = key_idx[key_local];
+                f16vec4 value = f16vec4(0.0);
+                if (key < p.n_kv) {
+                    const uint offset = stream * p.nbk3 + key * p.nbk1 + d + d4 * 4;
+                    value = f16vec4(data_k[offset], data_k[offset + 1], data_k[offset + 2], data_k[offset + 3]);
+                }
+                k_v_sh[key_local * QK_STRIDE + d4] = value;
+            }
+            if (tid < HEADS_PER_GROUP * (TILE / 4)) {
+                const uint head_local = tid / (TILE / 4);
+                const uint d4 = tid % (TILE / 4);
+                const uint head = head_base + head_local;
+                const uint offset = stream * p.nbq3 + head * p.nbq2 + token * p.nbq1 + d + d4 * 4;
+                q_p_sh[head_local * QK_STRIDE + d4] = f16vec4(
+                    data_q[offset], data_q[offset + 1], data_q[offset + 2], data_q[offset + 3]);
+            }
+            barrier();
+
+            const uint key_chunk = gl_SubgroupID % (KEYS_PER_BLOCK / TILE);
+            const uint head_tile = gl_SubgroupID / (KEYS_PER_BLOCK / TILE);
+            coopMatLoad(kmat, k_v_sh, key_chunk * TILE * QK_STRIDE,
+                QK_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(qmat, q_p_sh, head_tile * TILE * QK_STRIDE,
+                QK_STRIDE, gl_CooperativeMatrixLayoutColumnMajor);
+            scores = coopMatMulAdd(kmat, qmat, scores);
+            barrier();
+        }
+
+        const uint score_key_chunk = gl_SubgroupID % (KEYS_PER_BLOCK / TILE);
+        const uint score_head_tile = gl_SubgroupID / (KEYS_PER_BLOCK / TILE);
+        coopMatStore(scores, matrix_sh,
+            score_key_chunk * TILE * SCORE_STRIDE + score_head_tile * (TILE / 4),
+            SCORE_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
+        barrier();
+
+        {
+            const uint head_local = tid / (SUBGROUP_SIZE / 4);
+            const uint softmax_lane = tid % (SUBGROUP_SIZE / 4);
+            float block_max = uintBitsToFloat(0xff800000);
+            [[unroll]] for (uint i = 0; i < KEYS_PER_BLOCK / (SUBGROUP_SIZE / 4); ++i) {
+                const uint key_local = softmax_lane + i * (SUBGROUP_SIZE / 4);
+                const float mask = key_mask[key_local];
+                const float score = float(matrix_sh[key_local * SCORE_STRIDE + head_local / 4][head_local % 4]) * p.scale + mask;
+                block_max = mask < MASK_NEG_INF ? block_max : max(block_max, score);
+            }
+            [[unroll]] for (uint delta = 1; delta < SUBGROUP_SIZE / 4; delta *= 2) {
+                block_max = max(block_max, subgroupShuffleXor(block_max, delta));
+            }
+
+            const float old_row_max = row_max_sh[head_local];
+            const float old_row_sum = row_sum_sh[head_local];
+            const float new_max = max(old_row_max, block_max);
+            const float old_scale = old_row_sum == 0.0 ? 0.0 : exp(old_row_max - new_max);
+            float block_sum = 0.0;
+            [[unroll]] for (uint i = 0; i < KEYS_PER_BLOCK / (SUBGROUP_SIZE / 4); ++i) {
+                const uint key_local = softmax_lane + i * (SUBGROUP_SIZE / 4);
+                const float mask = key_mask[key_local];
+                float weight = 0.0;
+                if (mask >= MASK_NEG_INF) {
+                    const float score = float(matrix_sh[key_local * SCORE_STRIDE + head_local / 4][head_local % 4]) * p.scale + mask;
+                    weight = exp(score - new_max);
+                    block_sum += weight;
+                }
+                q_p_sh[head_local * P_STRIDE + key_local / 4][key_local % 4] = float16_t(weight);
+            }
+            [[unroll]] for (uint delta = 1; delta < SUBGROUP_SIZE / 4; delta *= 2) {
+                block_sum += subgroupShuffleXor(block_sum, delta);
+            }
+
+            if (softmax_lane == 0) {
+                row_sum_sh[head_local] = old_row_sum * old_scale + block_sum;
+                row_max_sh[head_local] = new_max;
+                old_scale_sh[head_local] = old_scale;
+            }
+        }
+        barrier();
+
+        [[unroll]] for (uint i = 0; i < accum.length(); ++i) {
+            const uint out_idx = tid + i * WORKGROUP_SIZE;
+            const uint head_local = out_idx / HEAD_SIZE;
+            accum[i] *= old_scale_sh[head_local];
+        }
+
+        coopmat<float16_t, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseA> pmats[KEYS_PER_BLOCK / TILE];
+        [[unroll]] for (uint key_chunk = 0; key_chunk < KEYS_PER_BLOCK / TILE; ++key_chunk) {
+            const uint pv_head_tile = gl_SubgroupID / (DIMS_PER_BLOCK / TILE);
+            coopMatLoad(pmats[key_chunk], q_p_sh,
+                pv_head_tile * TILE * P_STRIDE + key_chunk * (TILE / 4),
+                P_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
+        }
+
+        [[unroll]] for (uint dim_base = 0; dim_base < HEAD_SIZE; dim_base += DIMS_PER_BLOCK) {
+            [[unroll]] for (uint idx = tid; idx < KEYS_PER_BLOCK * (DIMS_PER_BLOCK / 4); idx += WORKGROUP_SIZE) {
+                const uint key_local = idx / (DIMS_PER_BLOCK / 4);
+                const uint d4 = idx % (DIMS_PER_BLOCK / 4);
+                const uint key = key_idx[key_local];
+                f16vec4 value = f16vec4(0.0);
+                if (key < p.n_kv) {
+                    const uint offset = stream * p.nbk3 + key * p.nbk1 + dim_base + d4 * 4;
+                    value = f16vec4(data_k[offset], data_k[offset + 1], data_k[offset + 2], data_k[offset + 3]);
+                }
+                k_v_sh[key_local * V_STRIDE + d4] = value;
+            }
+            barrier();
+
+            coopmat<float, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseAccumulator> pv =
+                coopmat<float, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseAccumulator>(0.0);
+            coopmat<float16_t, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseB> vmat;
+
+            const uint pv_head_tile = gl_SubgroupID / (DIMS_PER_BLOCK / TILE);
+            const uint pv_dim_tile = gl_SubgroupID % (DIMS_PER_BLOCK / TILE);
+            [[unroll]] for (uint key_chunk = 0; key_chunk < KEYS_PER_BLOCK / TILE; ++key_chunk) {
+                coopMatLoad(vmat, k_v_sh,
+                    key_chunk * TILE * V_STRIDE + pv_dim_tile * (TILE / 4),
+                    V_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
+                pv = coopMatMulAdd(pmats[key_chunk], vmat, pv);
+            }
+
+            coopMatStore(pv, matrix_sh,
+                pv_head_tile * TILE * PV_STRIDE + pv_dim_tile * (TILE / 4), PV_STRIDE,
+                gl_CooperativeMatrixLayoutRowMajor);
+            barrier();
+
+            [[unroll]] for (uint i = 0; i < accum.length(); ++i) {
+                const uint out_idx = tid + i * WORKGROUP_SIZE;
+                const uint head_local = out_idx / HEAD_SIZE;
+                const uint dim = out_idx % HEAD_SIZE;
+                if (dim >= dim_base && dim < dim_base + DIMS_PER_BLOCK) {
+                    accum[i] += matrix_sh[head_local * PV_STRIDE + (dim - dim_base) / 4][dim % 4];
+                }
+            }
+            barrier();
+        }
+    }
+
+    if (p.split_mode == 0 && p.has_sinks != 0 && tid < HEADS_PER_GROUP) {
+        const float sink = data_s[head_base + tid];
+        const float new_max = max(row_max_sh[tid], sink);
+        const float old_scale = row_sum_sh[tid] == 0.0 ? 0.0 : exp(row_max_sh[tid] - new_max);
+        row_sum_sh[tid] = row_sum_sh[tid] * old_scale + exp(sink - new_max);
+        row_max_sh[tid] = new_max;
+        old_scale_sh[tid] = old_scale;
+    }
+    barrier();
+
+    if (p.split_mode == 0 && p.has_sinks != 0) {
+        [[unroll]] for (uint i = 0; i < accum.length(); ++i) {
+            const uint out_idx = tid + i * WORKGROUP_SIZE;
+            accum[i] *= old_scale_sh[out_idx / HEAD_SIZE];
+        }
+    }
+    [[unroll]] for (uint i = 0; i < accum.length(); ++i) {
+        const uint out_idx = tid + i * WORKGROUP_SIZE;
+        const uint head_local = out_idx / HEAD_SIZE;
+        const uint dim = out_idx % HEAD_SIZE;
+        if (p.split_mode != 0) {
+            const uint part_idx = 1;
+            // Split-K buffer layout, shared with flash_attn_cm1.comp and
+            // flash_attn_split_k_reduce.comp: all O matrices [HSV, ne1, k_num, ne2, ne3]
+            // first, then the L/M rows [ne1, k_num, ne2, ne3]. Here ne1 = n_head,
+            // ne2 = n_batch and ne3 = the stream count, so the L/M base must span every
+            // stream -- omitting gl_NumWorkGroups.z lands L/M inside the O region as soon
+            // as there is more than one sequence.
+            const uint n_streams = gl_NumWorkGroups.z;
+            const uint matrix_base = HEAD_SIZE * p.n_head * (part_idx + 2 * (token + p.n_batch * stream));
+            const uint lm_base = HEAD_SIZE * p.n_head * p.n_batch * n_streams * 2 + p.n_head * 2 * (part_idx + 2 * (token + p.n_batch * stream));
+            data_dst[matrix_base + (head_base + head_local) * HEAD_SIZE + dim] = accum[i];
+            if (dim == 0) {
+                data_dst[lm_base + head_base + head_local] = row_sum_sh[head_local];
+                data_dst[lm_base + p.n_head + head_base + head_local] = row_max_sh[head_local];
+            }
+        } else {
+            const uint dst_base = stream * p.nb3 + token * p.nb2 + (head_base + head_local) * p.nb1;
+            const float inv_sum = row_sum_sh[head_local] == 0.0 ? 0.0 : 1.0 / row_sum_sh[head_local];
+            data_dst[dst_base + dim] = accum[i] * inv_sum;
+        }
+    }
+}

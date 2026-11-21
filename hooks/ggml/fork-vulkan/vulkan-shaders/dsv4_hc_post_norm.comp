@@ -1,0 +1,129 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_basic : require
+#if defined(OUT_F16)
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#endif
+
+// qwen4exp hyper-connection combine (identity mixing) followed by the next mix's grouped RMS norm,
+// in one pass over the residual:
+//
+//   res_out[i, h, t] = x[i, t] * post[h, t] + res[i, h, t]                       (DSV4_HC_POST, no comb)
+//   xn[i, h, t]      = res_out[i, h, t] * rsqrt(mean_i(res_out^2) + eps) * gamma[i, h]   (RMS_NORM + MUL)
+//
+// GATE != 0: post = gate_out * sigmoid(gate_in * p), the SCALE -> SIGMOID -> SCALE chain of the combine
+// (same expressions as dsv4_hc_post.comp's HC_POST_GATE).
+// HAS_POST == 0: no combine, xn is the norm of res itself (RMS_NORM + MUL (+ CPY)); x, post and res_out
+// are not accessed.
+// OUT_F16: xn is stored as f16 (the graph's CPY(f16) of the MUL); otherwise f32.
+//
+// One workgroup per (stream h, token t) row of n_embd. The row stays in registers between the combine
+// and the normalised write, so the residual is read once and the combine result written once.
+// The host guarantees n_embd % 4 == 0, n_embd <= 4096, unit element strides, 16-byte aligned rows and
+// zero misalignment on every operand (vec4 indexing).
+
+layout(constant_id = 0) const uint HAS_POST = 1;
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0, std430) readonly  buffer XBuf { vec4  data_x[]; };
+layout(binding = 1, std430) readonly  buffer RBuf { vec4  data_r[]; };
+layout(binding = 2, std430) readonly  buffer PBuf { float data_p[]; };
+layout(binding = 3, std430) readonly  buffer GBuf { vec4  data_g[]; };
+layout(binding = 4, std430) writeonly buffer OBuf { vec4  data_o[]; };
+#if defined(OUT_F16)
+layout(binding = 5, std430) writeonly buffer NBuf { f16vec4 data_n[]; };
+#else
+layout(binding = 5, std430) writeonly buffer NBuf { vec4    data_n[]; };
+#endif
+
+layout(push_constant) uniform parameter {
+    uint  n_embd;
+    uint  hc;
+    uint  n_tokens;
+    uint  sx1;             // x token stride (floats)
+    uint  sr1; uint sr2;   // residual stream / token strides (floats)
+    uint  sp0; uint sp1;   // post stream / token strides (floats)
+    uint  sg1;             // gamma stream stride (floats)
+    uint  so1; uint so2;   // res_out stream / token strides (floats)
+    uint  sn1; uint sn2;   // xn stream / token strides (elements)
+    float eps;
+    uint  gate;
+    float gate_in;
+    float gate_out;
+    uint  zero;            // always 0 (the f16 store's XOR operand)
+} p;
+
+const uint BLOCK = 256;
+const uint MAX_V4 = 4;
+
+shared float sumsh[BLOCK];
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint h   = gl_WorkGroupID.x % p.hc;
+    const uint t   = gl_WorkGroupID.x / p.hc;
+
+    const uint nv4 = p.n_embd / 4;
+    const uint rb  = (h * p.sr1 + t * p.sr2) / 4;
+    const uint gb  = (h * p.sg1) / 4;
+    const uint nb  = (h * p.sn1 + t * p.sn2) / 4;
+
+    float pw = 0.0f;
+    uint xb = 0;
+    uint ob = 0;
+    if (HAS_POST != 0) {
+        pw = data_p[h * p.sp0 + t * p.sp1];
+        if (p.gate != 0) {
+            pw = (1.0f / (1.0f + exp(-(pw * p.gate_in)))) * p.gate_out;
+        }
+        xb = (t * p.sx1) / 4;
+        ob = (h * p.so1 + t * p.so2) / 4;
+    }
+
+    vec4 v[MAX_V4];
+    float sum = 0.0f;
+    [[unroll]] for (uint k = 0; k < MAX_V4; ++k) {
+        const uint i4 = tid + k * BLOCK;
+        vec4 r = vec4(0.0f);
+        if (i4 < nv4) {
+            r = data_r[rb + i4];
+            if (HAS_POST != 0) {
+                r = data_x[xb + i4] * pw + r;
+                data_o[ob + i4] = r;
+            }
+        }
+        v[k] = r;
+        sum += dot(r, r);
+    }
+
+    // workgroup sum: subgroup partials, then a shared-memory tree (any subgroup size)
+    sum = subgroupAdd(sum);
+    if (gl_SubgroupInvocationID == 0) {
+        sumsh[gl_SubgroupID] = sum;
+    }
+    barrier();
+    float total = 0.0f;
+    for (uint s = 0; s < gl_NumSubgroups; ++s) {
+        total += sumsh[s];
+    }
+    const float scale = inversesqrt(total / float(p.n_embd) + p.eps);
+
+    [[unroll]] for (uint k = 0; k < MAX_V4; ++k) {
+        const uint i4 = tid + k * BLOCK;
+        if (i4 < nv4) {
+            const vec4 n = v[k] * scale * data_g[gb + i4];
+#if defined(OUT_F16)
+            // equal to the f32 norm stored, then CPY: the product goes through an XOR with a push-constant zero, so the
+            // compiler cannot fold the multiply and the conversion into one single-rounding mixed-precision op
+            const f16vec4 n16 = f16vec4(uintBitsToFloat(floatBitsToUint(n) ^ uvec4(p.zero)));
+            data_n[nb + i4] = n16;
+#else
+            data_n[nb + i4] = n;
+#endif
+        }
+    }
+}

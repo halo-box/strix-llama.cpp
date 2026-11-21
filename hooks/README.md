@@ -28,6 +28,7 @@ cmake/hooks-link.cmake      hooks_link (registrar, static builds), hooks_wrap (l
 ggml/                       ggml-base registry, backend wrapper, CPU/CUDA/Vulkan drivers, hook types
   kernels/<backend>/        kernel files, globbed
   fork-cuda/                the fork ggml-cuda tree, namespace ggml_fork, built into ggml-hip
+  fork-vulkan/              the fork ggml-vulkan tree and shaders, namespace ggml_fork, built into ggml-vulkan
   src/fork-sched/           the fork scheduler, graph allocator and sanitizer (fork_sched)
 llama/                      libllama hooks (models/, passes/ globbed), common and server wiring
 common/, server/            common and server hooks (args/, handlers/ globbed)
@@ -78,7 +79,12 @@ switch selects it. Upstream stays the default.
   every upstream backend a fork context that computes on the upstream stream.
   - `fork_cuda_node` (on): nodes that upstream refuses and the fork accepts, for example the fork types and the EXL3
     ops, run through the fork `ggml_cuda_compute_forward`.
-  - `fork_cuda_graph` (off): the fork computes whole graphs, with its `graph_optimize` after the upstream one.
+  - `fork_cuda_graph` (switch, off): the fork `graph_optimize` and `graph_compute` replace the upstream ones.
+- Vulkan: `ggml/fork-vulkan` is the fork `ggml/src/ggml-vulkan` with its shaders (`hooks/tools/import-fork-vulkan.py`).
+  The fork device uses the upstream instance and logical device, so both read the same buffers and share the queues.
+  `fork_vk_node` (on) and `fork_vk_graph` (switch, off) work as on HIP.
+- A backend extension can replace `graph_compute` and `graph_optimize` (`replace_graph_compute`,
+  `replace_graph_optimize`): the switches above use them, so no allocation dependency is added for the whole graph.
 - Upstream files that the hooks must reach inside are compiled through a hooks file that includes them
   (`ggml/src/ggml-backend-upstream.cpp`, `ggml/src/ggml-cuda-upstream.cu`); the original is marked as a header.
 

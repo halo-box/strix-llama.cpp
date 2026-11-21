@@ -1,0 +1,155 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_basic : require
+
+layout(constant_id = 0) const uint WORKGROUP_SIZE = 512;
+layout(constant_id = 1) const uint SUBGROUP_SIZE = 64;
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly  buffer QBuf    { float     data_q[];   };
+layout(binding = 1) readonly  buffer KBuf    { float16_t data_k[];   };
+layout(binding = 2) readonly  buffer MaskBuf { float16_t data_m[];   };
+layout(binding = 3) readonly  buffer SinkBuf { float     data_s[];   };
+layout(binding = 4) readonly  buffer TopBuf  { int       data_top[]; };
+layout(binding = 5) writeonly buffer DstBuf  { float     data_dst[]; };
+
+layout(push_constant) uniform Parameters {
+    uint n_batch;
+    uint n_kv;
+    uint n_kv_raw;
+    uint n_top_k;
+    uint n_head;
+    uint nbq1;
+    uint nbq2;
+    uint nbq3;
+    uint nbk1;
+    uint nbk3;
+    uint nbm1;
+    uint nbm3;
+    uint nbt1;
+    uint nbt3;
+    uint nb1;
+    uint nb2;
+    uint nb3;
+    float scale;
+    uint has_sinks;
+    uint split_mode;
+} p;
+
+// Shape constants pinned by the dispatch gate in ggml_vk_flash_attn_top_k: DeepSeek V4
+// CSA attention only (hd 512, 64 heads MQA over an f16 K==V latent). The gate also pins
+// the pipeline to subgroup size 64, so per-lane sizing uses LANES rather than the
+// SUBGROUP_SIZE specialization constant (a spec-constant array bound would be folded at
+// compile time from the default and silently break under a different runtime subgroup).
+const uint HEAD_SIZE = 512;
+const uint HEADS_PER_GROUP = 8;
+const uint KEYS_PER_BLOCK = 16;
+const uint LANES = 64;
+// f16 -inf (or the lowest f16 normal some mask writers use in its place) marks a
+// masked-out key.
+const float MASK_NEG_INF = -65500.0;
+
+shared float16_t key_sh[KEYS_PER_BLOCK * HEAD_SIZE];
+shared uint key_idx[KEYS_PER_BLOCK];
+
+void main() {
+    const uint tid = gl_LocalInvocationIndex;
+    const uint lane = gl_SubgroupInvocationID;
+    const uint head = gl_WorkGroupID.y * HEADS_PER_GROUP + gl_SubgroupID;
+    const uint token = gl_WorkGroupID.x;
+    const uint stream = gl_WorkGroupID.z;
+
+    // No bounds check: the grid is sized exactly (x = n_batch, y * HEADS_PER_GROUP covers
+    // n_head == 64). An early return here would skip the barriers below for part of the
+    // workgroup, which is undefined behavior — do not reintroduce one without restructuring
+    // the barrier flow.
+
+    float accum[HEAD_SIZE / LANES];
+    [[unroll]] for (uint i = 0; i < HEAD_SIZE / LANES; ++i) {
+        accum[i] = 0.0;
+    }
+
+    float row_max = uintBitsToFloat(0xff800000);
+    float row_sum = 0.0;
+    const uint q_base = stream * p.nbq3 + head * p.nbq2 + token * p.nbq1;
+    const uint mask_base = stream * p.nbm3 + token * p.nbm1;
+    const uint top_base = stream * p.nbt3 + token * p.nbt1;
+    const uint total_keys = p.n_kv_raw + p.n_top_k;
+
+    for (uint kb = 0; kb < total_keys; kb += KEYS_PER_BLOCK) {
+        if (tid < KEYS_PER_BLOCK) {
+            const uint selected = kb + tid;
+            uint key = p.n_kv;
+            if (selected < p.n_kv_raw) {
+                key = selected;
+            } else if (selected < total_keys) {
+                const int compressed = data_top[top_base + selected - p.n_kv_raw];
+                if (compressed >= 0 && uint(compressed) < p.n_kv - p.n_kv_raw) {
+                    key = p.n_kv_raw + uint(compressed);
+                }
+            }
+            key_idx[tid] = key;
+        }
+        barrier();
+
+        for (uint idx = tid; idx < KEYS_PER_BLOCK * HEAD_SIZE; idx += WORKGROUP_SIZE) {
+            const uint col = idx / HEAD_SIZE;
+            const uint dim = idx % HEAD_SIZE;
+            const uint key = key_idx[col];
+            key_sh[idx] = key < p.n_kv ? data_k[stream * p.nbk3 + key * p.nbk1 + dim] : float16_t(0.0);
+        }
+        barrier();
+
+        [[unroll]] for (uint col = 0; col < KEYS_PER_BLOCK; ++col) {
+            const uint selected = kb + col;
+            const uint key = key_idx[col];
+            if (selected >= total_keys || key >= p.n_kv) {
+                continue;
+            }
+
+            float partial = 0.0;
+            [[unroll]] for (uint i = 0; i < HEAD_SIZE / LANES; ++i) {
+                const uint dim = lane + i * LANES;
+                partial += data_q[q_base + dim] * float(key_sh[col * HEAD_SIZE + dim]);
+            }
+            const float mask = float(data_m[mask_base + key]);
+            const float score = subgroupAdd(partial) * p.scale + mask;
+            if (mask < MASK_NEG_INF) {
+                continue;
+            }
+
+            const float new_max = max(row_max, score);
+            const float old_scale = row_sum == 0.0 ? 0.0 : exp(row_max - new_max);
+            const float value_scale = exp(score - new_max);
+            row_sum = row_sum * old_scale + value_scale;
+            row_max = new_max;
+
+            [[unroll]] for (uint i = 0; i < HEAD_SIZE / LANES; ++i) {
+                const uint dim = lane + i * LANES;
+                accum[i] = accum[i] * old_scale + value_scale * float(key_sh[col * HEAD_SIZE + dim]);
+            }
+        }
+        barrier();
+    }
+
+    if (p.has_sinks != 0) {
+        const float sink = data_s[head];
+        const float new_max = max(row_max, sink);
+        const float old_scale = row_sum == 0.0 ? 0.0 : exp(row_max - new_max);
+        const float sink_scale = exp(sink - new_max);
+        row_sum = row_sum * old_scale + sink_scale;
+        [[unroll]] for (uint i = 0; i < HEAD_SIZE / LANES; ++i) {
+            accum[i] *= old_scale;
+        }
+    }
+
+    const uint dst_base = stream * p.nb3 + token * p.nb2 + head * p.nb1;
+    const float inv_sum = row_sum == 0.0 ? 0.0 : 1.0 / row_sum;
+    [[unroll]] for (uint i = 0; i < HEAD_SIZE / LANES; ++i) {
+        data_dst[dst_base + lane + i * LANES] = accum[i] * inv_sum;
+    }
+}

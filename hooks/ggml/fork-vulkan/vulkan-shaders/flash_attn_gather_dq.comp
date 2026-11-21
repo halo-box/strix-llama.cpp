@@ -1,0 +1,106 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+
+#define FLOAT_TYPE float
+#include "types.glsl"
+
+// Gather + DEQUANTISE for the per-token compact form: same row mapping as the verbatim
+// flash_attn_gather.comp, same decode as flash_attn_gather_union_dq.comp. One variant per K
+// type, via DATA_A_*.
+//
+// The union carries the decode only for n_batch > 1, because it needs more than one token to
+// deduplicate. Single-token decode is the common case and it lands here; a verbatim gather
+// leaves flash attention to decode inline, measured 1.98x the f16 op at q8_0 and 2.26x at
+// q4_0, kv 11008.
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly  buffer A      { A_TYPE    data_a[];   };
+layout(binding = 1) readonly  buffer TopBuf { int       data_top[]; };
+layout(binding = 2) readonly  buffer MBuf   { float16_t data_m[];   };
+layout(binding = 3) writeonly buffer KcBuf  { float16_t data_kc[];  };
+layout(binding = 4) writeonly buffer McBuf  { float16_t data_mc[];  };
+
+layout(push_constant) uniform Parameters {
+    uint n_kv;
+    uint n_kv_raw;
+    uint n_top_k;
+    uint kv_c;
+    uint nbk1;      // K source row stride, BLOCKS
+    uint nbk3;      // K source stream stride, BLOCKS
+    uint nbt1;
+    uint nbt3;
+    uint nbm1;
+    uint nbm3;
+    uint nem3;
+    uint n_batch;
+    uint row_elems; // elements per K row; 64 lanes x 8 covers the 512 the gate pins
+} p;
+
+void main() {
+    const uint row    = gl_WorkGroupID.x;
+    const uint stream = gl_WorkGroupID.z;
+    const uint tid    = gl_LocalInvocationIndex;
+
+    const uint ALL_TOKENS = 0xffffffffu;
+    uint src   = p.n_kv;
+    uint owner = ALL_TOKENS;
+    if (row < p.n_kv_raw) {
+        src = row;
+    } else {
+        const uint off  = row - p.n_kv_raw;
+        const uint tok  = off / p.n_top_k;
+        const uint slot = off - tok * p.n_top_k;
+        if (tok < p.n_batch) {
+            owner = tok;
+            const int idx = data_top[stream * p.nbt3 + tok * p.nbt1 + slot];
+            if (idx >= 0 && uint(idx) < p.n_kv - p.n_kv_raw) {
+                src = p.n_kv_raw + uint(idx);
+            }
+        }
+    }
+
+    const uint dst_base = (stream * p.kv_c + row) * p.row_elems;
+    const uint e0 = tid * 8;
+    if (src < p.n_kv) {
+        const uint ib  = stream * p.nbk3 + src * p.nbk1 + e0 / QUANT_K;
+        const uint iqs = e0 % QUANT_K;
+        const float d  = float(data_a[ib].d);
+#if defined(DATA_A_Q8_0)
+        // element e is qs[e]
+        [[unroll]] for (uint l = 0; l < 8; ++l) {
+            data_kc[dst_base + e0 + l] = float16_t(d * float(data_a[ib].qs[iqs + l]));
+        }
+#elif defined(DATA_A_Q4_0)
+        // byte j carries element j in its low nibble and element j+16 in its high one
+        const uint shift = (iqs >> 4) * 4;
+        const uint byte0 = iqs & 0xF;
+        [[unroll]] for (uint l = 0; l < 8; ++l) {
+            const float q = float((data_a[ib].qs[byte0 + l] >> shift) & 0xF) - 8.0f;
+            data_kc[dst_base + e0 + l] = float16_t(d * q);
+        }
+#else
+#error "no element mapping written for this K type"
+#endif
+    } else {
+        [[unroll]] for (uint l = 0; l < 8; ++l) {
+            data_kc[dst_base + e0 + l] = float16_t(0.0);
+        }
+    }
+
+    const float NEG_INF = uintBitsToFloat(0xff800000);
+    if (tid < p.n_batch) {
+        const uint mc_idx = (stream * p.n_batch + tid) * p.kv_c + row;
+        float mv = NEG_INF;
+        if (src < p.n_kv && (owner == ALL_TOKENS || owner == tid)) {
+            mv = float(data_m[(stream % p.nem3) * p.nbm3 + tid * p.nbm1 + src]);
+        }
+        data_mc[mc_idx] = float16_t(mv);
+    }
+}

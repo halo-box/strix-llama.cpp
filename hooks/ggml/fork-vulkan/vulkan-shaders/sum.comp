@@ -1,0 +1,44 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+
+// GGML_OP_SUM over a dense f32 source: each workgroup reduces one chunk of p.n elements to data_d[p.d_offset + wg].
+// The second pass is the same shader over the partials with p.chunk >= p.n (one workgroup).
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer A {float data_a[];};
+layout (binding = 1) writeonly buffer D {float data_d[];};
+
+layout (push_constant) uniform parameter {
+    uint n;
+    uint chunk;
+    uint a_offset;
+    uint d_offset;
+} p;
+
+layout (constant_id = 0) const uint BLOCK_SIZE = 256;
+
+shared float tmp[BLOCK_SIZE];
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint start = gl_WorkGroupID.x * p.chunk;
+    const uint end = p.n - start < p.chunk ? p.n : start + p.chunk;
+
+    float s = 0.0;
+    for (uint i = start + tid; i < end; i += BLOCK_SIZE) {
+        s += data_a[p.a_offset + i];
+    }
+    tmp[tid] = s;
+    barrier();
+    [[unroll]] for (uint k = BLOCK_SIZE / 2; k > 0; k >>= 1) {
+        if (tid < k) {
+            tmp[tid] += tmp[tid + k];
+        }
+        barrier();
+    }
+
+    if (tid == 0) {
+        data_d[p.d_offset + gl_WorkGroupID.x] = tmp[0];
+    }
+}

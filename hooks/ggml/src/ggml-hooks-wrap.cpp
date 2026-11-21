@@ -239,7 +239,13 @@ void wrap_backend_free(ggml_backend_t backend) {
 
 void wrap_graph_optimize(ggml_backend_t backend, ggml_cgraph * cgraph, ggml_backend_graph_optimize_params * params) {
     reg_state * rs = reg_of_backend(backend);
-    if (rs->orig_backend.graph_optimize) {
+    bool replaced = false;
+    for (const auto * e : exts_of(rs->drv.backend)) {
+        if (!replaced && e->replace_graph_optimize) {
+            replaced = e->replace_graph_optimize(backend, cgraph, params);
+        }
+    }
+    if (!replaced && rs->orig_backend.graph_optimize) {
         rs->orig_backend.graph_optimize(backend, cgraph, params);
     }
     for (const auto * e : exts_of(rs->drv.backend)) {
@@ -291,6 +297,11 @@ struct untaken_graph {
     std::string    arch;
 };
 
+const char * model_arch() {
+    const char * arch = ggml_hook_model_arch();
+    return arch ? arch : "";
+}
+
 untaken_graph & untaken_slot(ggml_backend_t backend) {
     static thread_local untaken_graph slots[8];
     return slots[((uintptr_t) backend >> 4) % 8];
@@ -301,7 +312,7 @@ ggml_status cut_compute(reg_state * rs, const dev_state * ds, ggml_backend_t bac
     untaken_graph & seen = untaken_slot(backend);
     const void * state = ggml_hook_kernels_state();
     if (cgraph->uid != 0 && seen.backend == backend && seen.uid == cgraph->uid && seen.state == state &&
-            seen.arch == ggml_hook_model_arch()) {
+            seen.arch == model_arch()) {
         return rs->orig_backend.graph_compute(backend, cgraph);
     }
     int  seg_start = 0;
@@ -316,7 +327,7 @@ ggml_status cut_compute(reg_state * rs, const dev_state * ds, ggml_backend_t bac
         if (seg_start == 0 && end == cgraph->n_nodes && !in_run_any) {
             // no hook kernel ran: the graph itself, with its uid (the CUDA graph cache of upstream checks it)
             if (cgraph->uid != 0) {
-                seen = { backend, cgraph->uid, state, ggml_hook_model_arch() };
+                seen = { backend, cgraph->uid, state, model_arch() };
             }
             return rs->orig_backend.graph_compute(backend, cgraph);
         }
@@ -406,9 +417,17 @@ ggml_status wrap_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
         }
     }
 
-    ggml_status st;
+    ggml_status st = GGML_STATUS_SUCCESS;
+    bool replaced = false;
+    for (const auto * e : exts) {
+        if (!replaced && e->replace_graph_compute) {
+            replaced = e->replace_graph_compute(backend, cgraph, &st);
+        }
+    }
     const bool cut = ggml_hook_has_kernels(rs->drv.backend) && (rs->drv.cut_ops || rs->drv.run_fusion);
-    if (cut) {
+    if (replaced) {
+        // computed by another implementation of the backend
+    } else if (cut) {
         st = cut_compute(rs, ds, backend, cgraph);
     } else {
         st = rs->orig_backend.graph_compute(backend, cgraph);

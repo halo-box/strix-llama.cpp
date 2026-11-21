@@ -1,0 +1,123 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+
+// iq4_nl's value table lives in shared memory and is typed FLOAT_TYPE
+#define FLOAT_TYPE float
+#include "types.glsl"
+
+// Gather + DEQUANTISE in one pass, for the DeepSeek V4 small-batch decode path with a
+// quantised KV cache. One variant per K type, via DATA_A_*.
+//
+// The sibling flash_attn_gather_union.comp relocates rows verbatim, which leaves flash
+// attention to decode them in its inner loop - once per query block that reads a row, rather
+// than once per row. Measured, that is a constant per KV row attended:
+//
+//   q8_0  0.148 - 0.153 us/row      q4_0  0.172 - 0.179 us/row
+//
+// flat across batch 2/4/8 and across the dense and gathered regimes alike. It is what made
+// quantised attention slower than f16 despite reading fewer bytes, and q4_0 worse than q8_0
+// despite reading fewer bytes still: unpacking nibbles costs more ALU than the bytes save.
+//
+// The gather already touches each selected row exactly once, so decoding here converts per-use
+// work into per-row work. The compact scratch becomes f16 and flash attention takes its f16
+// path. The pass itself already existed, so the only added cost is writing f16 rather than
+// blocks into the scratch.
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer A {A_TYPE data_a[];};
+
+layout(binding = 1) readonly  buffer UBuf  { uint      data_u[];  };
+layout(binding = 2) readonly  buffer MBuf  { float16_t data_m[];  };
+layout(binding = 3) writeonly buffer KcBuf { float16_t data_kc[]; };
+layout(binding = 4) writeonly buffer McBuf { float16_t data_mc[]; };
+layout(binding = 5) readonly  buffer CBuf  { uint      data_c[];  };
+
+layout(push_constant) uniform Parameters {
+    uint n_kv;
+    uint n_kv_raw;
+    uint kv_c_max;
+    uint nbk1;       // K source row stride, BLOCKS
+    uint nbm1;
+    uint n_batch;
+    uint row_elems;  // elements per K row (== head size)
+} p;
+
+const uint LANES = 64;
+
+void main() {
+#ifdef NEEDS_INIT_IQ_SHMEM
+    // barrier inside; must run before any divergent return below
+    init_iq_shmem(gl_WorkGroupSize);
+#endif
+    const uint row = gl_WorkGroupID.x;
+    const uint tid = gl_LocalInvocationIndex;
+
+    const uint kv_c  = data_c[0];   // padded compact rows, the FA's runtime KV
+    const uint n_uni = data_c[1];   // unpadded union size
+
+    if (row >= kv_c) {
+        return;
+    }
+
+    uint src = p.n_kv;              // sentinel: invalid
+    if (row < p.n_kv_raw) {
+        src = row;
+    } else if (row - p.n_kv_raw < n_uni) {
+        src = p.n_kv_raw + data_u[row - p.n_kv_raw];
+    }
+
+    // 64 lanes x 8 elements covers a 512-element row exactly, and QUANT_K is 32, so a lane's 8
+    // elements sit wholly inside one block AND wholly inside one nibble half.
+    //
+    // Deliberately NOT dequantize4() from dequant_funcs.glsl. That helper is permutation
+    // AGNOSTIC: mul_mat_vec only ever feeds it into a dot product, where any consistent element
+    // order gives the same answer, so for q4_0 it returns nibbles in packed order rather than
+    // element order. Materialising a row to memory is the one use where the order matters, and
+    // using it here produced NMSE 1.17 on q4_0 while q8_0 passed - q8_0's layout just happens to
+    // be contiguous. Each type's true element mapping is written out below instead.
+    const uint dst_base = row * p.row_elems;
+    const uint e0 = tid * 8;
+    if (src < p.n_kv) {
+        const uint ib  = src * p.nbk1 + e0 / QUANT_K;
+        const uint iqs = e0 % QUANT_K;
+        const float d  = float(data_a[ib].d);
+#if defined(DATA_A_Q8_0)
+        // element e is qs[e]
+        [[unroll]] for (uint l = 0; l < 8; ++l) {
+            data_kc[dst_base + e0 + l] = float16_t(d * float(data_a[ib].qs[iqs + l]));
+        }
+#elif defined(DATA_A_Q4_0)
+        // byte j carries element j in its low nibble and element j+16 in its high one
+        const uint shift = (iqs >> 4) * 4;   // 0 for elements 0..15, 4 for 16..31
+        const uint byte0 = iqs & 0xF;
+        [[unroll]] for (uint l = 0; l < 8; ++l) {
+            const float q = float((data_a[ib].qs[byte0 + l] >> shift) & 0xF) - 8.0f;
+            data_kc[dst_base + e0 + l] = float16_t(d * q);
+        }
+#else
+#error "no element mapping written for this K type"
+#endif
+    } else {
+        [[unroll]] for (uint j = 0; j < 8; ++j) {
+            data_kc[dst_base + e0 + j] = float16_t(0.0);
+        }
+    }
+
+    // Compact mask is token-major [n_batch][kv_c], stride the RUNTIME kv_c: the FA derives
+    // m_row_len from KV, which is that same runtime value.
+    const float NEG_INF = uintBitsToFloat(0xff800000);
+    if (tid < p.n_batch) {
+        float mv = NEG_INF;
+        if (src < p.n_kv) {
+            mv = float(data_m[tid * p.nbm1 + src]);
+        }
+        data_mc[tid * kv_c + row] = float16_t(mv);
+    }
+}

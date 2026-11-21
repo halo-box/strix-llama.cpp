@@ -116,6 +116,10 @@ struct ggml_hook_backend_ext {
     void (*graph_compute_end)(ggml_backend_t backend, ggml_cgraph * cgraph, ggml_status status) = nullptr;
     // the scheduler re-reserves its buffers: return true to skip the sync of this backend (HOOK(sched-realloc-sync))
     bool (*skip_realloc_sync)(ggml_backend_t backend) = nullptr;
+    // another implementation of the backend: return true to compute the graph instead of upstream and the hook kernels
+    bool (*replace_graph_compute)(ggml_backend_t backend, ggml_cgraph * cgraph, ggml_status * status) = nullptr;
+    // return true to optimize the graph instead of upstream (the graph_optimize callbacks still run after)
+    bool (*replace_graph_optimize)(ggml_backend_t backend, ggml_cgraph * cgraph, ggml_backend_graph_optimize_params * params) = nullptr;
 };
 
 // parameters: a hook point or a kernel asks for a value, a provider can override the default.
