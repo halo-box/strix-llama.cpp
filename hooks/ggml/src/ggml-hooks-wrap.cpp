@@ -136,6 +136,22 @@ bool uses_hook_type(const ggml_tensor * op) {
     return false;
 }
 
+// The hook kernels read their srcs as plain tensors. On the CPU a src in an extra buffer type (repacked weights, not
+// host memory) is left to upstream, which asks that buffer type: as upstream, a loader that probes the buffer types
+// of a weight does not put it in a layout that no kernel of the node reads.
+bool srcs_plain(const reg_state * rs, const ggml_tensor * op) {
+    if (rs->drv.backend != GGML_HOOK_BACKEND_CPU) {
+        return true;
+    }
+    for (int i = 0; i < GGML_MAX_SRC; ++i) {
+        const ggml_tensor * src = op->src[i];
+        if (src && src->buffer && !ggml_backend_buft_is_host(ggml_backend_buffer_get_type(src->buffer))) {
+            return false;
+        }
+    }
+    return true;
+}
+
 bool wrap_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     reg_state * rs = nullptr;
     dev_state * ds = find_dev(dev, &rs);
@@ -146,7 +162,13 @@ bool wrap_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
         }
     }
     if (ggml_hook_has_kernels(rs->drv.backend) && ggml_hook_find_op(&ds->info, op)) {
-        return true;
+        if (srcs_plain(rs, op)) {
+            return true;
+        }
+        if (ggml_hook_is_hook_custom(op) || uses_hook_type(op)) {
+            return false; // upstream does not know them
+        }
+        return ds->orig.supports_op(dev, op);
     }
     // the custom ops of the hooks (EXL3): only hook kernels compute them
     if (ggml_hook_is_hook_custom(op)) {
@@ -276,6 +298,18 @@ void wrap_graph_optimize(ggml_backend_t backend, ggml_cgraph * cgraph, ggml_back
     }
 }
 
+// the compute of upstream, or of another implementation of the backend (replace_graph_compute): the whole graph when no
+// hook kernel takes a node, else the segments between the hook kernels
+ggml_status base_compute(reg_state * rs, ggml_backend_t backend, ggml_cgraph * cgraph) {
+    for (const auto * e : exts_of(rs->drv.backend)) {
+        ggml_status st = GGML_STATUS_SUCCESS;
+        if (e->replace_graph_compute && e->replace_graph_compute(backend, cgraph, &st)) {
+            return st;
+        }
+    }
+    return rs->orig_backend.graph_compute(backend, cgraph);
+}
+
 ggml_cgraph graph_view(ggml_cgraph * g, int i0, int i1) {
     ggml_cgraph v = *g;
     v.size      = 0;
@@ -313,7 +347,7 @@ ggml_status cut_compute(reg_state * rs, const dev_state * ds, ggml_backend_t bac
     const void * state = ggml_hook_kernels_state();
     if (cgraph->uid != 0 && seen.backend == backend && seen.uid == cgraph->uid && seen.state == state &&
             seen.arch == model_arch()) {
-        return rs->orig_backend.graph_compute(backend, cgraph);
+        return base_compute(rs, backend, cgraph);
     }
     int  seg_start = 0;
     bool in_run    = false;
@@ -329,11 +363,11 @@ ggml_status cut_compute(reg_state * rs, const dev_state * ds, ggml_backend_t bac
             if (cgraph->uid != 0) {
                 seen = { backend, cgraph->uid, state, model_arch() };
             }
-            return rs->orig_backend.graph_compute(backend, cgraph);
+            return base_compute(rs, backend, cgraph);
         }
         if (end > seg_start) {
             ggml_cgraph v = graph_view(cgraph, seg_start, end);
-            return rs->orig_backend.graph_compute(backend, &v);
+            return base_compute(rs, backend, &v);
         }
         return GGML_STATUS_SUCCESS;
     };
@@ -360,7 +394,7 @@ ggml_status cut_compute(reg_state * rs, const dev_state * ds, ggml_backend_t bac
         // the upstream segment before the node. Inside a run of hook kernels, only empty nodes can be skipped.
         if (!in_run && i > seg_start) {
             ggml_cgraph v = graph_view(cgraph, seg_start, i);
-            const ggml_status st = rs->orig_backend.graph_compute(backend, &v);
+            const ggml_status st = base_compute(rs, backend, &v);
             if (st != GGML_STATUS_SUCCESS) {
                 return st;
             }
@@ -418,19 +452,11 @@ ggml_status wrap_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     }
 
     ggml_status st = GGML_STATUS_SUCCESS;
-    bool replaced = false;
-    for (const auto * e : exts) {
-        if (!replaced && e->replace_graph_compute) {
-            replaced = e->replace_graph_compute(backend, cgraph, &st);
-        }
-    }
     const bool cut = ggml_hook_has_kernels(rs->drv.backend) && (rs->drv.cut_ops || rs->drv.run_fusion);
-    if (replaced) {
-        // computed by another implementation of the backend
-    } else if (cut) {
+    if (cut) {
         st = cut_compute(rs, ds, backend, cgraph);
     } else {
-        st = rs->orig_backend.graph_compute(backend, cgraph);
+        st = base_compute(rs, backend, cgraph);
     }
     // a mark that no node of this graph took must not skip a node of the next graph
     ggml_hook_clear_computed();

@@ -644,7 +644,7 @@ static void test_reallocation() {
         bool result = ggml_gallocr_alloc_graph(galloc.get(), graph);
         GGML_ASSERT(result);
         check_all_allocated(graph);
-        GGML_ASSERT(backend.context->allocated_total() == 40);
+        GGML_ASSERT(backend.context->allocated_total() == 44); // hooks: the fork allocator keeps the 24 B chunk
     }
 }
 

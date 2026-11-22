@@ -5,7 +5,9 @@
 // fork_cuda_node  (on):  the nodes that upstream refuses and the fork accepts (the fork types, the EXL3 ops, ...) are
 //                        computed by the fork ggml_cuda_compute_forward.
 // fork_cuda_graph (off): the fork computes the graphs instead of upstream: its graph_optimize and graph_compute
-//                        (fusions, kernel selection, CUDA graphs). GGML_HOOKS=+fork_cuda_graph (a switch).
+//                        (fusions, kernel selection, CUDA graphs), and the device answers (supports_op, offload_op).
+//                        Hook kernels still apply: the fork computes the segments between them, on the same stream.
+//                        GGML_HOOKS=+fork_cuda_graph (a switch).
 
 #include "../../fork-cuda/common.cuh"
 
@@ -27,6 +29,7 @@ namespace ggml_fork {
 // fork-entry.inc
 bool ggml_hook_fork_compute_forward(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 bool ggml_hook_fork_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op);
+bool ggml_hook_fork_offload_op(ggml_backend_dev_t dev, const ggml_tensor * op);
 enum ggml_status ggml_hook_fork_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph);
 void ggml_hook_fork_graph_optimize(ggml_backend_t backend, ggml_cgraph * cgraph, ggml_backend_graph_optimize_params * params);
 void ggml_hook_fork_set_mmb_enabled(ggml_backend_t backend, bool enable);
@@ -86,6 +89,10 @@ void fork_backend_free(ggml_backend_t backend) {
 }
 
 // ggml_backend_cuda_reg() takes a lock: the devices are read once
+int dev_index_of(ggml_backend_dev_t dev) {
+    return *(const int *) dev->context; // ggml_backend_cuda_device_context starts with the device index
+}
+
 ggml_backend_dev_t cuda_dev(int device) {
     static ggml_backend_dev_t devs[GGML_CUDA_MAX_DEVICES] = {};
     if (!devs[device]) {
@@ -96,7 +103,12 @@ ggml_backend_dev_t cuda_dev(int device) {
 
 // fork_cuda_node
 
+bool graph_on();
+
 bool node_supports(const ggml_hook_dev * dev, const ggml_tensor * t) {
+    if (graph_on()) {
+        return false; // the fork computes every node
+    }
     switch (t->op) {
         case GGML_OP_NONE:
         case GGML_OP_VIEW:
@@ -131,6 +143,33 @@ bool node_supports(const ggml_hook_dev * dev, const ggml_tensor * t) {
     ggml_backend_dev_t d = cuda_dev(dev->device);
     e = { t, sig, !ggml_hook_cuda_upstream_supports_op(d, t) && ggml_fork::ggml_hook_fork_supports_op(d, t) };
     return e.res;
+}
+
+// the nodes that the fork computes (upstream refuses them): the fork answer for the offload of a CPU weight too, e.g.
+// the batch size of the EXL3 ops
+bool graph_on();
+
+// fork_cuda_graph: the fork computes every node, so the device answers are the fork ones (which nodes it takes, and
+// which CPU weights it offloads), as in a fork build. The device contexts have the same layout in both trees.
+bool graph_supports(ggml_backend_dev_t dev, const ggml_tensor * op, bool * result) {
+    if (!graph_on()) {
+        return false;
+    }
+    *result = ggml_fork::ggml_hook_fork_supports_op(dev, op);
+    return true;
+}
+
+bool node_offload(ggml_backend_dev_t dev, const ggml_tensor * op, bool * result) {
+    ggml_backend_dev_t d = cuda_dev(dev_index_of(dev));
+    if (graph_on()) {
+        *result = ggml_fork::ggml_hook_fork_offload_op(d, op);
+        return true;
+    }
+    if (!ggml_hook_is_hook_custom(op) && ggml_hook_cuda_upstream_supports_op(d, op)) {
+        return false;
+    }
+    *result = ggml_fork::ggml_hook_fork_offload_op(d, op);
+    return true;
 }
 
 bool node_compute(::ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -191,6 +230,8 @@ GGML_HOOK_REGISTER_BACKEND_EXT([] {
     auto e = ggml_hook_ext("fork_cuda", GGML_HOOK_BACKEND_CUDA);
     e.backend_init   = fork_backend_init;
     e.backend_free   = fork_backend_free;
+    e.offload_op             = node_offload;
+    e.supports_op            = graph_supports;
     e.replace_graph_compute  = graph_compute;
     e.replace_graph_optimize = graph_optimize;
     e.proc_address   = proc_address;

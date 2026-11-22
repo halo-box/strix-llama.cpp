@@ -1319,7 +1319,7 @@ variant  .github/ISSUE_TEMPLATE/020-enhancement.yml:11  the fork version in hook
 variant  .github/ISSUE_TEMPLATE/030-research.yml:11  the fork version in hooks/fork-files/.github/ISSUE_TEMPLATE/030-research.yml, not active; the upstream file stays
 variant  .github/ISSUE_TEMPLATE/040-refactor.yml:12  the fork version in hooks/fork-files/.github/ISSUE_TEMPLATE/040-refactor.yml, not active; the upstream file stays
 variant  .github/ISSUE_TEMPLATE/config.yml:1  the fork version in hooks/fork-files/.github/ISSUE_TEMPLATE/config.yml, not active; the upstream file stays
-variant  .github/pull_request_template.md:13  the fork version in hooks/fork-files/.github/pull_request_template.md, not active; the upstream file stays
+dropped  .github/pull_request_template.md:13 the requirement to send general llama.cpp improvements to halo-box/llama.cpp: that repository is archived (SYNC.md of the fork); the rest of the hunk is in hooks/fork-files
 variant  .github/pull_request_template.md:16  the fork version in hooks/fork-files/.github/pull_request_template.md, not active; the upstream file stays
 variant  .github/workflows/build-3rd-party.yml:1  the fork version in hooks/fork-files/.github/workflows/build-3rd-party.yml, not active; the upstream file stays
 variant  .github/workflows/build-and-test-snapdragon.yml:1  the fork version in hooks/fork-files/.github/workflows/build-and-test-snapdragon.yml, not active; the upstream file stays
@@ -1610,3 +1610,4 @@ variant  ui/apps/chat/README.md:131  the fork version in hooks/fork-files/ui/app
 variant  ui/apps/chat/src/lib/components/app/navigation/SidebarNavigation/SidebarNavigationActions.svelte:96  the fork version in hooks/fork-files/ui/apps/chat/src/lib/components/app/navigation/SidebarNavigation/SidebarNavigationActions.svelte, not active; the upstream file stays
 variant  ui/apps/chat/src/lib/components/app/navigation/SidebarNavigation/SidebarNavigationActions.svelte:109  the fork version in hooks/fork-files/ui/apps/chat/src/lib/components/app/navigation/SidebarNavigation/SidebarNavigationActions.svelte, not active; the upstream file stays
 variant  ui/apps/chat/src/lib/constants/ui.constants.ts:8  the fork version in hooks/fork-files/ui/apps/chat/src/lib/constants/ui.constants.ts, not active; the upstream file stays
+adapted  src/llama-memory-hybrid-idx.cpp:71  the registry name of a layer device: a meta device has none, it counts as not validated (hooks/llama/fork-src, marked hooks:)

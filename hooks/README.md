@@ -84,14 +84,18 @@ switch selects it. Upstream stays the default.
   every upstream backend a fork context that computes on the upstream stream.
   - `fork_cuda_node` (on): nodes that upstream refuses and the fork accepts, for example the fork types and the EXL3
     ops, run through the fork `ggml_cuda_compute_forward`.
-  - `fork_cuda_graph` (switch, off): the fork `graph_optimize` and `graph_compute` replace the upstream ones.
+  - `fork_cuda_graph` (switch, off): the fork `graph_optimize`, `graph_compute`, `supports_op` and `offload_op`
+    replace the upstream ones. Hook kernels still apply: the fork computes the segments between them.
 - Vulkan: `ggml/fork-vulkan` is the fork `ggml/src/ggml-vulkan` with its shaders (`hooks/tools/import-fork-vulkan.py`).
   The fork device uses the upstream instance and logical device, so both read the same buffers and share the queues.
   `fork_vk_node` (on) works as on HIP. With `fork_vk_graph` (switch, off) the upstream devices become the fork
   devices: buffers, backends and events are all fork objects (`hooks/ggml/fork-vulkan/README.md`).
-- A backend extension can replace `graph_compute` and `graph_optimize` (`replace_graph_compute`,
-  `replace_graph_optimize`, used by `fork_cuda_graph`) or any device function when the wrapper installs a device
-  (`device_install`, used by `fork_vk_graph`).
+- A backend extension can replace the compute of upstream (`replace_graph_compute`: the whole graph, or the segments
+  between hook kernels) and `graph_optimize` (`replace_graph_optimize`), both used by `fork_cuda_graph`, or any device
+  function when the wrapper installs a device (`device_install`, used by `fork_vk_graph`). In `fork_vk_graph` mode the
+  backends are fork backends, so the Vulkan hook kernels, written against the upstream Vulkan context, do not apply.
+- On the CPU a hook kernel does not take a node whose source sits in an extra buffer type (repacked weights): upstream
+  answers, so a loader that probes buffer types never puts a weight in a layout no kernel of the node reads.
 - libllama: `llama/fork-src` is the fork `src/`, `llama/fork-include` the fork `include/`
   (`hooks/tools/import-fork-llama.py`). `fork_llama` (switch, off) sends the public API to the fork libllama; the
   generated `llama/src/llama-fork-dispatch.cpp` calls one side.

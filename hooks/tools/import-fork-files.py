@@ -57,3 +57,11 @@ for line in git('diff', '--name-status', BASE, REF).split('\n'):
     n += 1
 
 print(n, 'files in hooks/fork-files')
+
+# the PR template of the fork asks to send general llama.cpp improvements to halo-box/llama.cpp: that repository is
+# archived (SYNC.md of the fork), the requirement is not kept
+p = 'hooks/fork-files/.github/pull_request_template.md'
+t = open(p).read()
+rule = ('- This change is Strix Halo specific, or justified by measurements on Strix Halo. General llama.cpp improvements\n  belong in [halo-box/llama.cpp](https://github.com/halo-box/llama.cpp) instead\n')
+assert t.count(rule) == 1
+open(p, 'w').write(t.replace(rule, ''))

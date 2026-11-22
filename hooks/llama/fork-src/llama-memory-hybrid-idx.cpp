@@ -150,7 +150,8 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
         if (!model.hparams.has_kv(il) || !filter_idx(il) || model.hparams.dsv4_compress_ratios[il] != 4) { continue; }
         auto * dev = model.dev_layer(il);
         // validated on ROCm, Vulkan and CPU
-        const char * reg = ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev));
+        ggml_backend_reg_t dev_reg = ggml_backend_dev_backend_reg(dev); // hooks: a meta device has no registry
+        const char * reg = dev_reg ? ggml_backend_reg_name(dev_reg) : ""; // hooks
         const bool validated = std::strcmp(reg, "ROCm") == 0 || std::strcmp(reg, "Vulkan") == 0 || std::strcmp(reg, "CPU") == 0;
         if (!validated) { continue; }
         incremental_qsa = true;

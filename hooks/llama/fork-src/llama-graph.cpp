@@ -4226,7 +4226,14 @@ ggml_tensor * llm_graph_context::build_rs(
         ggml_tensor * states_main = ggml_cpy(ctx0,
             ggml_view_2d(ctx0, states_all, state_size, n_main, states_all->nb[1], 0),
             ggml_view_2d(ctx0, states,     state_size, n_main, states->nb[1],     rs_head*states->nb[1]));
+        bool meta = false; // hooks: the model has a meta device
+        for (const auto & d : model.devices) { meta = meta || d.is_meta; } // hooks
+        if (n_main == 0 && meta) { // hooks: the meta backend cannot split a view of an empty copy: the same rows
+            ggml_build_forward_expand(gf, states_main); // hooks
+            output_states = ggml_view_2d(ctx0, states, state_size, n_seqs, states->nb[1], rs_head*states->nb[1]); // hooks
+        } else { // hooks
         output_states = ggml_view_2d(ctx0, states_main, state_size, n_seqs, states->nb[1], 0);
+        } // hooks
     } else {
         output_states = get_state_rows ?
             get_state_rows(ctx0, states, state_copy_main) :

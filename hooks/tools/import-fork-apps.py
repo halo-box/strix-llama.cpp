@@ -151,4 +151,19 @@ for f in [x for x in git('ls-tree', '--name-only', REF, 'tests/').split() if x.e
                      global_main=True)
     open(os.path.join(tdir, os.path.basename(f)), 'w').write(src)
 
+
+# test_reallocation: the fork allocator keeps each chunk at least its current size on a re-reserve (its cached plans
+# hold offsets into the chunks), so the second graph takes 24 + 20 bytes; the fork did not update its test
+p = os.path.join(tdir, 'test-alloc.cpp')
+t = open(p).read()
+old = """        bool result = ggml_gallocr_alloc_graph(galloc.get(), graph);
+        GGML_ASSERT(result);
+        check_all_allocated(graph);
+        GGML_ASSERT(backend.context->allocated_total() == 40);"""
+assert t.count(old) == 1
+t = t.replace(old, """        bool result = ggml_gallocr_alloc_graph(galloc.get(), graph);
+        GGML_ASSERT(result);
+        check_all_allocated(graph);
+        GGML_ASSERT(backend.context->allocated_total() == 44); // hooks: the fork allocator keeps the 24 B chunk""")
+open(p, 'w').write(t)
 print('adapted')

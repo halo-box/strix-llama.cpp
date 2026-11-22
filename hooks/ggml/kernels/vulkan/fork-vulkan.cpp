@@ -229,6 +229,16 @@ bool node_supports(const ggml_hook_dev * dev, const ggml_tensor * t) {
     return e.res;
 }
 
+bool node_offload(ggml_backend_dev_t dev, const ggml_tensor * op, bool * result) {
+    const size_t i = dev_index(dev);
+    if (ggml_hook_vk_upstream_supports_op(upstream_dev(i), op)) {
+        return false;
+    }
+    ggml_backend_dev_t f = fork_dev(i);
+    *result = f->iface.offload_op ? f->iface.offload_op(f, op) : false;
+    return true;
+}
+
 ggml_backend_t fork_of(::ggml_backend_vk_context * ctx) {
     std::lock_guard<std::mutex> lock(fork_mutex);
     return fork_states.at(ctx)->fork;
@@ -307,6 +317,7 @@ GGML_HOOK_REGISTER_BACKEND_EXT([] {
     e.backend_init   = fork_backend_init;
     e.backend_free   = fork_backend_free;
     e.device_install = graph_device_install;
+    e.offload_op     = node_offload;
     e.proc_address   = graph_proc_address;
     return e;
 }());

@@ -11,6 +11,10 @@ bool ggml_hook_fork_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) 
     return ggml_backend_cuda_device_supports_op(dev, op);
 }
 
+bool ggml_hook_fork_offload_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
+    return ggml_backend_cuda_device_offload_op(dev, op);
+}
+
 // backend->context is a fork context
 enum ggml_status ggml_hook_fork_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     return ggml_backend_cuda_graph_compute(backend, cgraph);

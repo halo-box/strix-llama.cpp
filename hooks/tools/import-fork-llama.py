@@ -107,6 +107,27 @@ p = 'hooks/llama/fork-src/llama-impl.h'
 t = open(p).read().rstrip('\n') + '\n#include "fork-hooks.h" // hooks: the hooks side of the fork code\n'
 open(p, 'w').write(t)
 
+# build_rs in place: with every state of the ubatch already in place (n_main == 0) the fork views the states through
+# an empty copy, which the meta backend (multi-device split) cannot place, and the fork aborts there. With a meta device
+# only, the rows are viewed from the cache and the empty copy stays a node; every other graph is the fork one.
+adapt('hooks/llama/fork-src/llama-graph.cpp',
+      """        output_states = ggml_view_2d(ctx0, states_main, state_size, n_seqs, states->nb[1], 0);""",
+      """        bool meta = false; // hooks: the model has a meta device
+        for (const auto & d : model.devices) { meta = meta || d.is_meta; } // hooks
+        if (n_main == 0 && meta) { // hooks: the meta backend cannot split a view of an empty copy: the same rows
+            ggml_build_forward_expand(gf, states_main); // hooks
+            output_states = ggml_view_2d(ctx0, states, state_size, n_seqs, states->nb[1], rs_head*states->nb[1]); // hooks
+        } else { // hooks
+        output_states = ggml_view_2d(ctx0, states_main, state_size, n_seqs, states->nb[1], 0);
+        } // hooks""")
+
+# the incremental QSA cache asks the registry of each layer device: a meta device (multi-device split) has none, it is
+# not one of the validated backends
+adapt('hooks/llama/fork-src/llama-memory-hybrid-idx.cpp',
+      "        const char * reg = ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev));",
+      "        ggml_backend_reg_t dev_reg = ggml_backend_dev_backend_reg(dev); // hooks: a meta device has no registry\n"
+      "        const char * reg = dev_reg ? ggml_backend_reg_name(dev_reg) : \"\"; // hooks")
+
 # ---------------------------------------------------------------- the dispatcher of the public API
 def api(text):
     text = re.sub(r'//[^\n]*', '', text)
@@ -165,6 +186,7 @@ cm = open('hooks/llama/llama-hooks.cmake').read()
 hooked = set()
 for m in re.finditer(r'hooks_rename\(llama SOURCE [^\n]* SYMBOLS([^)]*)\)', cm):
     hooked |= set(m.group(1).split())
+hooked &= up_names  # the llama.h functions only (not the llama-ext.h renames, nor the CMake variables)
 
 
 def fields(text, name):

@@ -117,7 +117,8 @@ struct ggml_hook_backend_ext {
     void (*graph_compute_end)(ggml_backend_t backend, ggml_cgraph * cgraph, ggml_status status) = nullptr;
     // the scheduler re-reserves its buffers: return true to skip the sync of this backend (HOOK(sched-realloc-sync))
     bool (*skip_realloc_sync)(ggml_backend_t backend) = nullptr;
-    // another implementation of the backend: return true to compute the graph instead of upstream and the hook kernels
+    // another implementation of the backend: return true to compute the graph instead of upstream. Called for the whole
+    // graph when no hook kernel takes a node, else for each segment between the hook kernels
     bool (*replace_graph_compute)(ggml_backend_t backend, ggml_cgraph * cgraph, ggml_status * status) = nullptr;
     // when the wrapper installs a device, after its own functions: another implementation of the device can replace
     // any function of iface (the live interface of dev)

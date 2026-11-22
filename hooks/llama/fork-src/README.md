@@ -19,3 +19,9 @@ dispatcher.
 
 With `GGML_HOOKS=+fork_llama,+fork_cuda_graph,+fork_sched`, gpt-oss-20b gives the perplexity and speed of the fork
 binary on gfx1151.
+
+Fixes of the fork code, applied by the import tool and marked `hooks:`:
+- `build_rs` in place, with a meta device (multi-device split) only: the fork views the recurrent states through an
+  empty copy when every state of the ubatch is already in place, which the meta backend cannot split (the fork aborts
+  in `test-llama-archs`). The same rows are viewed from the cache; every other graph is the fork one.
+- the incremental QSA cache reads the registry name of each layer device; a meta device has none.
