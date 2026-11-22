@@ -1,4 +1,5 @@
 // x86 CPU kernels of the fork types: the fork's additions to ggml/src/ggml-cpu/arch/x86/quants.c.
+typedef int ggml_hooks_x86_quants_ext_unit; // not an empty translation unit off x86 (-pedantic)
 #if (defined(__x86_64__) || defined(__i386__) || defined(_M_IX86) || defined(_M_X64)) && !defined(GGML_CPU_GENERIC)
 #define GGML_COMMON_IMPL_C
 #include "../ggml-quants-ext.h"
