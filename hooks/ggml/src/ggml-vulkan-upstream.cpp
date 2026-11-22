@@ -9,7 +9,7 @@ bool ggml_hook_vk_upstream_supports_op(ggml_backend_dev_t dev, const ggml_tensor
     return ggml_backend_vk_device_supports_op(dev, op);
 }
 
-// the instance and the logical device of upstream, for the fork code (hooks/ggml/fork-vulkan): one VkDevice
+// the instance and the logical device of upstream, for the fork code (hooks/ggml/vulkan): one VkDevice
 vk::Instance ggml_hook_vk_upstream_instance() {
     ggml_vk_instance_init();
     return vk_instance.instance;

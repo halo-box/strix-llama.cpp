@@ -20,29 +20,29 @@ hooks_rename(llama SOURCE ${CMAKE_SOURCE_DIR}/src/llama-context.cpp SYMBOLS
     llama_init_from_model llama_free llama_process llama_decode llama_encode
     llama_memory_clear llama_memory_seq_rm llama_memory_seq_cp llama_memory_seq_keep llama_memory_seq_add llama_memory_seq_div)
 
-# the fork libllama (hooks/llama/fork-src, namespace ggml_fork) beside the upstream one, and the dispatcher of the
-# public API (fork_llama switch, off): hooks/llama/src/llama-fork-dispatch.cpp
-option(LLAMA_HOOKS_FORK_LLAMA "hooks: build the fork libllama into libllama" ON)
-if (LLAMA_HOOKS_FORK_LLAMA)
-    include(${HOOKS_DIR}/llama/fork-src/symbols.cmake)
-    file(GLOB_RECURSE fork_llama_srcs CONFIGURE_DEPENDS ${HOOKS_DIR}/llama/fork-src/*.cpp)
-    add_library(hooks-fork-llama OBJECT ${fork_llama_srcs})
+# the fork libllama (hooks/llama/lib, namespace ggml_fork) beside the upstream one, and the dispatcher of the
+# public API (llama switch, off): hooks/llama/src/llama-dispatch.cpp
+option(LLAMA_HOOKS_LIB "hooks: build the fork libllama into libllama" ON)
+if (LLAMA_HOOKS_LIB)
+    include(${HOOKS_DIR}/llama/lib/symbols.cmake)
+    file(GLOB_RECURSE fork_llama_srcs CONFIGURE_DEPENDS ${HOOKS_DIR}/llama/lib/*.cpp)
+    add_library(hooks-llama OBJECT ${fork_llama_srcs})
     get_target_property(llama_bin llama BINARY_DIR)
-    target_include_directories(hooks-fork-llama PRIVATE ${HOOKS_DIR}/llama/fork-include ${HOOKS_DIR}/llama/fork-src ${llama_bin})
-    target_link_libraries(hooks-fork-llama PRIVATE ggml)
-    target_compile_features(hooks-fork-llama PRIVATE cxx_std_17)
-    set_target_properties(hooks-fork-llama PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    target_include_directories(hooks-llama PRIVATE ${HOOKS_DIR}/llama/lib-include ${HOOKS_DIR}/llama/lib ${llama_bin})
+    target_link_libraries(hooks-llama PRIVATE ggml)
+    target_compile_features(hooks-llama PRIVATE cxx_std_17)
+    set_target_properties(hooks-llama PROPERTIES POSITION_INDEPENDENT_CODE ON)
     if (BUILD_SHARED_LIBS)
-        target_compile_definitions(hooks-fork-llama PRIVATE LLAMA_BUILD LLAMA_SHARED)
+        target_compile_definitions(hooks-llama PRIVATE LLAMA_BUILD LLAMA_SHARED)
     endif()
     if (GGML_EXL3)
         # as src/CMakeLists.txt of the fork: the PLE gather decodes EXL3 rows on the host
-        target_compile_definitions(hooks-fork-llama PRIVATE LLAMA_USE_EXL3)
-        target_include_directories(hooks-fork-llama PRIVATE ${HOOKS_DIR}/ggml/exl3)
+        target_compile_definitions(hooks-llama PRIVATE LLAMA_USE_EXL3)
+        target_include_directories(hooks-llama PRIVATE ${HOOKS_DIR}/ggml/exl3)
     endif()
-    target_sources(llama PRIVATE $<TARGET_OBJECTS:hooks-fork-llama> ${HOOKS_DIR}/llama/src/llama-fork-dispatch.cpp
-                                 ${HOOKS_DIR}/llama/src/llama-fork-ext-dispatch.cpp)
-    # the llama-ext.h functions that common and the tools use (llama-fork-ext-dispatch.cpp)
+    target_sources(llama PRIVATE $<TARGET_OBJECTS:hooks-llama> ${HOOKS_DIR}/llama/src/llama-dispatch.cpp
+                                 ${HOOKS_DIR}/llama/src/llama-ext-dispatch.cpp)
+    # the llama-ext.h functions that common and the tools use (llama-ext-dispatch.cpp)
     hooks_rename(llama SOURCE ${CMAKE_SOURCE_DIR}/src/llama-model.cpp SYMBOLS llama_model_n_expert llama_model_n_devices
         llama_model_get_device llama_model_decision_label llama_model_get_tok_embd llama_model_get_tok_embd_rows
         llama_model_n_tokens_delay llama_model_classifier_free_guidance)
@@ -117,8 +117,8 @@ if (TARGET test-quantize-fns)
 endif()
 
 # the fork tools (hooks/apps)
-if (LLAMA_HOOKS_FORK_LLAMA)
-    include(${HOOKS_DIR}/apps/fork-apps.cmake)
+if (LLAMA_HOOKS_LIB)
+    include(${HOOKS_DIR}/apps/apps.cmake)
 endif()
 
 # the UI assets: HOOK(ui-assets) in scripts/ui-assets.cmake includes this file of the UI build, when it exists

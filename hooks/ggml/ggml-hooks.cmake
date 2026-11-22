@@ -8,7 +8,7 @@ get_target_property(GGML_HOOKS_GGML_SRC ggml-base SOURCE_DIR) # ggml/src
 target_sources(ggml-base PRIVATE ${GGML_HOOKS_DIR}/src/ggml-hooks-registry.cpp ${GGML_HOOKS_DIR}/src/ggml-hooks-wrap.cpp
                                  ${GGML_HOOKS_DIR}/types/types.c ${GGML_HOOKS_DIR}/types/ggml-quants-ext.c
                                  ${GGML_HOOKS_DIR}/types/rocmfp4/rocmfp4.c ${GGML_HOOKS_DIR}/types/rocmfpx/rocmfpx.c
-                                 ${GGML_HOOKS_DIR}/exl3/ggml-exl3-ops.c ${GGML_HOOKS_DIR}/src/ggml-fork-ops.c)
+                                 ${GGML_HOOKS_DIR}/exl3/ggml-exl3-ops.c ${GGML_HOOKS_DIR}/src/ggml-hooks-ops.c)
 # EXL3: the decoder library of the fork, as ggml/src/CMakeLists.txt of the fork
 if (GGML_EXL3)
     target_sources(ggml-base PRIVATE ${GGML_HOOKS_DIR}/exl3/exl3.c)
@@ -20,16 +20,16 @@ target_include_directories(ggml-base PRIVATE ${GGML_HOOKS_DIR}/types)
 target_compile_definitions(ggml-base PUBLIC GGML_HOOKS)
 target_link_libraries(ggml-base PRIVATE ${CMAKE_DL_LIBS})
 
-# the fork_sched switch: the scheduler, graph allocator and sanitizer of the fork beside the upstream ones
-# (hooks/ggml/src/ggml-fork-sched.cpp). The upstream ggml-backend.cpp is compiled through ggml-backend-upstream.cpp.
-include(${GGML_HOOKS_DIR}/src/fork-sched/symbols.cmake)
-set(fork_sched_dir ${GGML_HOOKS_DIR}/src/fork-sched)
-target_sources(ggml-base PRIVATE ${fork_sched_dir}/fork-alloc.c ${fork_sched_dir}/fork-backend.cpp
-                                 ${fork_sched_dir}/ggml-backend-sanitize.cpp ${GGML_HOOKS_DIR}/src/ggml-fork-sched.cpp
+# the sched switch: the scheduler, graph allocator and sanitizer of the fork beside the upstream ones
+# (hooks/ggml/src/ggml-hooks-sched.cpp). The upstream ggml-backend.cpp is compiled through ggml-backend-upstream.cpp.
+include(${GGML_HOOKS_DIR}/src/sched/symbols.cmake)
+set(fork_sched_dir ${GGML_HOOKS_DIR}/src/sched)
+target_sources(ggml-base PRIVATE ${fork_sched_dir}/alloc.c ${fork_sched_dir}/backend.cpp
+                                 ${fork_sched_dir}/ggml-backend-sanitize.cpp ${GGML_HOOKS_DIR}/src/ggml-hooks-sched.cpp
                                  ${GGML_HOOKS_DIR}/src/ggml-backend-upstream.cpp)
 set_source_files_properties(${GGML_HOOKS_GGML_SRC}/ggml-backend.cpp TARGET_DIRECTORY ggml-base PROPERTIES HEADER_FILE_ONLY ON)
 foreach (sym ${GGML_FORK_SCHED_SYMBOLS})
-    set_property(SOURCE ${fork_sched_dir}/fork-alloc.c ${fork_sched_dir}/fork-backend.cpp TARGET_DIRECTORY ggml-base
+    set_property(SOURCE ${fork_sched_dir}/alloc.c ${fork_sched_dir}/backend.cpp TARGET_DIRECTORY ggml-base
                  APPEND PROPERTY COMPILE_DEFINITIONS "${sym}=fork_${sym}")
 endforeach()
 hooks_rename(ggml-base SOURCE ${GGML_HOOKS_GGML_SRC}/ggml-alloc.c SYMBOLS ${GGML_FORK_SCHED_ALLOC_UPSTREAM})
@@ -65,7 +65,7 @@ if (GGML_CPU)
                 # as ggml/src/ggml-cpu/CMakeLists.txt of the fork
                 target_compile_definitions(${target} PRIVATE GGML_USE_EXL3)
                 target_sources(${target} PRIVATE ${GGML_HOOKS_DIR}/kernels/cpu-exl3/exl3-ops.cpp)
-                list(APPEND units ${GGML_HOOKS_DIR}/kernels/cpu-exl3/fork-exl3-cpu.cpp)
+                list(APPEND units ${GGML_HOOKS_DIR}/kernels/cpu-exl3/exl3-cpu.cpp)
             endif()
             hooks_link(${target} UNITS ${units})
             hooks_rename(${target} SOURCE ${GGML_HOOKS_GGML_SRC}/ggml-cpu/ggml-cpu.cpp SYMBOLS ggml_backend_cpu_init)
@@ -74,9 +74,9 @@ if (GGML_CPU)
 endif()
 
 # CUDA, HIP, MUSA
-option(GGML_HOOKS_FORK_CUDA "hooks: build the fork ggml-cuda code into ggml-hip" ON)
+option(GGML_HOOKS_CUDA "hooks: build the fork ggml-cuda code into ggml-hip" ON)
 file(GLOB GGML_HOOK_CUDA_KERNELS CONFIGURE_DEPENDS ${GGML_HOOKS_DIR}/kernels/cuda/*.cu)
-list(FILTER GGML_HOOK_CUDA_KERNELS EXCLUDE REGEX "/fork-cuda\\.cu$") # the bridge to the fork code, HIP only (below)
+list(FILTER GGML_HOOK_CUDA_KERNELS EXCLUDE REGEX "/cuda\\.cu$") # the bridge to the fork code, HIP only (below)
 set(GGML_HOOK_CUDA_SOURCES ${GGML_HOOKS_DIR}/src/ggml-hooks-cuda.cu ${GGML_HOOK_CUDA_KERNELS})
 foreach (target ggml-cuda ggml-hip ggml-musa)
     if (NOT TARGET ${target})
@@ -84,8 +84,8 @@ foreach (target ggml-cuda ggml-hip ggml-musa)
     endif()
     target_include_directories(${target} PRIVATE ${GGML_HOOKS_GGML_SRC}/ggml-cuda)
     set(units ${GGML_HOOK_CUDA_SOURCES})
-    if (target STREQUAL "ggml-hip" AND GGML_HOOKS_FORK_CUDA)
-        list(APPEND units ${GGML_HOOKS_DIR}/kernels/cuda/fork-cuda.cu)
+    if (target STREQUAL "ggml-hip" AND GGML_HOOKS_CUDA)
+        list(APPEND units ${GGML_HOOKS_DIR}/kernels/cuda/cuda-bridge.cu)
     endif()
     hooks_link(${target} UNITS ${units})
     # the upstream ggml-cuda.cu is compiled through ggml-cuda-upstream.cu, which reaches its static functions
@@ -102,12 +102,12 @@ foreach (target ggml-cuda ggml-hip ggml-musa)
 endforeach()
 
 # Vulkan: shaders are compiled with glslc and embedded as headers
-option(GGML_HOOKS_FORK_VULKAN "hooks: build the fork ggml-vulkan code into ggml-vulkan" ON)
+option(GGML_HOOKS_VULKAN "hooks: build the fork ggml-vulkan code into ggml-vulkan" ON)
 if (TARGET ggml-vulkan)
     file(GLOB GGML_HOOK_VK_KERNELS CONFIGURE_DEPENDS ${GGML_HOOKS_DIR}/kernels/vulkan/*.cpp)
-    list(FILTER GGML_HOOK_VK_KERNELS EXCLUDE REGEX "/fork-vulkan\\.cpp$") # the bridge to the fork code (below)
-    if (GGML_HOOKS_FORK_VULKAN)
-        list(APPEND GGML_HOOK_VK_KERNELS ${GGML_HOOKS_DIR}/kernels/vulkan/fork-vulkan.cpp)
+    list(FILTER GGML_HOOK_VK_KERNELS EXCLUDE REGEX "/vulkan\\.cpp$") # the bridge to the fork code (below)
+    if (GGML_HOOKS_VULKAN)
+        list(APPEND GGML_HOOK_VK_KERNELS ${GGML_HOOKS_DIR}/kernels/vulkan/vulkan-bridge.cpp)
     endif()
     file(GLOB GGML_HOOK_VK_SHADERS CONFIGURE_DEPENDS ${GGML_HOOKS_DIR}/kernels/vulkan/*.comp)
     if (NOT Vulkan_GLSLC_EXECUTABLE)
@@ -176,11 +176,11 @@ if (LLAMA_BUILD_TESTS AND NOT GGML_BACKEND_DL AND GGML_CPU)
     endif()
 endif()
 
-# HIP: the fork ggml-cuda sources (hooks/ggml/fork-cuda, namespace ggml_fork) in the upstream backend, the same list as
-# ggml/src/ggml-hip/CMakeLists.txt of the fork. Hook kernels and the fork_cuda switch run them on the upstream streams
-# (hooks/ggml/kernels/cuda/fork-cuda.cu).
-if (TARGET ggml-hip AND GGML_HOOKS_FORK_CUDA)
-    set(fork_cuda_dir ${GGML_HOOKS_DIR}/fork-cuda)
+# HIP: the fork ggml-cuda sources (hooks/ggml/cuda, namespace ggml_fork) in the upstream backend, the same list as
+# ggml/src/ggml-hip/CMakeLists.txt of the fork. Hook kernels and the cuda_node and cuda_graph switches run them on the upstream streams
+# (hooks/ggml/kernels/cuda/cuda-bridge.cu).
+if (TARGET ggml-hip AND GGML_HOOKS_CUDA)
+    set(fork_cuda_dir ${GGML_HOOKS_DIR}/cuda)
     file(GLOB fork_cuda_srcs ${fork_cuda_dir}/*.cu)
     foreach (pattern fattn-tile fattn-mma mmq mmf)
         file(GLOB srcs ${fork_cuda_dir}/template-instances/${pattern}*.cu)
@@ -189,15 +189,15 @@ if (TARGET ggml-hip AND GGML_HOOKS_FORK_CUDA)
     ggml_cuda_fattn_vec_instances(${fork_cuda_dir} srcs)
     list(APPEND fork_cuda_srcs ${srcs})
     if (NOT GGML_EXL3)
-        list(FILTER fork_cuda_srcs EXCLUDE REGEX "/fork-cuda/exl3\\.cu$")
+        list(FILTER fork_cuda_srcs EXCLUDE REGEX "/cuda/exl3\\.cu$")
     endif()
-    set(fork_cuda_defs GGML_USE_TRELLIS GGML_HOOKS_FORK_CUDA)
+    set(fork_cuda_defs GGML_USE_TRELLIS GGML_HOOKS_CUDA)
     if (GGML_EXL3)
         list(APPEND fork_cuda_defs GGML_USE_EXL3)
     endif()
     target_sources(ggml-hip PRIVATE ${fork_cuda_srcs})
     # the bridge (a hook unit) includes the fork headers
-    set(bridge ${GGML_HOOKS_DIR}/kernels/cuda/fork-cuda.cu)
+    set(bridge ${GGML_HOOKS_DIR}/kernels/cuda/cuda-bridge.cu)
     set_property(SOURCE ${bridge} TARGET_DIRECTORY ggml-hip APPEND PROPERTY COMPILE_DEFINITIONS ${fork_cuda_defs})
     set_property(SOURCE ${bridge} TARGET_DIRECTORY ggml-hip APPEND PROPERTY INCLUDE_DIRECTORIES ${GGML_HOOKS_DIR}/types)
     set_source_files_properties(${fork_cuda_srcs} TARGET_DIRECTORY ggml-hip PROPERTIES LANGUAGE HIP
@@ -206,13 +206,13 @@ if (TARGET ggml-hip AND GGML_HOOKS_FORK_CUDA)
     message(STATUS "hooks: fork ggml-cuda in ggml-hip, ${n} sources")
 endif()
 
-# Vulkan: the fork ggml-vulkan sources (hooks/ggml/fork-vulkan, namespace ggml_fork) and its shaders, generated by the
+# Vulkan: the fork ggml-vulkan sources (hooks/ggml/vulkan, namespace ggml_fork) and its shaders, generated by the
 # fork vulkan-shaders-gen with the shader symbols in namespace ggml_fork. They build into an object library of this
 # directory (the generated files are visible here) with the settings of ggml-vulkan, linked into ggml-vulkan.
-if (TARGET ggml-vulkan AND GGML_HOOKS_FORK_VULKAN)
-    set(fvk_dir ${GGML_HOOKS_DIR}/fork-vulkan)
+if (TARGET ggml-vulkan AND GGML_HOOKS_VULKAN)
+    set(fvk_dir ${GGML_HOOKS_DIR}/vulkan)
     find_package(Vulkan COMPONENTS glslc REQUIRED) # the imported target of ggml-vulkan is local to its directory
-    set(fvk_bin ${CMAKE_BINARY_DIR}/hooks-fork-vulkan)
+    set(fvk_bin ${CMAKE_BINARY_DIR}/hooks-vulkan)
     get_property(vk_dir_defs DIRECTORY ${GGML_HOOKS_GGML_SRC}/ggml-vulkan PROPERTY COMPILE_DEFINITIONS)
     set(fvk_gen_args -DGGML_TRELLIS=ON)
     foreach (def ${vk_dir_defs})
@@ -221,7 +221,7 @@ if (TARGET ggml-vulkan AND GGML_HOOKS_FORK_VULKAN)
         endif()
     endforeach()
     include(ExternalProject)
-    ExternalProject_Add(hooks-fork-vulkan-shaders-gen
+    ExternalProject_Add(hooks-vulkan-shaders-gen
         SOURCE_DIR ${fvk_dir}/vulkan-shaders
         BINARY_DIR ${fvk_bin}/gen-build
         CMAKE_ARGS -DCMAKE_INSTALL_PREFIX=${fvk_bin}/gen -DCMAKE_INSTALL_BINDIR=. -DCMAKE_BUILD_TYPE=Release ${fvk_gen_args}
@@ -229,12 +229,12 @@ if (TARGET ggml-vulkan AND GGML_HOOKS_FORK_VULKAN)
         BUILD_ALWAYS TRUE
         INSTALL_COMMAND ${CMAKE_COMMAND} -E env --unset=DESTDIR ${CMAKE_COMMAND} --install . --config Release)
     set(fvk_gen ${fvk_bin}/gen/vulkan-shaders-gen)
-    set(fvk_hpp ${fvk_bin}/ggml-vulkan-fork-shaders.hpp)
+    set(fvk_hpp ${fvk_bin}/ggml-vulkan-hooks-shaders.hpp)
     set(fvk_spv ${fvk_bin}/vulkan-shaders.spv)
     file(GLOB fvk_gen_sources CONFIGURE_DEPENDS ${fvk_dir}/vulkan-shaders/*.cpp ${fvk_dir}/vulkan-shaders/*.h)
     add_custom_command(OUTPUT ${fvk_hpp}
         COMMAND ${fvk_gen} --output-dir ${fvk_spv} --target-hpp ${fvk_hpp}
-        DEPENDS ${fvk_gen_sources} hooks-fork-vulkan-shaders-gen
+        DEPENDS ${fvk_gen_sources} hooks-vulkan-shaders-gen
         COMMENT "hooks: fork vulkan shaders header")
     set(fvk_srcs ${fvk_hpp})
     file(GLOB fvk_shaders CONFIGURE_DEPENDS ${fvk_dir}/vulkan-shaders/*.comp)
@@ -248,25 +248,25 @@ if (TARGET ggml-vulkan AND GGML_HOOKS_FORK_VULKAN)
             DEPFILE ${cpp}.d
             COMMAND ${fvk_gen} --glslc ${Vulkan_GLSLC_EXECUTABLE} --source ${shader} --output-dir ${fvk_spv}
                     --target-hpp ${fvk_hpp} --target-cpp ${cpp}
-            DEPENDS ${shader} ${fvk_gen_sources} hooks-fork-vulkan-shaders-gen
+            DEPENDS ${shader} ${fvk_gen_sources} hooks-vulkan-shaders-gen
             COMMENT "hooks: fork vulkan shaders for ${name}")
         list(APPEND fvk_srcs ${cpp})
     endforeach()
     file(GLOB fvk_cxx CONFIGURE_DEPENDS ${fvk_dir}/*.cpp)
-    add_library(hooks-fork-vulkan OBJECT ${fvk_cxx} ${fvk_srcs})
-    set_target_properties(hooks-fork-vulkan PROPERTIES POSITION_INDEPENDENT_CODE ON CXX_VISIBILITY_PRESET hidden)
-    target_include_directories(hooks-fork-vulkan PRIVATE ${fvk_dir} ${fvk_bin} $<TARGET_PROPERTY:ggml-vulkan,INCLUDE_DIRECTORIES>)
-    target_compile_definitions(hooks-fork-vulkan PRIVATE ${vk_dir_defs} $<TARGET_PROPERTY:ggml-vulkan,COMPILE_DEFINITIONS>
-                               GGML_USE_TRELLIS GGML_HOOKS_FORK_VULKAN)
-    target_compile_options(hooks-fork-vulkan PRIVATE $<TARGET_PROPERTY:ggml-vulkan,COMPILE_OPTIONS>)
-    target_compile_features(hooks-fork-vulkan PRIVATE cxx_std_17)
-    target_link_libraries(hooks-fork-vulkan PRIVATE Vulkan::Vulkan ggml-base)
-    target_sources(ggml-vulkan PRIVATE $<TARGET_OBJECTS:hooks-fork-vulkan>)
+    add_library(hooks-vulkan OBJECT ${fvk_cxx} ${fvk_srcs})
+    set_target_properties(hooks-vulkan PROPERTIES POSITION_INDEPENDENT_CODE ON CXX_VISIBILITY_PRESET hidden)
+    target_include_directories(hooks-vulkan PRIVATE ${fvk_dir} ${fvk_bin} $<TARGET_PROPERTY:ggml-vulkan,INCLUDE_DIRECTORIES>)
+    target_compile_definitions(hooks-vulkan PRIVATE ${vk_dir_defs} $<TARGET_PROPERTY:ggml-vulkan,COMPILE_DEFINITIONS>
+                               GGML_USE_TRELLIS GGML_HOOKS_VULKAN)
+    target_compile_options(hooks-vulkan PRIVATE $<TARGET_PROPERTY:ggml-vulkan,COMPILE_OPTIONS>)
+    target_compile_features(hooks-vulkan PRIVATE cxx_std_17)
+    target_link_libraries(hooks-vulkan PRIVATE Vulkan::Vulkan ggml-base)
+    target_sources(ggml-vulkan PRIVATE $<TARGET_OBJECTS:hooks-vulkan>)
     # the bridge (a hook unit of ggml-vulkan) includes the fork headers and the generated fork shaders header
-    add_dependencies(ggml-vulkan hooks-fork-vulkan)
-    set(bridge ${GGML_HOOKS_DIR}/kernels/vulkan/fork-vulkan.cpp)
+    add_dependencies(ggml-vulkan hooks-vulkan)
+    set(bridge ${GGML_HOOKS_DIR}/kernels/vulkan/vulkan-bridge.cpp)
     set_property(SOURCE ${bridge} TARGET_DIRECTORY ggml-vulkan APPEND PROPERTY INCLUDE_DIRECTORIES ${fvk_dir} ${fvk_bin})
-    set_property(SOURCE ${bridge} TARGET_DIRECTORY ggml-vulkan APPEND PROPERTY COMPILE_DEFINITIONS GGML_USE_TRELLIS GGML_HOOKS_FORK_VULKAN)
+    set_property(SOURCE ${bridge} TARGET_DIRECTORY ggml-vulkan APPEND PROPERTY COMPILE_DEFINITIONS GGML_USE_TRELLIS GGML_HOOKS_VULKAN)
     list(LENGTH fvk_shaders n)
     message(STATUS "hooks: fork ggml-vulkan in ggml-vulkan, ${n} shaders")
 endif()

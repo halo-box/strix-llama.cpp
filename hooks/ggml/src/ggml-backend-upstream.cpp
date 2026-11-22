@@ -1,5 +1,5 @@
 // The upstream ggml/src/ggml-backend.cpp, compiled through this file (ggml-hooks.cmake marks the original as a header):
-// the upstream scheduler is private to it, and the fork_sched dispatcher (ggml-fork-sched.cpp) needs one of its fields.
+// the upstream scheduler is private to it, and the sched dispatcher (ggml-hooks-sched.cpp) needs one of its fields.
 // The upstream public functions that the dispatcher replaces are renamed *__upstream (hooks_rename).
 
 #include "../../../ggml/src/ggml-backend.cpp"

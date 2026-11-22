@@ -1,0 +1,100 @@
+// hooks: ggml/src/ggml-cuda/convert.cuh of the fork (1fe05fa45, upstream 9048bad8d, changed in the fork), verbatim inside
+// namespace ggml_fork. Adapted lines carry "hooks:".
+#pragma once
+#include "common.cuh"
+namespace ggml_fork { // hooks: the fork code is namespaced, see hooks/ggml/cuda/README.md
+
+#define CUDA_DEQUANTIZE_BLOCK_SIZE 256
+
+template<typename T>
+using to_t_cuda_t = void (*)(const void * x, T * y, int64_t k, cudaStream_t stream);
+
+typedef to_t_cuda_t<float> to_fp32_cuda_t;
+typedef to_t_cuda_t<half> to_fp16_cuda_t;
+typedef to_t_cuda_t<nv_bfloat16> to_bf16_cuda_t;
+
+to_fp16_cuda_t ggml_get_to_fp16_cuda(ggml_type type);
+
+to_bf16_cuda_t ggml_get_to_bf16_cuda(ggml_type type);
+
+to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type);
+
+// TODO more general support for non-contiguous inputs
+
+template<typename T>
+using to_t_nc_cuda_t = void (*)(const void * x, T * y,
+    int64_t ne00, int64_t ne01, int64_t ne02, int64_t ne03,
+    int64_t s01, int64_t s02, int64_t s03, cudaStream_t stream);
+
+typedef to_t_nc_cuda_t<float> to_fp32_nc_cuda_t;
+typedef to_t_nc_cuda_t<half> to_fp16_nc_cuda_t;
+typedef to_t_nc_cuda_t<nv_bfloat16> to_bf16_nc_cuda_t;
+
+to_fp32_nc_cuda_t ggml_get_to_fp32_nc_cuda(ggml_type type);
+to_fp16_nc_cuda_t ggml_get_to_fp16_nc_cuda(ggml_type type);
+to_bf16_nc_cuda_t ggml_get_to_bf16_nc_cuda(ggml_type type);
+
+template<typename dst_t, typename src_t>
+ __host__ __device__ inline dst_t ggml_cuda_cast(src_t x) {
+    if constexpr (std::is_same_v<dst_t, src_t>) {
+        return x;
+    } else if constexpr (std::is_same_v<dst_t, ggml_fp8_e4m3_t>) {
+        return { ggml_cuda_fp32_to_f8_e4m3(ggml_cuda_cast<float>(x)) };
+    } else if constexpr (std::is_same_v<src_t, ggml_fp8_e4m3_t>) {
+#if defined(FP8_AVAILABLE) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+#if CUDART_VERSION >= 13040
+        if constexpr (std::is_same_v<dst_t, nv_bfloat16>) {
+            return static_cast<nv_bfloat16>(__nv_cvt_fp8_to_bf16raw(x.bits, __NV_E4M3));
+        }
+#endif
+        if constexpr (std::is_same_v<dst_t, half>) {
+            return static_cast<half>(__nv_cvt_fp8_to_halfraw(x.bits, __NV_E4M3));
+        }
+#endif
+        return ggml_cuda_cast<dst_t>(ggml_cuda_f8_e4m3_to_fp32(x.bits));
+#if defined(FP8_AVAILABLE) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    } else if constexpr (std::is_same_v<src_t, __nv_fp8x2_e4m3> && std::is_same_v<dst_t, nv_bfloat162>) {
+#if CUDART_VERSION >= 13040
+        return static_cast<nv_bfloat162>(__nv_cvt_fp8x2_to_bf162raw(x.__x, __NV_E4M3));
+#else
+        return make_bfloat162(
+            ggml_cuda_cast<nv_bfloat16>(ggml_cuda_f8_e4m3_to_fp32(x.__x & 0xFF)),
+            ggml_cuda_cast<nv_bfloat16>(ggml_cuda_f8_e4m3_to_fp32(x.__x >> 8)));
+#endif
+    } else if constexpr (std::is_same_v<src_t, __nv_fp8x2_e4m3> && std::is_same_v<dst_t, float2>) {
+#if CUDART_VERSION >= 13040
+        return ggml_cuda_cast<float2>(ggml_cuda_cast<nv_bfloat162>(x));
+#else
+        return __half22float2(static_cast<half2>(__nv_cvt_fp8x2_to_halfraw2(x.__x, __NV_E4M3)));
+#endif
+#endif
+    } else if constexpr(std::is_same_v<dst_t, nv_bfloat16>) {
+        return __float2bfloat16(float(x));
+    } else if constexpr(std::is_same_v<src_t, nv_bfloat16>) {
+        return __bfloat162float(x);
+    } else if constexpr(std::is_same_v<src_t, float2> && std::is_same_v<dst_t, half2>) {
+        return __float22half2_rn(x);
+    } else if constexpr(std::is_same_v<src_t, nv_bfloat162> && std::is_same_v<dst_t, float2>) {
+#ifdef GGML_USE_HIP
+        return make_float2(__bfloat162float(__low2bfloat16(x)), __bfloat162float(__high2bfloat16(x)));
+#else
+#if !defined(GGML_USE_MUSA) && __CUDA_ARCH__ >= 800
+        return __bfloat1622float2(x);
+#else
+        return make_float2(__bfloat162float(x.x), __bfloat162float(x.y));
+#endif // !defined(GGML_USE_MUSA) && __CUDA_ARCH__ >= 800
+#endif // GGML_USE_HIP
+    } else if constexpr(std::is_same_v<src_t, float2> && std::is_same_v<dst_t, nv_bfloat162>) {
+        // bypass compile error on cuda 12.0.1
+#ifdef GGML_USE_HIP
+        return __float22bfloat162_rn(x);
+#else
+        return {x.x, x.y};
+#endif // GGML_USE_HIP
+    } else if constexpr(std::is_same_v<dst_t, int32_t>) {
+        return int32_t(x);
+    } else {
+        return float(x);
+    }
+}
+} // namespace ggml_fork

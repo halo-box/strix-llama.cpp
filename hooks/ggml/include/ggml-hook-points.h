@@ -173,9 +173,9 @@ GGML_API bool ggml_hook_gguf_type_unassigned(const char * name, enum ggml_type t
 #endif
 #define GGML_HOOK_GGUF_TYPE_UNASSIGNED(name, type) ggml_hook_gguf_type_unassigned(name, type)
 
-// The scheduler and graph allocator functions of the fork (fork_sched switch, hooks/ggml/src/ggml-fork-sched.cpp):
+// The scheduler and graph allocator functions of the fork (sched switch, hooks/ggml/src/ggml-hooks-sched.cpp):
 // the declarations of ggml/include/ggml-alloc.h and ggml-backend.h of the fork (1fe05fa45), verbatim. Without the
-// switch they keep the upstream behavior (see ggml-fork-sched.cpp).
+// switch they keep the upstream behavior (see ggml-hooks-sched.cpp).
 // The fork replaces the usage comment of the scheduler in ggml-backend.h by a pointer to its document:
     // see docs/development/backend-scheduler.md
 #ifdef __cplusplus
@@ -206,7 +206,7 @@ GGML_API void                 ggml_backend_sched_set_lazy_realloc_sync(ggml_back
 #endif
 
 // FA hints and the f16 DSV4 hc_pre of the fork: the declarations of ggml/include/ggml.h (after upstream lines
-// 2281 and 2486, fork 1fe05fa45), verbatim. The builders are in hooks/ggml/src/ggml-fork-ops.c.
+// 2281 and 2486, fork 1fe05fa45), verbatim. The builders are in hooks/ggml/src/ggml-hooks-ops.c.
 #define GGML_HINT_EXACT_BATCH ((enum ggml_op_hint) 2) // enum ggml_op_hint of the fork
 #ifdef __cplusplus
 extern "C" {

@@ -24,7 +24,7 @@ while read -r name file lines _; do
 done < "$manifest"
 
 # the repository files whose fork version is active at their path (no build input): ACTIVE_FORK_PATHS of
-# hooks/tools/import-fork-files.py
+# hooks/tools/import-files.py
 active_fork_paths=(README.md AGENTS.md CONTRIBUTING.md .editorconfig .github/ .agents/ .claude/ docs/ .devops/
                    scripts/hip/gcn-cdna-vgpr-check.py gguf-py/README.md tools/cli/README.md tools/completion/README.md tools/llama-bench/README.md tools/server/README.md ui/apps/chat/README.md tests/.gitignore)
 is_active() {

@@ -225,6 +225,9 @@ void parse_env(ggml_hook_registry & r) {
             enable = false;
         } else if (tok == "all") {
             tok = "*";
+        } else if (tok.rfind("fork_", 0) == 0) {
+            // the switches and kernels were named fork_* before: the rule would match nothing
+            GGML_LOG_WARN("ggml-hooks: GGML_HOOKS name '%s' no longer exists, it is '%s' now\n", tok.c_str(), tok.c_str() + 5);
         }
         r.rules.push_back({ arch, tok, enable });
     }
