@@ -25,7 +25,7 @@ done < "$manifest"
 
 # the repository files whose fork version is active at their path (no build input): ACTIVE_FORK_PATHS of
 # hooks/tools/import-fork-files.py
-active_fork_paths=(README.md AGENTS.md CONTRIBUTING.md .editorconfig .github/ .agents/ .claude/ docs/)
+active_fork_paths=(README.md AGENTS.md CONTRIBUTING.md .editorconfig .github/ .agents/ .claude/ docs/ .devops/)
 is_active() {
     local a
     for a in "${active_fork_paths[@]}"; do

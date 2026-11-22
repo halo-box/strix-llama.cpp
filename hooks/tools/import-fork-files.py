@@ -4,7 +4,7 @@
 #   python3 hooks/python/convert_hf_to_gguf.py runs the fork converter (it puts its own gguf-py on sys.path);
 # - hooks/fork-files/<path>: the fork version of every other changed file (docs, CI workflows, the UI sources,
 #   scripts, repository files), as it is. They are not active: copy one over the upstream file to use it.
-# - the repository files (README, contributing and agent guides, docs, CI workflows and templates): the fork version at
+# - the repository files (README, contributing and agent guides, docs, CI workflows and templates, Dockerfiles): the fork version at
 #   their path (ACTIVE_FORK_PATHS), since they describe and test this repository. No build input.
 # Run from the repository root:
 #   hooks/tools/import-fork-files.py [fork ref] [upstream base]
@@ -48,7 +48,8 @@ handled = ('ggml/', 'src/', 'include/', 'common/', 'tools/server/', 'tools/mtmd/
            'examples/speculative-prefill/', 'tests/', 'conversion/', 'gguf-py/', 'convert_hf_to_gguf.py', 'hooks/')
 # the fork version at its path, whole directories included (the fork deletes and renames files there); also listed in
 # hooks/tools/check-hooks.sh
-ACTIVE_FORK_PATHS = ('README.md', 'AGENTS.md', 'CONTRIBUTING.md', '.editorconfig', '.github/', '.agents/', '.claude/', 'docs/')
+ACTIVE_FORK_PATHS = ('README.md', 'AGENTS.md', 'CONTRIBUTING.md', '.editorconfig', '.github/', '.agents/', '.claude/', 'docs/',
+                     '.devops/')
 
 
 def active(f):

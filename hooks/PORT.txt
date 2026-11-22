@@ -1309,9 +1309,9 @@ adapted  tests/test-qsa-prefix.cpp:0  the ../src includes: the fork libllama hea
 adapted  tests/test-qsa-recover.cpp:0  the ../src includes: the fork libllama headers (hooks/llama/fork-src)
 
 # the files that are not built here: hooks/python (runs as is), hooks/fork-files (kept, not active)
-variant  .devops/rocm.Dockerfile:1  the fork version in hooks/fork-files/.devops/rocm.Dockerfile, not active; the upstream file stays
-variant  .devops/rocm.Dockerfile:4  the fork version in hooks/fork-files/.devops/rocm.Dockerfile, not active; the upstream file stays
-variant  .devops/rocm.Dockerfile:8  the fork version in hooks/fork-files/.devops/rocm.Dockerfile, not active; the upstream file stays
+variant  .devops/rocm.Dockerfile:1  the fork version is active at its path (repository file, hooks/tools/import-fork-files.py)
+variant  .devops/rocm.Dockerfile:4  the fork version is active at its path (repository file, hooks/tools/import-fork-files.py)
+variant  .devops/rocm.Dockerfile:8  the fork version is active at its path (repository file, hooks/tools/import-fork-files.py)
 variant  .github/ISSUE_TEMPLATE/010-bug-compilation.yml:16  the fork version is active at its path (repository file, hooks/tools/import-fork-files.py)
 variant  .github/ISSUE_TEMPLATE/011-bug-results.yml:16  the fork version is active at its path (repository file, hooks/tools/import-fork-files.py)
 variant  .github/ISSUE_TEMPLATE/019-bug-misc.yml:14  the fork version is active at its path (repository file, hooks/tools/import-fork-files.py)
