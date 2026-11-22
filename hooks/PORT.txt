@@ -1366,13 +1366,13 @@ variant  .github/workflows/release.yml:1  the fork version is active at its path
 variant  .github/workflows/server-self-hosted.yml:1  the fork version is active at its path (repository file, hooks/tools/import-files.py)
 variant  AGENTS.md:1  the fork version is active at its path (repository file, hooks/tools/import-files.py)
 variant  AGENTS.md:5  the fork version is active at its path (repository file, hooks/tools/import-files.py)
-variant  AGENTS.md:9  the fork version is active at its path (repository file, hooks/tools/import-files.py)
+dropped  AGENTS.md:9  halo-box/llama.cpp in the note on the upstream AGENTS.md: that repository is archived
 variant  AGENTS.md:14  the fork version is active at its path (repository file, hooks/tools/import-files.py)
 variant  AGENTS.md:36  the fork version is active at its path (repository file, hooks/tools/import-files.py)
 variant  AGENTS.md:42  the fork version is active at its path (repository file, hooks/tools/import-files.py)
-variant  AGENTS.md:44  the fork version is active at its path (repository file, hooks/tools/import-files.py)
+dropped  AGENTS.md:44  the rule to send general llama.cpp improvements to halo-box/llama.cpp: that repository is archived
 variant  AGENTS.md:46  the fork version is active at its path (repository file, hooks/tools/import-files.py)
-variant  AGENTS.md:60  the fork version is active at its path (repository file, hooks/tools/import-files.py)
+adapted  AGENTS.md:60  the fork guidelines, without halo-box/llama.cpp (archived) and with the hooks layout (Where fork code goes, import-files.py)
 variant  AGENTS.md:70  the fork version is active at its path (repository file, hooks/tools/import-files.py)
 variant  AGENTS.md:72  the fork version is active at its path (repository file, hooks/tools/import-files.py)
 variant  AGENTS.md:74  the fork version is active at its path (repository file, hooks/tools/import-files.py)
@@ -1404,6 +1404,7 @@ variant  AGENTS.md:225  the fork version is active at its path (repository file,
 variant  AGENTS.md:232  the fork version is active at its path (repository file, hooks/tools/import-files.py)
 variant  AGENTS.md:234  the fork version is active at its path (repository file, hooks/tools/import-files.py)
 variant  AGENTS.md:236  the fork version is active at its path (repository file, hooks/tools/import-files.py)
+dropped  AGENTS.md:238  the link to halo-box/llama.cpp as the place of general changes: that repository is archived
 variant  AGENTS.md:240  the fork version is active at its path (repository file, hooks/tools/import-files.py)
 variant  CONTRIBUTING.md:7  the fork version is active at its path (repository file, hooks/tools/import-files.py)
 variant  CONTRIBUTING.md:13  the fork version is active at its path (repository file, hooks/tools/import-files.py)
