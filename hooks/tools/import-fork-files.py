@@ -4,6 +4,7 @@
 #   python3 hooks/python/convert_hf_to_gguf.py runs the fork converter (it puts its own gguf-py on sys.path);
 # - hooks/fork-files/<path>: the fork version of every other changed file (docs, CI workflows, the UI sources,
 #   scripts, repository files), as it is. They are not active: copy one over the upstream file to use it.
+# - README.md: the fork README, at the root (ACTIVE_FORK_FILES): it describes this repository.
 # Run from the repository root:
 #   hooks/tools/import-fork-files.py [fork ref] [upstream base]
 import os
@@ -43,13 +44,16 @@ open('hooks/python/README.md', 'w').write(
 # everything else that the fork changed and that no other part of the port carries
 handled = ('ggml/', 'src/', 'include/', 'common/', 'tools/server/', 'tools/mtmd/', 'tools/llama-bench/', 'tools/quantize/',
            'examples/speculative-prefill/', 'tests/', 'conversion/', 'gguf-py/', 'convert_hf_to_gguf.py', 'hooks/')
+ACTIVE_FORK_FILES = ('README.md',)  # the fork version at its path; also listed in hooks/tools/check-hooks.sh
+for f in ACTIVE_FORK_FILES:
+    open(f, 'wb').write(git_bytes('show', f'{REF}:{f}'))
 shutil.rmtree('hooks/fork-files', ignore_errors=True)
 n = 0
 for line in git('diff', '--name-status', BASE, REF).split('\n'):
     if not line:
         continue
     status, f = line.split('\t')[0], line.split('\t')[-1]
-    if status.startswith('D') or f.startswith(handled):
+    if status.startswith('D') or f.startswith(handled) or f in ACTIVE_FORK_FILES:
         continue
     if status.startswith('A') and os.path.isfile(f) and not os.path.islink(f) and open(f, 'rb').read() == git_bytes('show', f'{REF}:{f}'):
         continue  # a new file of the fork, already at its path

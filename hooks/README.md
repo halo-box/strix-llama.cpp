@@ -15,7 +15,7 @@ cmake -B build ...                                                  # pure upstr
 | Run-time wrapping of the backend interfaces | 0 | kernels, fusions, graph passes of the backends, buffer types, device memory |
 | Link-time wrapping (`-Wl,--wrap`) | 0 | activation of the backend wrapper, libllama callbacks, sampler creation, server request fields and routes |
 | Private member access (`llama-hooks-access.h`) | 0 | reading upstream state without a `friend` line |
-| Hook points (`HOOK(name)`, listed in `HOOKS.txt`) | 61 in 19 files | ggml types and scheduler, KV cache events and other points inside libllama, CLI arguments, quantize types, server loop |
+| Hook points (`HOOK(name)`, listed in `HOOKS.txt`) | 54 (63 lines) in 21 files | ggml types and scheduler, KV cache events and other points inside libllama, CLI arguments, quantize types, server loop |
 
 Link-time wrapping needs a GNU compatible linker (ld, gold, lld, mold). On MSVC and macOS the hooks are disabled.
 
@@ -109,6 +109,8 @@ switch selects it. Upstream stays the default.
 - Files that are not built here: `python/` is the fork converter with its `conversion/` and `gguf-py/`
   (`python3 hooks/python/convert_hf_to_gguf.py`); `fork-files/<path>` keeps the fork version of the docs, CI
   workflows, UI sources, scripts and repository files, not active (`hooks/tools/import-fork-files.py`).
+  The root `README.md` is the fork README: it is the one file outside `hooks/` whose fork version is active, and
+  `check-hooks.sh` skips it (documentation only).
 - Upstream files that the hooks must reach inside are compiled through a hooks file that includes them
   (`ggml/src/ggml-backend-upstream.cpp`, `ggml/src/ggml-cuda-upstream.cu`); the original is marked as a header.
 
@@ -169,7 +171,8 @@ running `llama_process`.
 
 ## Checks
 
-- `hooks/tools/check-hooks.sh <upstream base>`: every changed line outside `hooks/` belongs to a hook point of `HOOKS.txt`.
+- `hooks/tools/check-hooks.sh <upstream base>`: every changed line outside `hooks/` belongs to a hook point of `HOOKS.txt`,
+  except in the root `README.md` (the fork README).
 - `hooks/tools/check-port.py <upstream base> <fork>`: every line the fork added is in this branch, and every
   fork change that is not kept as it is has an entry in `hooks/PORT.txt` (adapted, restored, variant, dropped,
   pending) with its reason. `--files` gives the state of each file.

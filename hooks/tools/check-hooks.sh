@@ -23,10 +23,14 @@ while read -r name file lines _; do
     want_lines[$name]=$lines
 done < "$manifest"
 
+# files whose fork version is active at their path (documentation only, no build input): hooks/tools/import-fork-files.py
+active_fork_files=" README.md "
+
 fail=0
 total=0
 
 while IFS= read -r file; do
+    [[ "$active_fork_files" == *" $file "* ]] && continue
     # one hunk per line: "<start> <changed lines> <names>"
     while read -r start n names; do
         total=$((total + n))
