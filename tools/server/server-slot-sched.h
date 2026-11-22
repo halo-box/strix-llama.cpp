@@ -21,7 +21,8 @@ struct server_prompt_reuse {
 struct server_prompt {
     server_tokens tokens;
 
-    // a checkpoint does not change after it is created, so the prompt cache shares it with the slot instead of a copy
+    // the prompt cache shares a checkpoint with the slot instead of a copy - read checkpoints only on the main loop
+    // after creation only hold_checkpoint() changes one: on the main loop, it moves the state to --ctx-checkpoints-dir
     std::list<std::shared_ptr<const common_prompt_checkpoint>> checkpoints;
 
     void clear() {
@@ -67,7 +68,8 @@ struct server_prompt_cache_state {
         size_t res = data.size();
 
         for (const auto & ckpt : prompt.checkpoints) {
-            res += ckpt->size();
+            // --cache-ram counts memory: a checkpoint written to --ctx-checkpoints-dir holds its state in a file
+            res += ckpt->size_mem();
         }
 
         return res;
