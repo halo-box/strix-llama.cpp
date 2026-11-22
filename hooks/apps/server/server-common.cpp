@@ -1,4 +1,4 @@
-// hooks: tools/server/server-common.cpp of the fork (1fe05fa45, upstream 9048bad8d, changed in the fork), verbatim inside
+// hooks: tools/server/server-common.cpp of the fork (25b1c175e, upstream 9048bad8d, changed in the fork), verbatim inside
 // namespace ggml_fork. Adapted lines carry "hooks:".
 struct ggml_tensor; struct ggml_context; struct ggml_cgraph; struct gguf_context; struct ggml_backend; struct ggml_backend_buffer; struct ggml_backend_buffer_type; struct ggml_backend_device; struct ggml_backend_reg; struct ggml_backend_sched; struct ggml_threadpool; struct ggml_opt_context; struct ggml_backend_event; // hooks: global
 #include "common.h"
@@ -1867,7 +1867,10 @@ std::vector<llama_token_data> get_token_probabilities(llama_context * ctx, int i
     const auto * logits = llama_get_logits_ith(ctx, idx);
     const llama_token * sampled_ids = llama_get_sampled_candidates_ith(ctx, idx);
 
-    const int n_logits = llama_get_sampled_logits_count_ith(ctx, idx);
+    // the row was not backend-sampled: report the raw logits over the full vocab
+    const int n_logits = llama_get_sampled_logits_ith(ctx, idx)
+        ? (int) llama_get_sampled_logits_count_ith(ctx, idx)
+        : llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx)));
 
     cur.resize(n_logits);
     if (sampled_ids) {

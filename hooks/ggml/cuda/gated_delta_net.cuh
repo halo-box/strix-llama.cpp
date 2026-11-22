@@ -1,4 +1,4 @@
-// hooks: ggml/src/ggml-cuda/gated_delta_net.cuh of the fork (1fe05fa45, upstream 9048bad8d, changed in the fork), verbatim inside
+// hooks: ggml/src/ggml-cuda/gated_delta_net.cuh of the fork (25b1c175e, upstream 9048bad8d, changed in the fork), verbatim inside
 // namespace ggml_fork. Adapted lines carry "hooks:".
 #include "common.cuh"
 #include "ggml.h"
@@ -75,6 +75,13 @@ struct ggml_cuda_gdn_decode_args {
     int64_t       qkv_token_stride = 0;
     int64_t       conv_slot_stride = 0;
     int64_t       state_slot_stride = 0;
+    // the per-slot CPY store writes slots n_tokens..K-1 with the old conv state; the SET_ROWS rollback store
+    // (build_conv_state_store with n_rs_seq > 0) leaves them unwritten
+    bool          conv_fill_tail = true;
+    // softplus as the unfused op_softplus / gdn_gate_kernel compute it, log1pf(expf(x)); the single-token decode kernel has always
+    // used logf(1 + expf(x)) for the per-slot CPY store (plain decode), which stays as it is. The SET_ROWS rollback store replaces
+    // the unfused chain (base runs it unfused at every token count), so it takes the unfused expression.
+    bool          softplus_log1p = false;
 };
 
 void ggml_cuda_op_gdn_decode_fused(ggml_backend_cuda_context & ctx, const ggml_cuda_gdn_decode_args & args);

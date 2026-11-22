@@ -1,4 +1,4 @@
-// hooks: src/llama-context.cpp of the fork (1fe05fa45, upstream 9048bad8d, changed in the fork), verbatim inside
+// hooks: src/llama-context.cpp of the fork (25b1c175e, upstream 9048bad8d, changed in the fork), verbatim inside
 // namespace ggml_fork. Adapted lines carry "hooks:".
 struct ggml_tensor; struct ggml_context; struct ggml_cgraph; struct gguf_context; struct ggml_backend; struct ggml_backend_buffer; struct ggml_backend_buffer_type; struct ggml_backend_device; struct ggml_backend_reg; struct ggml_backend_sched; struct ggml_threadpool; struct ggml_opt_context; struct ggml_backend_event; // hooks: global
 #include "llama-context.h"
@@ -2035,6 +2035,15 @@ bool llama_context::get_causal_attn() const {
 bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
     if (!sampler && sampling.samplers.count(seq_id) == 0) {
         return true;
+    }
+
+    // re-registering the same sampler pointer is a no-op: graph inputs hold it and backend_init asserts
+    // !is_init. callers that reuse sampler objects across requests rely on this to keep graph reuse alive.
+    if (sampler) {
+        auto it = sampling.samplers.find(seq_id);
+        if (it != sampling.samplers.end() && it->second == sampler) {
+            return true;
+        }
     }
 
     LLAMA_LOG_DEBUG("%s: seq_id = %d, sampler = %p\n", __func__, (int) seq_id, (void *) sampler);

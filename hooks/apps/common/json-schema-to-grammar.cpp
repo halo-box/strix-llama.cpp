@@ -1,4 +1,4 @@
-// hooks: common/json-schema-to-grammar.cpp of the fork (1fe05fa45, upstream 9048bad8d, unchanged in the fork), verbatim inside
+// hooks: common/json-schema-to-grammar.cpp of the fork (25b1c175e, upstream 9048bad8d, unchanged in the fork), verbatim inside
 // namespace ggml_fork. Adapted lines carry "hooks:".
 struct ggml_tensor; struct ggml_context; struct ggml_cgraph; struct gguf_context; struct ggml_backend; struct ggml_backend_buffer; struct ggml_backend_buffer_type; struct ggml_backend_device; struct ggml_backend_reg; struct ggml_backend_sched; struct ggml_threadpool; struct ggml_opt_context; struct ggml_backend_event; // hooks: global
 #include "json-schema-to-grammar.h"

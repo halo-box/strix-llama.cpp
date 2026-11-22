@@ -1,4 +1,4 @@
-// hooks: common/sampling.h of the fork (1fe05fa45, upstream 9048bad8d, unchanged in the fork), verbatim inside
+// hooks: common/sampling.h of the fork (25b1c175e, upstream 9048bad8d, changed in the fork), verbatim inside
 // namespace ggml_fork. Adapted lines carry "hooks:".
 #pragma once
 struct ggml_tensor; struct ggml_context; struct ggml_cgraph; struct gguf_context; struct ggml_backend; struct ggml_backend_buffer; struct ggml_backend_buffer_type; struct ggml_backend_device; struct ggml_backend_reg; struct ggml_backend_sched; struct ggml_threadpool; struct ggml_opt_context; struct ggml_backend_event; // hooks: global
@@ -56,6 +56,10 @@ void common_sampler_free(struct common_sampler * gsmpl);
 // if is_generated is true, the token is accepted by the sampling chain, the reasoning budget sampler, and the grammar sampler
 void                    common_sampler_accept(struct common_sampler * gsmpl, llama_token token, bool is_generated);
 void                    common_sampler_reset (struct common_sampler * gsmpl);
+// resets the sampler in place and returns true when the params build the same chain, keeping the chain
+// pointer stable so llama_context skips sched_reserve(). on false, gsmpl and params are untouched.
+bool common_sampler_reuse(struct common_sampler * gsmpl, const struct llama_model * model, struct common_params_sampling & params);
+
 struct common_sampler * common_sampler_clone (struct common_sampler * gsmpl);
 void                    common_sampler_copy  (const struct common_sampler * src, struct common_sampler * dst);
 

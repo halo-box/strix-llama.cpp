@@ -56,4 +56,5 @@ server-public-paths    tools/server/server-http.cpp      1      the public paths
 server-models-include  tools/server/server-models.cpp    1      for server-model-hidden
 server-model-hidden    tools/server/server-models.cpp    1      apply_hidden is a local lambda
 hooks                  CMakeLists.txt                    1      the hooks build, after project(): CMAKE_PROJECT_INCLUDE would need an option at every configure
+cpu-amx                ggml/src/ggml-cpu/CMakeLists.txt  1      the AMX mmq build flags of the fork for clang 22, with or without the hooks build
 ui-assets              scripts/ui-assets.cmake           1      the fork UI functions (hooks/ui), with or without the hooks build: the script runs in cmake -P mode

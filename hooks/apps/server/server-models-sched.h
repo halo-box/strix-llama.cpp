@@ -1,4 +1,4 @@
-// hooks: tools/server/server-models-sched.h of the fork (1fe05fa45, upstream 9048bad8d, unchanged in the fork), verbatim inside
+// hooks: tools/server/server-models-sched.h of the fork (25b1c175e, upstream 9048bad8d, unchanged in the fork), verbatim inside
 // namespace ggml_fork. Adapted lines carry "hooks:".
 #pragma once
 struct ggml_tensor; struct ggml_context; struct ggml_cgraph; struct gguf_context; struct ggml_backend; struct ggml_backend_buffer; struct ggml_backend_buffer_type; struct ggml_backend_device; struct ggml_backend_reg; struct ggml_backend_sched; struct ggml_threadpool; struct ggml_opt_context; struct ggml_backend_event; // hooks: global

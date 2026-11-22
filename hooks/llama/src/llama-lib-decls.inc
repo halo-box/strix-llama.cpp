@@ -27,7 +27,7 @@ struct llama_sampler_seq_config;
 struct llama_token_data;
 struct llama_token_data_array;
 struct llama_vocab;
-// hooks: include/llama.h of the fork (1fe05fa45, upstream 9048bad8d, changed in the fork), verbatim inside
+// hooks: include/llama.h of the fork (25b1c175e, upstream 9048bad8d, changed in the fork), verbatim inside
 // namespace ggml_fork. Adapted lines carry "hooks:".
 // hooks: the global ggml forward declarations are in the dispatcher
 

@@ -1,4 +1,4 @@
-// hooks: ggml/src/ggml-cuda/convert.cu of the fork (1fe05fa45, upstream 9048bad8d, changed in the fork), verbatim inside
+// hooks: ggml/src/ggml-cuda/convert.cu of the fork (25b1c175e, upstream 9048bad8d, changed in the fork), verbatim inside
 // namespace ggml_fork. Adapted lines carry "hooks:".
 #include "convert.cuh"
 #include "dequantize.cuh"

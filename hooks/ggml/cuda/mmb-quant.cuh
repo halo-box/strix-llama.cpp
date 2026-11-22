@@ -1,4 +1,4 @@
-// hooks: ggml/src/ggml-cuda/mmb-quant.cuh of the fork (1fe05fa45, upstream 9048bad8d, new in the fork), verbatim inside
+// hooks: ggml/src/ggml-cuda/mmb-quant.cuh of the fork (25b1c175e, upstream 9048bad8d, new in the fork), verbatim inside
 // namespace ggml_fork. Adapted lines carry "hooks:".
 #pragma once
 #include "dequantize.cuh"
@@ -223,8 +223,8 @@ __device__ __forceinline__ uint4 mmb_lb_decode(const typename mmb_lb<WTYPE>::gri
         return mmb_lb<WTYPE>::decode(g, f, sub, il);
     }
 }
-// M-split decoders for the 3-value IQ2 grids: one lane decodes 16 consecutive weights of a row (groups il = 2 pc, 2 pc + 1
-// of one 32-block, which share their scale). Every IQ2_XXS / IQ2_XS / IQ2_S grid byte is 8, 25 or 43, so the three
+// M-split (mmb_ms3) decoders: one lane decodes 16 consecutive weights of a row (groups il = 2 pc, 2 pc + 1 of one
+// 32-block, which share their scale). IQ3_S is below. Every IQ2_XXS / IQ2_XS / IQ2_S grid byte is 8, 25 or 43, so the three
 // values RNE_bf16(d * 8), RNE_bf16(d * 25), RNE_bf16(d * 43) are formed once per 16 weights and v_perm picks one per
 // weight from the grid's 2-bit codes; signs are the bf16 sign-bit XOR (RNE is sign-symmetric). Same fp32 d and products
 // as mmb_lb<>::decode / mmb_grid8_bf16 -> bit-identical.
@@ -282,6 +282,28 @@ template <> struct mmb_ms3<32 + GGML_TYPE_IQ2_XXS> {
         uint32_t lo, hi; mmb_iq2_tab(d, lo, hi);
         w0 = mmb_iq2_dec8(g[f[2] & 0xff], lo, hi, mmb_ksigns((f[0] >> (14 * pc)) & 127));
         w1 = mmb_iq2_dec8(g[f[2] >> 8], lo, hi, mmb_ksigns((f[0] >> (14 * pc + 7)) & 127));
+    }
+};
+// IQ3_S: a lane's 16 weights are grid groups il = 2 pc, 2 pc + 1 of 32-block q (one 4-byte qs read, qh, two sign bytes, the
+// scale nibble pre-selected in fetch); decode() is mmb_lb<IQ3_S>::decode twice (same fp32 d * (1 + 2 ls), mmb_grid8_bf16) -> bit-identical.
+template <> struct mmb_ms3<32 + GGML_TYPE_IQ3_S> {
+    static constexpr bool ok = true; using grid_t = uint32_t; static constexpr int N = 512, NR = 3;
+    static __device__ __forceinline__ grid_t entry(const int i) { return iq3s_grid[i]; }
+    static __device__ __forceinline__ void fetch(const uint8_t * row, const int ks, const int q, const int pc, uint32_t (&f)[NR]) {
+        const block_iq3_s * x = (const block_iq3_s *) row + (ks * 64) / QK_K;
+        const int ib = ((ks * 64) % QK_K) / 32 + q;   // ib % 2 == q: the scale nibble is a lane constant
+        const uint16_t * qs = (const uint16_t *) (x->qs + 8 * ib + 4 * pc);
+        f[0] = qs[0] | ((uint32_t) qs[1] << 16);
+        f[1] = x->qh[ib] | ((uint32_t) x->signs[4 * ib + 2 * pc] << 8) | ((uint32_t) x->signs[4 * ib + 2 * pc + 1] << 16) |
+               ((uint32_t) ((x->scales[ib / 2] >> (4 * q)) & 0xf) << 24);
+        f[2] = *(const uint16_t *) &x->d;
+    }
+    static __device__ __forceinline__ void decode(const grid_t * g, const uint32_t (&f)[NR], const int pc, uint4 & w0, uint4 & w1) {
+        const float d = mmb_h2f((uint16_t) f[2]) * (1 + 2 * (int) (f[1] >> 24));
+        const uint32_t qh = f[1] & 0xff;
+        const int il0 = 2 * pc, il1 = 2 * pc + 1;
+        w0 = mmb_grid8_bf16(g[(f[0] & 0xff) | ((qh << (8 - 2 * il0)) & 256)], g[((f[0] >> 8) & 0xff) | ((qh << (7 - 2 * il0)) & 256)], d, (f[1] >> 8) & 0xff);
+        w1 = mmb_grid8_bf16(g[((f[0] >> 16) & 0xff) | ((qh << (8 - 2 * il1)) & 256)], g[(f[0] >> 24) | ((qh << (7 - 2 * il1)) & 256)], d, (f[1] >> 16) & 0xff);
     }
 };
 

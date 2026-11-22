@@ -1,4 +1,4 @@
-// hooks: ggml/src/ggml-cuda/col2im-1d.cu of the fork (1fe05fa45, upstream 9048bad8d, changed in the fork), verbatim inside
+// hooks: ggml/src/ggml-cuda/col2im-1d.cu of the fork (25b1c175e, upstream 9048bad8d, changed in the fork), verbatim inside
 // namespace ggml_fork. Adapted lines carry "hooks:".
 #include "col2im-1d.cuh"
 #include "convert.cuh"

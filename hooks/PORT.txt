@@ -1613,3 +1613,51 @@ variant  ui/apps/chat/src/lib/components/app/navigation/SidebarNavigation/Sideba
 variant  ui/apps/chat/src/lib/components/app/navigation/SidebarNavigation/SidebarNavigationActions.svelte:109  the fork version in hooks/files/ui/apps/chat/src/lib/components/app/navigation/SidebarNavigation/SidebarNavigationActions.svelte, not active; the upstream file stays
 variant  ui/apps/chat/src/lib/constants/ui.constants.ts:8  the fork version in hooks/files/ui/apps/chat/src/lib/constants/ui.constants.ts, not active; the upstream file stays
 adapted  src/llama-memory-hybrid-idx.cpp:71  the registry name of a layer device: a meta device has none, it counts as not validated (hooks/llama/lib, marked hooks:)
+
+# fork commits 2c3dc199d..25b1c175e
+variant  .github/workflows/ai-issues.yml:1  the fork version is active at its path (repository file, hooks/tools/import-files.py)
+variant  .github/workflows/ci-self-hosted-vulkan.yml:1  the fork version is active at its path (repository file, hooks/tools/import-files.py)
+variant  .github/workflows/models-check.yml:1  the fork version is active at its path (repository file, hooks/tools/import-files.py)
+variant  .github/workflows/server-sanitize.yml:1  the fork version is active at its path (repository file, hooks/tools/import-files.py)
+variant  .github/workflows/server-speculative.yml:1  the fork version is active at its path (repository file, hooks/tools/import-files.py)
+variant  .github/workflows/ui-build-self-hosted.yml:1  the fork version is active at its path (repository file, hooks/tools/import-files.py)
+variant  .github/workflows/ui-self-hosted.yml:1  the fork version is active at its path (repository file, hooks/tools/import-files.py)
+variant  common/sampling.cpp:191  tools: the fork version in hooks/apps, upstream by default
+variant  common/sampling.cpp:206  tools: the fork version in hooks/apps, upstream by default
+variant  common/sampling.cpp:219  tools: the fork version in hooks/apps, upstream by default
+variant  common/sampling.cpp:430  tools: the fork version in hooks/apps, upstream by default
+variant  common/sampling.cpp:451  tools: the fork version in hooks/apps, upstream by default
+variant  common/speculative.cpp:1220  tools: the fork version in hooks/apps, upstream by default
+variant  common/speculative.cpp:1222  tools: the fork version in hooks/apps, upstream by default
+variant  common/speculative.cpp:1236  tools: the fork version in hooks/apps, upstream by default
+variant  common/speculative.cpp:1261  tools: the fork version in hooks/apps, upstream by default
+variant  common/speculative.cpp:1268  tools: the fork version in hooks/apps, upstream by default
+variant  common/speculative.cpp:2018  tools: the fork version in hooks/apps, upstream by default
+variant  ggml/src/ggml-cuda/gated_delta_net.cu:129  cuda_graph: the fork version in hooks/ggml/cuda, upstream by default
+variant  ggml/src/ggml-cuda/gated_delta_net.cu:143  cuda_graph: the fork version in hooks/ggml/cuda, upstream by default
+variant  ggml/src/ggml-cuda/gated_delta_net.cu:150  cuda_graph: the fork version in hooks/ggml/cuda, upstream by default
+variant  ggml/src/ggml-cuda/gated_delta_net.cu:165  cuda_graph: the fork version in hooks/ggml/cuda, upstream by default
+variant  ggml/src/ggml-cuda/gated_delta_net.cu:175  cuda_graph: the fork version in hooks/ggml/cuda, upstream by default
+variant  tests/test-backend-ops.cpp:4750  the fork test in hooks/apps/tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-backend-ops.cpp:4752  the fork test in hooks/apps/tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-backend-ops.cpp:4757  the fork test in hooks/apps/tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-backend-ops.cpp:4768  the fork test in hooks/apps/tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-backend-ops.cpp:4777  the fork test in hooks/apps/tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-backend-ops.cpp:4782  the fork test in hooks/apps/tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-backend-ops.cpp:4790  the fork test in hooks/apps/tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-backend-ops.cpp:4796  the fork test in hooks/apps/tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-backend-ops.cpp:4799  the fork test in hooks/apps/tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-backend-ops.cpp:4806  the fork test in hooks/apps/tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-backend-ops.cpp:4815  the fork test in hooks/apps/tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-backend-ops.cpp:4819  the fork test in hooks/apps/tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-backend-ops.cpp:4825  the fork test in hooks/apps/tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-backend-ops.cpp:4829  the fork test in hooks/apps/tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-backend-ops.cpp:5489  the fork test in hooks/apps/tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-backend-ops.cpp:5990  the fork test in hooks/apps/tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-backend-ops.cpp:7637  the fork test in hooks/apps/tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-backend-ops.cpp:7640  the fork test in hooks/apps/tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-backend-ops.cpp:7957  the fork test in hooks/apps/tests (test-<name>-fork), the upstream test unchanged
+variant  tools/server/server-common.cpp:1820  tools: the fork version in hooks/apps, upstream by default
+variant  tools/server/server-context.cpp:457  tools: the fork version in hooks/apps, upstream by default
+variant  tools/server/server-context.cpp:1988  tools: the fork version in hooks/apps, upstream by default
+variant  tools/server/server-context.cpp:2006  tools: the fork version in hooks/apps, upstream by default
