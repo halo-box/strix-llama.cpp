@@ -1022,7 +1022,7 @@ def test_ctx_checkpoint_read_error_reprocesses(swa_server, monkeypatch):
             "cache_prompt": True,
         })
     except requests.exceptions.ConnectionError:
-        pytest.fail("the server died on a failed context checkpoint read")
+        pytest.fail(reason="the server died on a failed context checkpoint read")
     assert res.status_code == 200
     assert res.body["timings"]["cache_n"] == 0
     assert server.make_request("GET", "/health").status_code == 200
