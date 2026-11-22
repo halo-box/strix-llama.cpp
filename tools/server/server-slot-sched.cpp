@@ -93,9 +93,10 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     }
 
     // calculate checkpoints size to see if it will fit with the prompt
+    // --cache-ram counts memory, as server_prompt_cache_state::size() does: a written checkpoint holds its state in a file
     size_t checkpoints_size = 0;
     for (const auto & ckpt : prompt.checkpoints) {
-        checkpoints_size += ckpt->size();
+        checkpoints_size += ckpt->size_mem();
     }
 
     const size_t state_size_new = state_size_tgt + state_size_dft + checkpoints_size;
