@@ -1,4 +1,5 @@
 #include "llama-kv-cache-dsv4.h"
+#include "../hooks/llama/include/llama-hook-points.h" // HOOK(kv-dsv4-include)
 
 #include "ggml-backend.h"
 #include "llama-impl.h"
@@ -36,18 +37,6 @@ static void dsv4_clear_tensor_stream(ggml_tensor * tensor, uint32_t stream) {
 
     const size_t stream_size = tensor->nb[2];
     ggml_backend_tensor_memset(tensor, 0, stream*stream_size, stream_size);
-}
-
-static void dsv4_zero_tensor_stream_rows(ggml_tensor * tensor, uint32_t stream, uint32_t r0) {
-    GGML_ASSERT(ggml_is_contiguous(tensor));
-    GGML_ASSERT(tensor->ne[3] == 1);
-    GGML_ASSERT(stream < (uint32_t) tensor->ne[2]);
-
-    const uint32_t n_rows = (uint32_t) tensor->ne[1];
-    if (r0 >= n_rows) {
-        return;
-    }
-    ggml_backend_tensor_memset(tensor, 0, stream*tensor->nb[2] + r0*tensor->nb[1], (n_rows - r0)*tensor->nb[1]);
 }
 
 static uint32_t dsv4_state_n_used_k_rows(llama_pos pos_max, uint32_t ratio, uint32_t kv_size) {
@@ -1400,11 +1389,9 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
     LLAMA_LOG_INFO("%s: creating DSV4 lightning-indexer KV cache, size = %u cells\n",
             __func__, dsv4_comp_size(kv_size, ratio_csa));
 
-    // keep indexer keys f16 regardless of type_k: the fused indexer kernels read
-    // f16 only, and quantizing this small cache (128 dims) saves little while
-    // forcing the much slower decomposed indexer path
+    type_k = llama_hook_kv_type(model, "dsv4-lid", type_k); // HOOK(kv-type-dsv4)
     kv_lid = std::make_unique<llama_kv_cache>(
-            model, no_alloc, hparams_lid, GGML_TYPE_F16, type_v,
+            model, no_alloc, hparams_lid, type_k, type_v,
             v_trans, offload, unified_compressed, GGML_PAD(dsv4_comp_size(kv_size, ratio_csa), 256u), n_seq_max,
             0, LLAMA_SWA_TYPE_NONE, nullptr, filter_lid, nullptr, nullptr);
 
@@ -1629,16 +1616,6 @@ bool llama_kv_cache_dsv4::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1
         const bool res = kv_raw->seq_rm(seq_id, p0, p1);
         if (res) {
             rs_idx[seq_id] = (uint32_t) rollback;
-
-            const std::pair<llama_kv_cache *, const llama_dsv4_comp_state *> comps[] = {
-                { kv_csa.get(), csa_state.get() }, { kv_hca.get(), hca_state.get() }, { kv_lid.get(), lid_state.get() },
-            };
-            for (const auto & [kv, state] : comps) {
-                const uint32_t r0 = dsv4_state_n_used_k_rows(p0 - 1, state->get_ratio(), kv->get_size());
-                for (uint32_t il : kv->get_layer_ids()) {
-                    dsv4_zero_tensor_stream_rows(kv->get_k_storage(il), (uint32_t) seq_id, r0);
-                }
-            }
         }
 
         return res;
@@ -2104,7 +2081,6 @@ ggml_tensor * llama_kv_cache_dsv4_raw_context::build_input_k_idxs(ggml_context *
 
     ggml_tensor * k_idxs = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, n_tokens);
     ggml_set_input(k_idxs);
-    ggml_set_name(k_idxs, "dsv4_raw_attn_inp_k_idxs");
 
     return k_idxs;
 }

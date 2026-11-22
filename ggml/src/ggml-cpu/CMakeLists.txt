@@ -89,14 +89,6 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
                     ggml-cpu/llamafile/sgemm.h)
     endif()
 
-    if (GGML_EXL3)
-        target_compile_definitions(${GGML_CPU_NAME} PRIVATE GGML_USE_EXL3)
-
-        list(APPEND GGML_CPU_SOURCES
-                    ggml-cpu/exl3-ops.cpp
-                    ggml-cpu/exl3-ops.h)
-    endif()
-
     if (GGML_CPU_HBM)
         find_library(memkind memkind REQUIRED)
 
@@ -726,12 +718,6 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
     target_sources(${GGML_CPU_NAME} PRIVATE ${GGML_CPU_SOURCES})
     target_compile_options(${GGML_CPU_NAME} PRIVATE ${ARCH_FLAGS})
     target_compile_definitions(${GGML_CPU_NAME} PRIVATE ${ARCH_DEFINITIONS})
-
-    if (CMAKE_CXX_COMPILER_ID STREQUAL "Clang" AND
-        CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 22 AND
-        CMAKE_CXX_COMPILER_VERSION VERSION_LESS 23)
-        set_source_files_properties(ggml-cpu/amx/mmq.cpp PROPERTIES COMPILE_OPTIONS "$<$<BOOL:${MSVC}>:/clang:>-fno-unroll-loops")
-    endif()
 
     if (EMSCRIPTEN)
         set_target_properties(${GGML_CPU_NAME} PROPERTIES COMPILE_FLAGS "-msimd128")

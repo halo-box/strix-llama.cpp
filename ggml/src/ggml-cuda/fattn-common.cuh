@@ -18,18 +18,6 @@
 // The macro on the following line shifts it by a factor of 2**3=8, as was needed to fix https://github.com/ggml-org/llama.cpp/issues/18606 .
 #define FATTN_KQ_MAX_OFFSET (3.0f*0.6931f)
 
-#if defined(GGML_USE_HIP)
-#define GGML_FATTN_KV_ROWS_PARAM
-#define GGML_FATTN_KV_ROWS_ARG(x)
-#define GGML_FATTN_KV_ROWS_LOCAL constexpr const int * KV_rows_ptr = nullptr;
-#define GGML_FATTN_NB32_T int32_t
-#else
-#define GGML_FATTN_KV_ROWS_PARAM const int * __restrict__ KV_rows_ptr,
-#define GGML_FATTN_KV_ROWS_ARG(x) x,
-#define GGML_FATTN_KV_ROWS_LOCAL
-#define GGML_FATTN_NB32_T int64_t
-#endif // defined(GGML_USE_HIP)
-
 typedef void (* fattn_kernel_t)(
         const char * __restrict__ Q,
         const char * __restrict__ K,
@@ -37,7 +25,7 @@ typedef void (* fattn_kernel_t)(
         const char * __restrict__ mask,
         const char * __restrict__ sinks,
         const int  * __restrict__ KV_max,
-        GGML_FATTN_KV_ROWS_PARAM
+        const int  * __restrict__ KV_rows,
         float      * __restrict__ dst,
         float2     * __restrict__ dst_meta,
         const float scale,
@@ -52,7 +40,7 @@ typedef void (* fattn_kernel_t)(
                             const int32_t nb11, const int32_t nb12, const int64_t nb13,
                             const int32_t nb21, const int32_t nb22, const int64_t nb23,
                             const int32_t ne31, const int32_t ne32, const int32_t ne33,
-                            const int32_t nb31, const GGML_FATTN_NB32_T nb32, const int64_t nb33);
+                            const int32_t nb31, const int64_t nb32, const int64_t nb33);
 
 typedef float (*vec_dot_KQ_t)(
     const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8 , const void * __restrict__ Q_ds);
@@ -1040,10 +1028,10 @@ static __global__ void flash_attn_combine_results(
     dst[tid] = VKQ_numerator / VKQ_denominator;
 }
 
-template <int DV, int ncols1, int ncols2, bool stream_k>
+template <int DV, int ncols1, int ncols2>
 void launch_fattn(
     ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
-    const int nbatch_fa, const bool need_f16_K, const bool need_f16_V, const bool use_sparse,
+    const int nbatch_fa, const bool need_f16_K, const bool need_f16_V, const bool stream_k, const bool use_sparse,
     const int warp_size = WARP_SIZE, const bool async_kv_preload = false
 ) {
     constexpr int ncols = ncols1 * ncols2;
@@ -1288,12 +1276,6 @@ void launch_fattn(
             }
         }
 
-        if constexpr (ncols2 == 3) {
-            if (GGML_CUDA_CC_IS_RDNA3_5(cc)) {
-                parallel_blocks = std::min(18, ntiles_KV);
-            }
-        }
-
         blocks_num.x = ntiles_x;
         blocks_num.y = parallel_blocks;
         blocks_num.z = ntiles_z_gqa*K->ne[2]*Q->ne[3];
@@ -1335,7 +1317,7 @@ void launch_fattn(
         mask ? ((const char *) mask->data) : nullptr,
         sinks ? ((const char *) sinks->data) : nullptr,
         KV_max.ptr,
-        GGML_FATTN_KV_ROWS_ARG(kv_rows ? (const int *) kv_rows->data : nullptr)
+        kv_rows ? (const int *) kv_rows->data : nullptr,
         !stream_k && parallel_blocks > 1 ? dst_tmp.ptr : (float *) KQV->data, dst_tmp_meta.ptr,
         scale, max_bias, m0, m1, n_head_log2, logit_softcap,
         Q->ne[0], ne01,     Q->ne[2], Q->ne[3], Q->nb[1], Q->nb[2], Q->nb[3],
@@ -1346,7 +1328,7 @@ void launch_fattn(
     );
     CUDA_CHECK(cudaGetLastError());
 
-    if constexpr (stream_k) {
+    if (stream_k) {
         if ((int)blocks_num.x % ntiles_dst == 0 && (int)blocks_num.x > ntiles_dst) {
             // Optimized fixup: nblocks_stream_k is a multiple of ntiles_dst, launch one block per tile.
             const int nblocks_sk  = (int)blocks_num.x;
@@ -1382,8 +1364,7 @@ void launch_fattn(
                  Q->ne[1], Q->ne[2], gqa_ratio, total_work,
                  fd_k_j_z_ne12, fd_k_j_z, fd_k_j, fd_k);
         }
-    }
-    if (!stream_k && parallel_blocks > 1) {
+    } else if (parallel_blocks > 1) {
         const dim3 block_dim_combine(DV, 1, 1);
         const dim3 blocks_num_combine(Q->ne[1], Q->ne[2], Q->ne[3]);
         const size_t nbytes_shared_combine = parallel_blocks*sizeof(float2);

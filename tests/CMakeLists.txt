@@ -169,10 +169,6 @@ if (LLAMA_LLGUIDANCE)
     llama_build_and_test(test-grammar-llguidance.cpp  LABEL "main behavior"  ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-llama-bpe.gguf)
 endif ()
 
-llama_build_and_test(test-qsa-fast.cpp)
-llama_build_and_test(test-qsa-recover.cpp)
-llama_build_and_test(test-ple-disk.cpp)
-llama_build(test-mtp-draft-vocab.cpp) # needs a qwen35/qwen35moe model with an MTP head: -m MODEL
 # llama_context state tests: KV and recurrent state save, load, copy, rollback
 set(LLAMA_CONTEXT_TEST_SRC
     test-llama-context.cpp
@@ -194,7 +190,6 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build_and_test(test-grammar-integration.cpp  LABEL behavior)
     llama_build_and_test(test-llama-grammar.cpp  LABEL behavior  LINK llama)
     llama_build_and_test(test-batch-alloc.cpp  LABEL behavior  LINK llama)
-    llama_build_and_test(test-qsa-prefix.cpp)
     llama_build_and_test(test-kv-cache.cpp LABEL behavior)
     target_include_directories(test-kv-cache PRIVATE ${PROJECT_SOURCE_DIR}/src)
     llama_build_and_test(test-chat.cpp  LABEL behavior  WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
@@ -235,9 +230,6 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
 endif()
 
 llama_build(test-llama-archs.cpp)
-llama_test(test-llama-archs NAME test-qwen4exp-mtp-cache-only ARGS --mtp-cache-only -s 1234)
-llama_test(test-llama-archs NAME test-qwen4exp-merged-weights ARGS --qwen4exp-merged -s 1234)
-llama_test(test-llama-archs NAME test-qwen35-merged-weights ARGS --qwen35-merged -s 1234)
 if (GGML_CPU AND (NOT WIN32 OR NOT BUILD_SHARED_LIBS))
     llama_build(test-fp8.cpp)
     set(FP8_MODEL_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-models-fp8")
@@ -320,13 +312,6 @@ llama_build_and_test(test-chat-template.cpp  LABEL behavior)
 # debug tool for chat template differential analysis (not registered as a test, run it manually)
 llama_build(test-chat-analysis.cpp)
 llama_build_and_test(test-log.cpp  LABEL behavior)
-llama_build_and_test(test-sched-view-scratch.cpp LINK ggml)
-llama_build_and_test(test-graph-src-type.cpp LINK ggml)
-# Vulkan fused-path exactness: the engagement asserts need the int8 MMQ / f16-output pipelines, which lavapipe and many
-# non-AMD devices lack, so it is not registered as a test (run it manually on a device that has the paths)
-llama_build(test-vk-exact.cpp LINK ggml)
-llama_build_and_test(test-spec-mtp-pcum.cpp)
-llama_build_and_test(test-draft-vocab.cpp)
 llama_build_and_test(
     test-peg-parser.cpp
     peg-parser/simple-tokenize.cpp
@@ -404,43 +389,7 @@ if (NOT GGML_BACKEND_DL AND GGML_CPU)
     # these tests use the backends directly and cannot be built with dynamic loading
     llama_build_and_test(test-barrier.cpp  LABEL "main behavior"  LINK ggml)
     llama_build_and_test(test-quantize-fns.cpp  LABEL "main behavior"  LINK ggml)
-    if (GGML_TRELLIS)
-        llama_build_and_test(test-tq2t.cpp LINK ggml)
-        target_compile_definitions(test-tq2t PRIVATE TQ2T_REF_DEFAULT="${CMAKE_CURRENT_SOURCE_DIR}/data/tq2t_ref.bin")
-        llama_build_and_test(test-tqk.cpp LINK ggml)
-        target_compile_definitions(test-tqk PRIVATE TQK_REF_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
-        llama_build_and_test(test-tqp.cpp LINK ggml)
-        target_compile_definitions(test-tqp PRIVATE TQP_REF_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
-    endif()
     llama_build_and_test(test-quantize-perf.cpp  LABEL "main behavior backend"  LINK ggml)
-
-    # ROCmFPx codec self-tests, kept next to the codecs under ggml/rocmfpx.
-    # test-rocmfpx exercises the ROCmFP3/6/8 codecs; test-rocmfp2-reference
-    # checks the standalone ROCmFP2 reference encoder.
-    #
-    # rocmfpx.c is already part of ggml-base and its entry points are GGML_API,
-    # so link it rather than compiling a second copy: in a shared build the
-    # inherited GGML_SHARED would make those declarations __declspec(dllimport)
-    # in the very translation unit that defines them, which MSVC rejects.
-    # rocmfp2_reference.c is standalone and carries no GGML_API, so it is still
-    # compiled straight into its test.
-    llama_build_and_test(${PROJECT_SOURCE_DIR}/ggml/rocmfpx/test_rocmfpx.c
-                         NAME test-rocmfpx)
-    target_include_directories(test-rocmfpx PRIVATE ${PROJECT_SOURCE_DIR}/ggml/rocmfpx)
-    llama_build_and_test(${PROJECT_SOURCE_DIR}/ggml/rocmfpx/test_rocmfp2_reference.c
-                         ${PROJECT_SOURCE_DIR}/ggml/rocmfpx/rocmfp2_reference.c
-                         NAME test-rocmfp2-reference)
-    target_include_directories(test-rocmfp2-reference PRIVATE ${PROJECT_SOURCE_DIR}/ggml/rocmfpx)
-    if (NOT MSVC)
-        target_compile_options(test-rocmfp2-reference PRIVATE -ffp-contract=off)
-    endif()
-    if (GGML_EXL3)
-        # EXL3 decode self-test, kept next to the decoder under ggml/exl3
-        llama_build_and_test(${PROJECT_SOURCE_DIR}/ggml/exl3/test_exl3.c NAME test-exl3 LINK ggml vendor::hash)
-        target_include_directories(test-exl3 PRIVATE ${PROJECT_SOURCE_DIR}/ggml/exl3 ${PROJECT_SOURCE_DIR}/vendor)
-        # EXL3 model directory importer, common/exl3-dir.cpp
-        llama_build_and_test(test-exl3-dir.cpp LINK llama-common vendor::hash)
-    endif()
     llama_build_and_test(test-rope.cpp  LABEL "main behavior backend"  LINK ggml)
     llama_build_and_test(test-col2im-1d.cpp  LABEL "main behavior backend"  LINK ggml)
     llama_build_and_test(test-conv-1d.cpp  LABEL "main behavior backend"  LINK ggml)
@@ -484,7 +433,6 @@ if (NOT LLAMA_USE_SYSTEM_GGML)
 
     # Needs non-public ggml{,-backend}-impl.h
     llama_build_and_test(test-alloc.cpp  LABEL "behavior backend"  LINK ggml)
-    llama_build_and_test(test-backend-sched-ring.cpp)
 endif()
 
 llama_build(test-export-graph-ops.cpp)

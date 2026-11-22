@@ -1,7 +1,6 @@
 #pragma once
 
 #include "llama-memory-hybrid.h"
-#include "qsa-prefix-state.h"
 
 #include <array>
 #include <limits>
@@ -109,53 +108,7 @@ public:
     const stale_pos_t & mem_idx_stale_get() const { return mem_idx_stale; }
     void mem_idx_stale_clear() { mem_idx_stale.fill(POS_CLEAN); }
 
-    // qwen4exp QSA inputs, see llama_memory_hybrid_idx_context::set_input_qsa
-    // causal_attn selects the rule: causal forces the query's own block on, non-causal lets every visible block compete on score
-    void set_input_qsa(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
-                       ggml_tensor * bias, const llama_ubatch * ubatch, uint32_t ratio,
-                       bool blk_bias, bool causal_attn) const;
-    // complete-block selection metadata: tails and, when the bias is I32, compact limits
-    void set_input_qsa_blocks(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
-                              ggml_tensor * bias, ggml_tensor * tail_idxs,
-                              const llama_ubatch * ubatch, uint32_t ratio) const;
-
-    void qsa_apply(const llama_ubatch & ubatch, const llama_kv_cache::slot_info & slots);
-    void qsa_invalidate();
-    bool qsa_prefix_matches(const llama_ubatch & ubatch) const;
-    bool qsa_fast(int il, const llama_ubatch & ubatch) const;
-    bool qsa_incremental() const { return incremental_qsa; }
-    bool qsa_fast_fits(int il, uint32_t n_tokens) const;
-    bool qsa_selected_key_attn() const { return selected_key_attn; }
-    // the tracked prefix is position-ordered (no image in it): rank == position
-    bool qsa_prefix_identity() const { return qsa_prefix.identity(); }
-    ggml_tensor * qsa_cache(ggml_context * ctx, int il, int64_t blocks) const;
-    void qsa_fill_updates(ggml_tensor * members, ggml_tensor * positions, ggml_tensor * rows) const;
-    void qsa_commit(int il) const;
-
 private:
-    // closed-form metadata for an incremental ubatch on the tracked prefix; false when the scan is needed
-    bool set_input_qsa_prefix(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
-                              ggml_tensor * bias, const llama_ubatch * ubatch, uint32_t ratio, bool blk_bias) const;
-    // the per-cell scan over the whole window; with tail_idxs it also writes each query's own partial block
-    // (r-1 cells, -1 padded) and, for an I32 bias, the compact visibility limits
-    // [n_seq x n_blocks starts] ++ [n_tps tails] ++ [n_tps row idx]
-    void set_input_qsa_scan(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
-                            ggml_tensor * bias, ggml_tensor * tail_idxs, const llama_ubatch * ubatch,
-                            uint32_t ratio, bool blk_bias, bool causal_attn) const;
-    // closed-form block metadata on the tracked prefix for the compact I32 bias; false when the scan is needed
-    bool qsa_metadata(ggml_tensor * cells, ggml_tensor * positions, ggml_tensor * bias,
-                      ggml_tensor * tails, const llama_ubatch & ubatch, uint32_t ratio) const;
-
-    bool incremental_qsa = false;
-    // the QSA layers run where a kernel reads the maskless block selection (HIP on RDNA3.5, Vulkan); otherwise the masked top-k
-    bool selected_key_attn = false;
-    bool qsa_recover_pending = false;
-    llama_seq_id qsa_recover_failed = -1; // the sequence the last recovery attempt failed for
-    bool qsa_recover(llama_seq_id seq);
-    qsa_prefix_state qsa_prefix;
-    mutable std::vector<int64_t> qsa_ready;
-    std::vector<ggml_tensor *> qsa_keys;
-    std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> qsa_buffers;
     // forget seq_id (all of it if seq_id < 0) in every cache at once, so a failed restore cannot leave the caches out of step
     // seq_id < 0 drops the whole context, as the caches themselves do on a failed restore
     void state_drop(llama_seq_id seq_id);
@@ -233,53 +186,8 @@ public:
     // nullptr with no indexer
     const llama_kv_cache_context * get_idx() const;
 
-    enum class qsa_route { live, prefix, fast };
-    void set_qsa_reserve_route(qsa_route route) { GGML_ASSERT(reserve || route == qsa_route::live); qsa_reserve_route = route; }
-    bool qsa_incremental() const { return mem && mem->qsa_incremental(); }
-
-    bool qsa_prefix_matches(const llama_ubatch & u) const {
-        if (qsa_reserve_route != qsa_route::live) { return qsa_incremental(); }
-        return mem && mem->qsa_prefix_matches(u);
-    }
-    bool qsa_fast(int il, const llama_ubatch & u) const {
-        if (qsa_reserve_route != qsa_route::live) { return qsa_reserve_route == qsa_route::fast && mem->qsa_fast_fits(il, u.n_tokens); }
-        return mem && mem->qsa_fast(il, u);
-    }
-    bool qsa_selected_key_attn() const { return mem && mem->qsa_selected_key_attn(); }
-    // cells the block metadata must cover: the KV view is sized by occupied cells, but a cache whose positions
-    // run ahead of its cells (an MTP draft never receives the image cells an M-RoPE image pins to one position)
-    // has blocks past that view. Never below get_n_kv(), padded like it so graph reuse keeps its cadence.
-    uint32_t qsa_n_kv_window() const;
-    ggml_tensor * qsa_cache(ggml_context * ctx, int il) const {
-        return mem ? mem->qsa_cache(ctx, il, (qsa_n_kv_window()+3)/4) : nullptr;
-    }
-    void qsa_fill_updates(ggml_tensor * members, ggml_tensor * pos, ggml_tensor * rows) const { mem->qsa_fill_updates(members, pos, rows); }
-    void qsa_commit(int il) const { mem->qsa_commit(il); }
-
     // streams in the current slot info, the `ns` of get_k/get_v; 1 if unified
     uint32_t get_n_stream() const;
-
-    // block-compressed sparse attention (qwen4exp QSA) over the cells of the indexer cache.
-    // Blocks cut the position line, not the cell array, so no caller assumes a contiguous layout:
-    //   cell_blk  I32 [n_kv, ns]           block each cell belongs to
-    //   blk_cells I32 [ratio*n_blocks, ns] cells making up each block
-    //   blk_pos   I32 [4*n_blocks*ns]      mrope position rows of each block's first token
-    //   bias      F32 [n_kv, n_tokens/ns, ns] -inf where invisible, large where always visible
-    // blk_bias asks for the bias per block instead: [n_blocks, n_tokens/ns, ns]
-    // the caller then adds the attention mask, the only part of the bias that varies within a block
-    void set_input_qsa(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
-                       ggml_tensor * bias, const llama_ubatch * ubatch, uint32_t ratio,
-                       bool blk_bias, bool causal_attn) const;
-    void set_input_qsa_blocks(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
-                              ggml_tensor * bias, ggml_tensor * tail_idxs,
-                              const llama_ubatch * ubatch, uint32_t ratio) const;
-    // one stream, scalar positions in range, no 2d rope extents, no block split over sequence sets
-    // (qsa_scalar_visibility_cells): the compact visibility rule applies
-    bool qsa_scalar_visibility(const llama_ubatch & ubatch, uint32_t ratio) const;
-    // scalar visibility and the cached cells form a single-sequence prefix with unique positions
-    bool qsa_position_prefix(const llama_ubatch & ubatch, uint32_t ratio) const;
-    // the cells the two rules above look at: none in a reservation context (the route of an empty cache)
-    uint32_t qsa_n_cells_seen() const;
 
     // glm5-next and qwen4exp, complete pools of kpool cells per sequence, scored as whole pools.
     uint32_t get_n_kpool    () const; // Padded pool count, where the last pool is always unused.
@@ -294,15 +202,9 @@ public:
 private:
     llama_memory_hybrid_idx * mem = nullptr;
 
-    // a full-cache context (init_full) only reserves graphs: its QSA route must not depend on the cells in the cache
-    const bool reserve = false;
-
-    qsa_route qsa_reserve_route = qsa_route::live;
-
     // streams per ubatch, read from the slot infos before ctx_idx takes them
     // declared first, so it is initialised while sinfos_idx is still intact
     const std::vector<uint32_t> ns_ubatch;
-    const slot_info_vec_t qsa_slots;
 
     // the indexer cells of each ubatch, kept for pools in cache order (qwen4exp): token s*n + i of ubatch u
     // sits in cell idxs[s][i] of stream strm[s] of sinfos_kpool[u], and several cells can share a position

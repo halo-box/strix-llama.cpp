@@ -122,8 +122,6 @@ class ServerProcess:
     media_path: str | None = None
     sleep_idle_seconds: int | None = None
     cache_ram: int | None = None
-    ctx_checkpoints_dir: str | None = None
-    ctx_checkpoints_ram: int | None = None
     override_kv: str | None = None
     no_cache_idle_slots: bool = False
     log_path: str | None = None
@@ -309,10 +307,6 @@ class ServerProcess:
             server_args.extend(["--sleep-idle-seconds", self.sleep_idle_seconds])
         if self.cache_ram is not None:
             server_args.extend(["--cache-ram", self.cache_ram])
-        if self.ctx_checkpoints_dir:
-            server_args.extend(["--ctx-checkpoints-dir", self.ctx_checkpoints_dir])
-        if self.ctx_checkpoints_ram is not None:
-            server_args.extend(["--ctx-checkpoints-ram", self.ctx_checkpoints_ram])
         if self.override_kv:
             server_args.extend(["--override-kv", self.override_kv])
         if self.no_cache_idle_slots:

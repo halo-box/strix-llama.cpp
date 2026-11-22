@@ -109,8 +109,6 @@ add_library(${TARGET}
     reasoning-budget.h
     sampling.cpp
     sampling.h
-    speculative-prefill.cpp
-    speculative-prefill.h
     speculative.cpp
     speculative.h
     subproc.cpp
@@ -145,13 +143,6 @@ target_compile_features   (${TARGET} PUBLIC cxx_std_17)
 
 if (LLAMA_SUBPROCESS)
     target_compile_definitions(${TARGET} PUBLIC LLAMA_SUBPROCESS)
-endif()
-
-if (GGML_EXL3)
-    # -m DIR: an exllamav3 EXL3 model directory, imported while loading
-    target_sources(${TARGET} PRIVATE exl3-dir.cpp exl3-dir.h)
-    target_link_libraries(${TARGET} PRIVATE vendor::hash)
-    target_compile_definitions(${TARGET} PRIVATE LLAMA_USE_EXL3)
 endif()
 
 if (BUILD_SHARED_LIBS)

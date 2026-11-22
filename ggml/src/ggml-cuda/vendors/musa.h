@@ -58,8 +58,6 @@ typedef uint32_t ggml_cuda_thread_mask_t;
 #define cudaErrorPeerAccessAlreadyEnabled musaErrorPeerAccessAlreadyEnabled
 #define cudaErrorPeerAccessNotEnabled musaErrorPeerAccessNotEnabled
 #define cudaEventCreateWithFlags musaEventCreateWithFlags
-#define cudaEventCreate musaEventCreate
-#define cudaEventElapsedTime musaEventElapsedTime
 #define cudaEventDisableTiming musaEventDisableTiming
 #define cudaEventRecord musaEventRecord
 #define cudaEventSynchronize musaEventSynchronize

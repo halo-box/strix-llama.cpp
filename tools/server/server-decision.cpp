@@ -19,12 +19,12 @@ static const char * decision_question_type_name(server_decision_question_type ty
 // lev reads noul from a rating scale: 0 = certainly no, 8 = certainly yes
 static const size_t DECISION_LEV_N_RATINGS = 9;
 
-// the recursive functions of this file walk request JSON, a deeper value would overflow the stack
-static const int RECURSIVE_LIMIT = 128;
-
 // h2o-lightning follows serve_config.json and h2o_lightning_shim.py of the model repo
 // a longer state keeps its head and its tail
 static const size_t DECISION_H2O_MAX_STATE_TOKENS = 32000;
+
+// the recursive functions of this file walk request JSON, a deeper value would overflow the stack
+static const int RECURSIVE_LIMIT = 128;
 
 static std::string decision_meta_str(const llama_model * model, const std::string & key) {
     char buf[256];

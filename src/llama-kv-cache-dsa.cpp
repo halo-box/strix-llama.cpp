@@ -1,4 +1,5 @@
 #include "llama-kv-cache-dsa.h"
+#include "../hooks/llama/include/llama-hook-points.h" // HOOK(kv-dsa-include)
 
 #include "llama-impl.h"
 #include "llama-batch.h"
@@ -50,11 +51,9 @@ llama_kv_cache_dsa::llama_kv_cache_dsa(
 
     LLAMA_LOG_INFO("%s: creating indexer KV cache, size = %u cells\n", __func__, kv_size);
 
-    // keep indexer keys f16 regardless of type_k: the fused indexer kernels read
-    // f16 only, and quantizing this small cache (128 dims) saves little while
-    // forcing the much slower decomposed indexer path
+    type_k = llama_hook_kv_type(model, "dsa-lid", type_k); // HOOK(kv-type-dsa)
     kv_lid = std::make_unique<llama_kv_cache>(
-            model, no_alloc, hparams_lid, GGML_TYPE_F16, type_v,
+            model, no_alloc, hparams_lid, type_k, type_v,
             v_trans, offload, unified, kv_size, n_seq_max,
             n_swa, swa_type, nullptr, filter_lid, nullptr, nullptr, "", true);
 }

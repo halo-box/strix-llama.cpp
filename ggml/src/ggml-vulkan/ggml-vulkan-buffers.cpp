@@ -708,22 +708,20 @@ static bool ggml_vk_buffer_read_async(vk_context subctx, vk_buffer& src, size_t 
     return ggml_vk_buffer_read_2d_async(subctx, src, offset, dst, size, size, size, 1, sync_staging);
 }
 
-static bool ggml_vk_buffer_host_read_direct(const vk_buffer & buf, size_t size) {
+static bool ggml_vk_buffer_host_read_direct(const vk_buffer & buf) {
     // If the device is not an UMA device the memory is host-accessible through rebar. While writing
     // through PCIe is sufficient fast reading back data from PCIe is slower than going through
     // the HW device to host copy path.
     // UMA: uncached host-visible memory is write-combined, CPU reads are slow (except Nvidia, based on benchmarks)
     const bool slow_host_read = buf->device->vendor_id != VK_VENDOR_ID_NVIDIA &&
                                 !(buf->memory_property_flags & vk::MemoryPropertyFlagBits::eHostCached);
-    // Small reads stay direct even then, to avoid the fence round trip of the device copy path.
-    return (buf->memory_property_flags & vk::MemoryPropertyFlagBits::eHostVisible) && buf->device->uma &&
-           (!slow_host_read || size <= 64 * 1024);
+    return (buf->memory_property_flags & vk::MemoryPropertyFlagBits::eHostVisible) && buf->device->uma && !slow_host_read;
 }
 
 void ggml_vk_buffer_read_2d(vk_buffer& src, size_t offset, void * dst, size_t spitch, size_t dpitch, size_t width, size_t height) {
     VK_LOG_DEBUG("ggml_vk_buffer_read_2d(" << src->buffer << ", " << offset << ", " << width << ", " << height << ")");
 
-    if (ggml_vk_buffer_host_read_direct(src, width * height)) {
+    if (ggml_vk_buffer_host_read_direct(src)) {
         GGML_ASSERT(src->memory_property_flags & vk::MemoryPropertyFlagBits::eHostCoherent);
 
         std::lock_guard<std::recursive_mutex> guard(src->device->mutex);
@@ -818,7 +816,8 @@ void ggml_vk_buffer_memset(vk_buffer& dst, size_t offset, uint32_t c, size_t siz
 }
 
 static size_t ggml_vk_staging_size_n(const vk_device & device, const std::vector<vk_buffer_region> & regions) {
-    size_t max = 0;
+    size_t total = 0;
+    size_t max   = 0;
     for (const auto & r : regions) {
         vk_buffer pinned;
         size_t pinned_offset;
@@ -826,9 +825,10 @@ static size_t ggml_vk_staging_size_n(const vk_device & device, const std::vector
         if (pinned != nullptr) {
             continue;
         }
+        total += r.size;
         max = std::max(max, r.size);
     }
-    return max;
+    return std::max(max, std::min(total, (size_t) device->suballocation_block_size));
 }
 
 // returns number of regions recorded, stops when staging is full
@@ -950,7 +950,7 @@ void ggml_vk_buffer_read_n(const vk_buffer_region * regions, size_t n) {
             continue;
         }
         GGML_ASSERT((direct.empty() && pending.empty()) || r.buf->device == (direct.empty() ? pending[0] : direct[0]).buf->device);
-        if (ggml_vk_buffer_host_read_direct(r.buf, r.size)) {
+        if (ggml_vk_buffer_host_read_direct(r.buf)) {
             GGML_ASSERT(r.buf->memory_property_flags & vk::MemoryPropertyFlagBits::eHostCoherent);
             direct.push_back(r);
         } else {

@@ -15,21 +15,6 @@ struct vk_mat_mat_push_constants {
     uint32_t padded_N;
 };
 
-// matmul_f32_f32_qsa (QSA_EPI in mul_mm.comp): the plain push constants plus the block-bias addressing (QSA_SCORE)
-struct vk_mat_mat_qsa_push_constants {
-    vk_mat_mat_push_constants mm;
-    uint32_t has_bias; uint32_t stride_bias; uint32_t batch_stride_bias;
-};
-
-// matmul_q8_0_q8_1_hcmix (HC_EPI in mul_mmq_cm1.comp): the plain push constants plus the x / mixed addressing and the mix scale
-struct vk_mat_mat_hcmix_push_constants {
-    vk_mat_mat_push_constants mm;
-    uint32_t hc_n_embd; uint32_t hc_x_offset; uint32_t hc_x_s1; uint32_t hc_x_s2; uint32_t hc_d_offset; uint32_t hc_d_s1;
-    float hc_scale;
-    uint32_t hc_zero;   // 0: keeps the epilogue's f16 gate rounding opaque to the shader compiler
-    uint32_t hc_round;  // 1: f16 gate (the unfused chain casts it), 0: f32 gate
-};
-
 struct vk_mat_vec_push_constants {
     uint32_t ncols;
     uint32_t stride_a;
@@ -79,7 +64,6 @@ struct vk_mat_mat_id_push_constants {
     uint32_t nei0; uint32_t nei1; uint32_t nbi1; uint32_t ne11;
     uint32_t n_experts;
     uint32_t row_ids_offset;
-    uint32_t fusion_flags;
 };
 
 struct vk_mat_vec_id_push_constants {
@@ -258,58 +242,6 @@ struct vk_op_top_k_mask_push_constants {
     uint32_t d_offset;
 };
 
-// dsv4_hc_post_norm.comp: strides in elements; every operand has unit element stride and no misalignment
-struct vk_op_dsv4_hc_post_norm_push_constants {
-    uint32_t n_embd;
-    uint32_t hc;
-    uint32_t n_tokens;
-    uint32_t sx1;
-    uint32_t sr1; uint32_t sr2;
-    uint32_t sp0; uint32_t sp1;
-    uint32_t sg1;
-    uint32_t so1; uint32_t so2;
-    uint32_t sn1; uint32_t sn2;
-    float    eps;
-    uint32_t gate;
-    float    gate_in;
-    float    gate_out;
-    uint32_t zero;   // always 0: the f16 store's XOR operand
-};
-static_assert(sizeof(vk_op_dsv4_hc_post_norm_push_constants) <= 128);
-
-// dsv4_hc_post_norm_inj.comp: the dsv4_hc_post_norm fields, then the inject weight row stride and output token stride (floats)
-struct vk_op_dsv4_hc_post_norm_inj_push_constants {
-    vk_op_dsv4_hc_post_norm_push_constants base;
-    uint32_t sw1;
-    uint32_t si1;
-};
-static_assert(sizeof(vk_op_dsv4_hc_post_norm_inj_push_constants) <= 128);
-
-// dsv4_hc_moe_post_norm.comp: the dsv4_hc_post_norm_inj fields (base.sx1 = the shared-expert token stride), then the routed slots:
-// count, slot 0 offset, slot stride and token stride (elements), the shared-expert term (0: none, 1: added, 2: its sigmoid gate
-// applied first) and the gate's token stride (floats)
-struct vk_op_dsv4_hc_moe_post_norm_push_constants {
-    vk_op_dsv4_hc_post_norm_inj_push_constants inj;
-    uint32_t n_slots;
-    uint32_t so;
-    uint32_t ss1;
-    uint32_t ss2;
-    uint32_t sh_mode;
-    uint32_t sgt;
-};
-static_assert(sizeof(vk_op_dsv4_hc_moe_post_norm_push_constants) <= 128);
-
-// HC_DEFER: the MoE epilogue also recomputes the deferred attention-side combine
-struct vk_op_dsv4_hc_moe_post_norm_defer_push_constants {
-    vk_op_dsv4_hc_moe_post_norm_push_constants moe;
-    uint32_t sxa1;
-    uint32_t spa0; uint32_t spa1;
-    uint32_t gate_a;
-    float    gate_in_a;
-    float    gate_out_a;
-};
-static_assert(sizeof(vk_op_dsv4_hc_moe_post_norm_defer_push_constants) <= 128);
-
 struct vk_op_count_experts_push_constants {
     uint32_t ne00;
     uint32_t ne01;
@@ -324,40 +256,6 @@ struct vk_op_count_experts_push_constants {
     uint32_t ne0_dst;
     uint32_t stride_dst;
     uint32_t batch_stride_dst;
-};
-
-// mul_mm_id_glu.comp (MUL_MAT_ID_PAIR_SWIGLU); offsets and strides in the units of each binding
-struct vk_op_mmid_glu_push_constants {
-    uint32_t M;
-    uint32_t K;
-    uint32_t g_offset;
-    uint32_t u_offset;
-    uint32_t stride_e;
-    uint32_t b_offset;
-    uint32_t b_s1;
-    uint32_t b_s2;
-    uint32_t ne11;
-    uint32_t d_offset;
-    uint32_t n_used;
-    uint32_t row_ids_offset;
-    uint32_t zero;
-};
-
-// mul_mm_id_down.comp (streaming MUL_MAT_ID(+MUL)+CPY(f16) down); offsets and strides in the units of each binding
-struct vk_op_mmid_down_push_constants {
-    uint32_t M;
-    uint32_t K;
-    uint32_t a_offset;
-    uint32_t stride_e;
-    uint32_t b_offset;
-    uint32_t b_s1;
-    uint32_t b_s2;
-    uint32_t ne11;
-    uint32_t d_offset;
-    uint32_t n_used;
-    uint32_t row_ids_offset;
-    uint32_t s_offset;
-    uint32_t scaled;
 };
 
 struct vk_op_glu_push_constants {
@@ -674,19 +572,6 @@ struct vk_op_topk_radix_push_constants {
     uint32_t n_stream; // QSA only
 };
 
-// QSA_EXPAND (qsa_expand.comp): element offsets and row strides of each binding
-struct vk_op_qsa_expand_push_constants {
-    uint32_t n_query;
-    uint32_t n_blocks;
-    uint32_t budget;
-    uint32_t r;
-    uint32_t b_off, b_stride;
-    uint32_t s_off, s_stride;
-    uint32_t c_off, c_stride;
-    uint32_t t_off, t_stride;
-    uint32_t d_off, d_stride;
-};
-
 struct vk_op_im2col_push_constants {
     uint64_t dst_addr;
     uint32_t batch_offset; uint32_t offset_delta;
@@ -847,21 +732,6 @@ struct vk_op_gated_delta_net_push_constants {
     uint32_t K;
 };
 
-// gdn_chunk_prep.comp / gdn_chunk_scan.comp: the sequential kernel's constants plus the chunk count
-struct vk_op_gdn_chunk_push_constants {
-    vk_op_gated_delta_net_push_constants gdn;
-    uint32_t nch;
-    uint32_t qk_norm;   // prep: q and k are the raw views, l2-normalised on load (x * qk_mul * rsqrt(mean(x^2) + qk_eps))
-    float    qk_eps;
-    float    qk_mul;
-    // conv_fold: q / k / v are silu(conv4(x)) computed on load from the conv input x, conv state and
-    // taps (prep bindings 0, 1, 5, 6; scan bindings 0, 4, 5); qc0 / kc0 / vc0 are the q / k / v view offsets in x (floats)
-    uint32_t conv_fold;   // bit 0 on, bit 1: chunks after the first read the window without the conv-state branch
-    uint32_t qc0, kc0, vc0;
-    uint32_t conv_C;
-};
-static_assert(sizeof(vk_op_gdn_chunk_push_constants) <= 128);
-
 struct vk_op_ssm_scan_push_constants {
     uint32_t nb02, nb03, nb12, nb13;
     uint32_t nb21, nb22, nb31;
@@ -1010,13 +880,6 @@ static vk_op_sum_rows_push_constants vk_op_sum_rows_push_constants_init(const gg
     return p;
 }
 
-struct vk_op_sum_push_constants {
-    uint32_t n;
-    uint32_t chunk;
-    uint32_t a_offset;
-    uint32_t d_offset;
-};
-
 template <> inline void init_pushconst_fastdiv(vk_op_sum_rows_push_constants &p) {
     init_fastdiv_values(p.ne01*p.ne02, p.ne0_12mp, p.ne0_12L);
     init_fastdiv_values(p.ne01,        p.ne0_1mp,  p.ne0_1L);
@@ -1025,18 +888,12 @@ template <> inline void init_pushconst_fastdiv(vk_op_sum_rows_push_constants &p)
 struct vk_quantize_q8_1_push_constants {
     uint32_t ne;
     uint32_t num_blocks;
-    uint32_t row4;      // a row-strided source: row length and row stride in vec4s (0: packed)
-    uint32_t stride4;
 };
 
 struct vk_op_flash_attn_split_k_reduce_push_constants {
     uint32_t D;
     uint32_t ne1;
-    // ne2 describes the SPLIT BUFFER (which may cover only a tile of queries); dst_ne2 is the
-    // destination's query count. They differ only when the caller tiles the split buffer, and
-    // the destination stride between streams must always use the full count.
     uint32_t ne2;
-    uint32_t dst_ne2;
     uint32_t ne3;
     uint32_t k_num;
     uint32_t sinks;

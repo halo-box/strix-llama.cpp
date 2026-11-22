@@ -195,22 +195,12 @@ add_library(ggml-base
             ggml-alloc.c
             ggml-backend.cpp
             ggml-backend-meta.cpp
-            ggml-backend-sanitize.cpp
-            ggml-backend-sanitize.h
             ggml-opt.cpp
             ggml-threading.cpp
             ggml-threading.h
             ggml-quants.c
             ggml-quants.h
-            ../rocmfp4/rocmfp4.c
-            ../rocmfp4/rocmfp4.h
-            ../rocmfpx/rocmfpx.c
-            ../rocmfpx/rocmfpx.h
             gguf.cpp)
-
-if (GGML_EXL3)
-    target_sources(ggml-base PRIVATE ../exl3/exl3.c ../exl3/exl3.h)
-endif()
 
 set_target_properties(ggml-base PROPERTIES
     VERSION ${GGML_VERSION}
@@ -234,11 +224,6 @@ if (GGML_SCHED_NO_REALLOC)
     target_compile_definitions(ggml-base PUBLIC GGML_SCHED_NO_REALLOC)
 endif()
 
-# PUBLIC: reaches every backend, llama and the tests through their ggml-base link
-if (GGML_TRELLIS)
-    target_compile_definitions(ggml-base PUBLIC GGML_USE_TRELLIS)
-endif()
-
 if (GGML_OPENMP_FETCH)
     if (NOT GGML_OPENMP)
         message(FATAL_ERROR "GGML_OPENMP_FETCH requires GGML_OPENMP")
@@ -246,17 +231,9 @@ if (GGML_OPENMP_FETCH)
         message(FATAL_ERROR "GGML_OPENMP_FETCH currently requires Clang on Windows")
     endif()
 
-    string(REGEX MATCH "^[0-9]+" GGML_OPENMP_COMPILER_VERSION_MAJOR "${CMAKE_C_COMPILER_VERSION}")
-    if (GGML_OPENMP_COMPILER_VERSION_MAJOR STREQUAL "22")
-        set(GGML_OPENMP_LLVM_VERSION "22.1.3")
-        set(GGML_OPENMP_INSTALLER_SHA256_X64   "72ca54c3b7940615776d8994c0b918a1d8c4981bdcf13b439eaa86a1bd477001")
-        set(GGML_OPENMP_INSTALLER_SHA256_ARM64 "c18d02a43ba31595ca99590faf3ac74c89577f3f49e903537c5bdec5100ed4d2")
-    else()
-        set(GGML_OPENMP_LLVM_VERSION "20.1.8")
-        set(GGML_OPENMP_INSTALLER_SHA256_X64   "3197846a2b19063687dd56e93e34cd941e3548d907f23a6131571321bdf9fe7b")
-        set(GGML_OPENMP_INSTALLER_SHA256_ARM64 "7c4ac97eb2ae6b960ca5f9caf3ff6124c8d2a18cc07a7840a4d2ea15537bad8e")
-    endif()
+    set(GGML_OPENMP_LLVM_VERSION "20.1.8")
     string(REGEX MATCH "^[0-9]+" GGML_OPENMP_LLVM_VERSION_MAJOR "${GGML_OPENMP_LLVM_VERSION}")
+    string(REGEX MATCH "^[0-9]+" GGML_OPENMP_COMPILER_VERSION_MAJOR "${CMAKE_C_COMPILER_VERSION}")
     if (NOT GGML_OPENMP_COMPILER_VERSION_MAJOR STREQUAL GGML_OPENMP_LLVM_VERSION_MAJOR)
         message(FATAL_ERROR "LLVM OpenMP ${GGML_OPENMP_LLVM_VERSION} requires Clang ${GGML_OPENMP_LLVM_VERSION_MAJOR}.x")
     endif()
@@ -265,11 +242,11 @@ if (GGML_OPENMP_FETCH)
     if (GGML_OPENMP_SYSTEM_PROCESSOR MATCHES "^(amd64|x86_64)$")
         set(GGML_OPENMP_ARCH "x64")
         set(GGML_OPENMP_INSTALLER_SUFFIX "win64")
-        set(GGML_OPENMP_INSTALLER_SHA256 "${GGML_OPENMP_INSTALLER_SHA256_X64}")
+        set(GGML_OPENMP_INSTALLER_SHA256 "3197846a2b19063687dd56e93e34cd941e3548d907f23a6131571321bdf9fe7b")
     elseif (GGML_OPENMP_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$")
         set(GGML_OPENMP_ARCH "arm64")
         set(GGML_OPENMP_INSTALLER_SUFFIX "woa64")
-        set(GGML_OPENMP_INSTALLER_SHA256 "${GGML_OPENMP_INSTALLER_SHA256_ARM64}")
+        set(GGML_OPENMP_INSTALLER_SHA256 "7c4ac97eb2ae6b960ca5f9caf3ff6124c8d2a18cc07a7840a4d2ea15537bad8e")
     else()
         message(FATAL_ERROR "GGML_OPENMP_FETCH does not support ${CMAKE_SYSTEM_PROCESSOR}")
     endif()

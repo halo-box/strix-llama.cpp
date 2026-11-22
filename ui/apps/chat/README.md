@@ -128,8 +128,7 @@ proxy: {
 	'/models': SERVER_ORIGIN,
 	'/tools': SERVER_ORIGIN,
 	'/slots': SERVER_ORIGIN,
-	'/cors-proxy': SERVER_ORIGIN,
-	'/dashboard': SERVER_ORIGIN
+	'/cors-proxy': SERVER_ORIGIN
 },
 ```
 

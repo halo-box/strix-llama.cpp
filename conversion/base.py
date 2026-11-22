@@ -31,8 +31,6 @@ if 'NO_LOCAL_GGUF' not in os.environ:
 import gguf
 from gguf.vocab import MistralTokenizerType, MistralVocab
 
-from .exl3 import add_exl3_metadata, write_exl3_tensors
-
 try:
     from mistral_common.tokens.tokenizers.base import TokenizerVersion # ty: ignore[import-not-found]
     from mistral_common.tokens.tokenizers.multimodal import DATASET_MEAN as _MISTRAL_COMMON_DATASET_MEAN, DATASET_STD as _MISTRAL_COMMON_DATASET_STD # ty: ignore[import-not-found]
@@ -125,13 +123,6 @@ class ModelBase:
     supports_mtp_export: bool = False
     mtp_only: bool = False
     no_mtp: bool = False
-    mtp_shared_embd: bool = False
-
-    # EXL3 (exllamav3) checkpoints, set by write_exl3_tensors
-    exl3_codebook: str | None = None
-    exl3_permuted: list[str] = []
-    exl3_permutation: str = ""
-    exl3_rows: list[str] = []
 
     def __init__(self, dir_model: Path, ftype: gguf.LlamaFileType, fname_out: Path, *, is_big_endian: bool = False,
                  use_temp_file: bool = False, eager: bool = False,
@@ -684,8 +675,6 @@ class ModelBase:
                     tensors_to_remove.append(name)
                     if self._fp8_as_q8:
                         self._fp8_dequantized.add(weight_name)
-            elif quant_method == "exl3":
-                pass  # the payloads are already written by write_exl3_tensors
             elif quant_method is not None:
                 raise NotImplementedError(f"Quant method is not yet supported: {quant_method!r}")
 
@@ -875,18 +864,6 @@ class ModelBase:
             if bid is not None:
                 return False
         return name == (key_name + suffix)
-
-    def exl3_block_permutation(self, name: str, k: int, n: int) -> tuple[np.ndarray | None, np.ndarray | None]:
-        """Reorder of the 128-blocks of an EXL3 linear on the input (k) and output (n) side, or None."""
-        return None, None
-
-    def exl3_linear_names(self, name: str, n: int) -> list[tuple[str, int, int]] | None:
-        """GGUF names (without .weight) of an EXL3 linear and the output columns [n0, n1) of each, or None for its mapped name."""
-        return None
-
-    def exl3_row_table_name(self, name: str, row_dim: int) -> str:
-        """GGUF name (without .weight) of an EXL3 n-gram row table that decodes to rows of row_dim."""
-        raise NotImplementedError(f"{name}: this model has no EXL3 n-gram row table")
 
     def map_tensor_name(self, name: str, try_suffixes: Sequence[str] = (".weight", ".bias")) -> str:
         new_name = self.tensor_map.get_name(key=name, try_suffixes=try_suffixes)
@@ -1566,10 +1543,6 @@ class ModelBase:
                             self.model_tensors[input_scale_name] = inverse_scale(self.model_tensors.pop(name))
             self._generate_nvfp4_tensors()
 
-        # EXL3 payloads are copied as they are, before dequant_model sees the checkpoint
-        if quant_method == "exl3":
-            write_exl3_tensors(self)
-
         self._prepare_fp8_e4m3_tensors()
         self.dequant_model()
 
@@ -1641,10 +1614,6 @@ class ModelBase:
                     ):
                         # TODO: use Q4_K and Q6_K
                         data_qtype = gguf.GGMLQuantizationType.F16
-
-                # EXL3 checkpoints keep the stored type of the tensors that are not EXL3 payloads
-                if data_qtype is False and self.exl3_codebook is not None and old_dtype in (torch.float16, torch.bfloat16):
-                    data_qtype = gguf.GGMLQuantizationType.F16 if old_dtype == torch.float16 else gguf.GGMLQuantizationType.BF16
 
                 # No override (data_qtype is False), or wants to be quantized (data_qtype is True)
                 if isinstance(data_qtype, bool):
@@ -1738,9 +1707,6 @@ class ModelBase:
         self.gguf_writer.add_quantization_version(gguf.GGML_QUANT_VERSION)
 
         self.add_hadamard_metadata()
-
-        if self.exl3_codebook is not None:
-            add_exl3_metadata(self, self.hparams["quantization_config"])
 
         if self._prec_a4:
             names = sorted(self._prec_a4.keys())
@@ -3392,7 +3358,6 @@ class LazyTorchTensor(gguf.LazyBase):
         torch.float16: np.float16,
         torch.float32: np.float32,
         torch.uint8: np.uint8,
-        torch.int16: np.int16,
         torch.int64: np.int64,
     }
 

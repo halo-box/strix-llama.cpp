@@ -11,7 +11,6 @@
 #include <map>
 #include <string>
 #include <vector>
-#include <memory>
 
 //
 // llama architecture queries
@@ -140,15 +139,6 @@ LLAMA_API bool llama_batch_ext_set_decision_order(struct llama_batch_ext * batch
 
 // Label of option i of a decision model ("<arch>.decision.labels"), nullptr past the last one
 LLAMA_API const char * llama_model_decision_label(const struct llama_model * model, uint32_t i);
-
-// NextN resident hand-over (C++ only, kept out of llama.h)
-struct llama_resident_nextn;
-LLAMA_API bool llama_nextn_resident_enable(llama_context * target, llama_context * draft);
-// Keep carry unchanged until the producer-ready event completes.
-LLAMA_API std::shared_ptr<llama_resident_nextn> llama_nextn_resident_prepare(llama_context * target, llama_batch_ext * batch, const float * carry);
-LLAMA_API void llama_nextn_resident_read(const std::shared_ptr<llama_resident_nextn> & rows, uint64_t generation, int32_t row, float * dst);
-LLAMA_API uint64_t llama_nextn_resident_generation(const std::shared_ptr<llama_resident_nextn> & rows);
-LLAMA_API std::shared_ptr<llama_resident_nextn> llama_nextn_resident_snapshot(const std::shared_ptr<llama_resident_nextn> & rows, std::shared_ptr<llama_resident_nextn> snapshot);
 
 //
 // model/context data extraction

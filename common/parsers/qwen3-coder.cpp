@@ -1,33 +1,5 @@
 #include "parsers.h"
 
-// the values of a non-empty enum of strings, alone or inside an allOf (e.g. {"type": "string", "enum": [...]})
-static const std::vector<common_json> * qwen3_coder_string_enum(const common_chat_schema * schema) {
-    if (schema == nullptr) {
-        return nullptr;
-    }
-    if (schema->kind() == common_chat_schema::KIND_ALL_OF) {
-        for (const auto & child : static_cast<const common_chat_schema_all_of *>(schema)->children) {
-            if (const auto * values = qwen3_coder_string_enum(child.get())) {
-                return values;
-            }
-        }
-        return nullptr;
-    }
-    if (schema->kind() != common_chat_schema::KIND_ENUM) {
-        return nullptr;
-    }
-    const auto & values = static_cast<const common_chat_schema_enum *>(schema)->values;
-    if (values.empty()) {
-        return nullptr;
-    }
-    for (const auto & value : values) {
-        if (!value.is_string()) {
-            return nullptr;
-        }
-    }
-    return &values;
-}
-
 common_chat_params common_chat_params_init_qwen3_coder(const common_chat_template &          tmpl,
                                                               const autoparser::generation_params & inputs) {
     common_chat_params data;
@@ -169,14 +141,6 @@ common_chat_params common_chat_params_init_qwen3_coder(const common_chat_templat
                             json_value |= p.json_null();
                         }
                         arg_value = p.gbnf(p.atomic(p.tool_arg_json_value(json_value) + arg_close) | arg_string, "xml-arg-string");
-                    }
-                    // a string-only enum constrains the raw value to its literals, each followed by the closing tag
-                    if (const auto * values = qwen3_coder_string_enum(param.schema.get())) {
-                        auto choice = p.choice();
-                        for (const auto & value : *values) {
-                            choice |= p.literal(value.get<std::string>()) + p.peek(p.literal("\n</parameter>\n"));
-                        }
-                        arg_value = p.tool_arg_string_value(choice) + arg_close;
                     }
 
                     auto arg_rule = p.rule(rule_name, p.tool_arg(arg_open + arg_value));

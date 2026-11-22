@@ -91,9 +91,6 @@ struct llama_context {
     float * get_embeddings_nextn();
     float * get_embeddings_nextn_ith(int32_t i);
 
-    bool nextn_resident_enable(llama_context & draft);
-    std::shared_ptr<llama_resident_nextn> nextn_resident_prepare(llama_batch_ext & batch, const float * carry);
-
     float * get_embeddings_layer_inp(uint32_t lid);
 
     ggml_tensor * get_layer_inp_dev() const { return layer_inp_dev; }
@@ -122,7 +119,6 @@ struct llama_context {
     void set_n_threads(int32_t n_threads, int32_t n_threads_batch);
 
     void set_abort_callback(bool (*abort_callback)(void * data), void * abort_callback_data);
-    void set_eval_callback(ggml_backend_sched_eval_callback cb_eval, void * cb_eval_user_data);
 
     void set_embeddings (bool value);
     void set_embeddings_nextn(bool value, bool masked);
@@ -255,9 +251,6 @@ private:
 
     void output_reorder();
 
-    void nextn_resident_begin(const llama_batch_ext & batch);
-    void nextn_resident_materialize();
-
     // map the output row index `i` to batch index
     int64_t output_resolve_row(int32_t i) const;
 
@@ -293,9 +286,6 @@ public:
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
 
 private:
-    std::vector<uint32_t> reserve_token_ranges(const llama_memory_context_i * mctx, uint32_t n_seqs, uint32_t n_tokens_max);
-    void reserve_qsa_routes(llama_memory_context_i * mctx, uint32_t n_tokens_max, const std::vector<uint32_t> & range_ends);
-
     llm_graph_result * get_gf_res_prev();
 
     llm_graph_params graph_params(
@@ -328,8 +318,6 @@ private:
 
     // ggml_backend_sched realloc callback, counts and traces the graph reallocations of this context
     static void sched_graph_realloc(ggml_backend_sched_t sched, ggml_cgraph * gf, bool backend_ids_changed, bool graph_size_changed, void * user_data);
-    void vsub_init(uint32_t n_dynamic);
-    void vsub_init_head(ggml_tensor * w, const llama_vocab_subset::head & head);
 
     // disable auto fused ops (Flash Attention, Gated Delta Net) whose op lands on a device
     // that differs from the layer it belongs to (usually due to missing backend support)
@@ -355,14 +343,8 @@ private:
 
     llama_cross cross; // TODO: tmp for handling cross-attention - need something better probably
 
-    // MTP draft vocabulary subset used by this context's graphs (nullptr = full vocabulary)
-    std::shared_ptr<const llama_mtp_draft_vocab> mtp_draft;
-
     llama_memory_ptr memory;
     llama_moe_cache_ptr moe_cache;
-
-    // llama_model::prefetch_begin state of this context's decodes
-    std::unique_ptr<llama_model_prefetch> prefetch;
 
     // decode output (2-dimensional array: [n_outputs][n_vocab])
     buffer_view<float> logits = {nullptr, 0};
@@ -375,9 +357,6 @@ private:
     // populated only when cparams.embeddings_nextn is enabled and the model graph
     // sets llm_graph_result::t_h_nextn
     buffer_view<float> embd_nextn = {nullptr, 0};
-    std::shared_ptr<llama_resident_nextn> nextn_resident;
-    bool nextn_resident_active = false;
-    bool nextn_resident_host_ready = true;
 
     // host buffers for output layer input embeddings, per layer
     // populated when cparams.output_layer_inp[il] is true
@@ -480,10 +459,6 @@ private:
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;
 
-    // reduced draft LM head, nullptr = full LM head
-    std::unique_ptr<llama_vocab_subset>  vsub;
-    std::vector<ggml_context_ptr>        vsub_ctxs;
-    std::vector<ggml_backend_buffer_ptr> vsub_bufs;
     // device buffer with enabled layer inputs, [n_layer_inp*n_embd, n_batch], row = batch index
     ggml_context_ptr        ctx_layer_inp_dev;
     ggml_backend_buffer_ptr buf_layer_inp_dev;
@@ -521,9 +496,6 @@ private:
 
     // true after the prism.hadamard coverage check passes on a reserved graph
     bool hadamard_verified = false;
-
-    // true after the EXL3 coverage check passes on a reserved graph
-    bool exl3_verified = false;
 
     // perf
     mutable int64_t t_start_us  = 0;

@@ -118,7 +118,7 @@ public:
         // lightning indexer keys are rotated with the indexer RoPE parameters
                        bool   is_indexer = false);
 
-    ~llama_kv_cache() override;
+    ~llama_kv_cache() = default;
 
     //
     // llama_memory_i
@@ -188,10 +188,6 @@ public:
     // undo a state_read() of seq_id (-1 for the whole cache) that another memory module failed to complete
     void state_clear(llama_seq_id seq_id);
 
-    // after a mirrored state_read_sinfo(): take the 2D position of the restored cells from src (same layout)
-    // the qwen4exp indexer has no rope of its own, so its saved state has no x/y, yet the QSA visibility rule reads them
-    void ext_2d_copy(const llama_kv_cache & src, const slot_info_vec_t & sinfos);
-
     //
     // graph_build API
     //
@@ -211,13 +207,6 @@ public:
     ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
     ggml_tensor * get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
 
-    // zero the K rows (and the V rows when V is stored row-major) [r0, r1) of stream strm in
-    // every layer, including the layers of the caches that mirror these cells (sharers).
-    // Called for every cell that becomes free, so a masked-out cell never holds stale content:
-    // on gfx11 WMMA, P*V with P == +0.0 is not exact for V != +0.0, so the FA output would
-    // otherwise depend on whatever the masked-out cells last held.
-    void zero_rows(uint32_t strm, uint32_t r0, uint32_t r1);
-    void zero_idxs(uint32_t strm, const std::vector<uint32_t> & idxs);   // ascending cell indices
     ggml_tensor * get_k_scale(int32_t il) const;
     ggml_tensor * get_v_scale(int32_t il) const;
 
@@ -261,12 +250,6 @@ public:
     void set_input_attn_mask (const llm_attn_mask & attn_mask, const llama_ubatch * ubatch, bool causal_attn) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
     void set_input_relative_pos(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const;
-
-    // true if the KQ mask of ubatch is the plain index-causal one (key j visible to query i of its stream iff j <= i):
-    // causal, no SWA or ALiBi, and in every stream the n_kv cells hold that stream's tokens of ubatch, one sequence,
-    // in cell order with strictly increasing positions
-    bool is_causal_prefix(const llama_ubatch & ubatch, uint32_t n_kv, uint32_t n_stream, bool causal_attn) const;
-
 
     // true if llama_kv_cell_ext holds information that has to survive a state save/restore
     bool has_cell_ext() const;
@@ -340,14 +323,6 @@ private:
     // the current index from where we start searching for a free slot in the ring buffer of KV cells (see find_slot())
     // note: this is not part of the KV state and it's only used to speed-up the find_slot() method
     std::vector<uint32_t> v_heads;
-
-    // one past the highest cell row ever written, per stream. Rows above it are still zero
-    // from the buffer clear at construction, so clear() only has to wipe [0, rows_hw).
-    std::vector<uint32_t> rows_hw;
-    void rows_hw_init();
-
-    // caches that mirror our cells (see `other`): their rows go stale exactly when ours do
-    std::vector<llama_kv_cache *> sharers;
 
     // TODO: temporary until we refactor to be able to share the same cells between 2 kv caches [TAG_KV_CACHE_SHARE_CELLS]
     llama_kv_cache * other;
@@ -480,10 +455,6 @@ public:
     void set_input_attn_mask (const llm_attn_mask & attn_mask, const llama_ubatch * ubatch, bool causal_attn) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
     void set_input_relative_pos(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const;
-
-    // see llama_kv_cache::is_causal_prefix()
-    bool is_causal_prefix(const llama_ubatch & ubatch, bool causal_attn) const;
-
 
     // see llama_kv_cache::get_prev_tokens()
     void get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const;

@@ -79,8 +79,7 @@ void ggml_cuda_op_reglu(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
 void ggml_cuda_op_geglu(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
-// dst16: optional BF16 copy of dst (round to nearest even) for an MMB GEMM that reads it next
-void ggml_cuda_op_swiglu(ggml_backend_cuda_context & ctx, ggml_tensor * dst, uint16_t * dst16 = nullptr);
+void ggml_cuda_op_swiglu(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
 void ggml_cuda_op_swiglu_oai(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
@@ -93,10 +92,6 @@ void ggml_cuda_op_geglu_quick(ggml_backend_cuda_context & ctx, ggml_tensor * dst
 void ggml_cuda_op_xielu(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
 void ggml_cuda_op_unary_mul(ggml_backend_cuda_context & ctx, ggml_tensor * unary_node, ggml_tensor * mul_node);
-
-void ggml_cuda_op_cont_sigmoid_mul(
-        ggml_backend_cuda_context & ctx, ggml_tensor * cont_node, ggml_tensor * unary_node, ggml_tensor * mul_node, uint16_t * dst16 = nullptr,
-        bool dst16_f16 = false, bool store_f32 = true);
 
 void ggml_cuda_op_relu_sqr(ggml_backend_cuda_context & ctx, ggml_tensor * relu_node, ggml_tensor * sqr_node);
 
@@ -127,16 +122,6 @@ __device__ __forceinline__ float ggml_cuda_op_swiglu_clamp_single(float gate, fl
     return ggml_cuda_op_silu_single(gate) * up;
 }
 
-// fused GGML_OP_SCALE + GGML_UNARY_OP_{SILU,SIGMOID}: dst = op(scale*x + bias)
-void ggml_cuda_op_scale_unary(ggml_backend_cuda_context & ctx, ggml_tensor * scale_node, ggml_tensor * unary_node, uint16_t * dst16 = nullptr);
-
-// ADD(x, b) -> SOFTPLUS -> MUL(., a) with b, a one row broadcast over the rows of x (the GDN gate); true if fused
-bool ggml_cuda_gdn_gate_fusable(const ggml_tensor * add, const ggml_tensor * sp, const ggml_tensor * mul);
-void ggml_cuda_op_gdn_gate(ggml_backend_cuda_context & ctx, const ggml_tensor * add, ggml_tensor * mul);
-
-// out = other + src * sigmoid(gate[row]) (gate: one value per row)
-void ggml_cuda_op_sigmoid_gate_mul_add(ggml_backend_cuda_context & ctx, const ggml_tensor * gate, const ggml_tensor * src,
-        const ggml_tensor * other, ggml_tensor * out);
 __device__ __forceinline__ float ggml_cuda_op_glu_single(ggml_glu_op op, float gate, float up, float limit) {
     switch (op) {
         case GGML_GLU_OP_SWIGLU:

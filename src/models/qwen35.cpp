@@ -126,15 +126,6 @@ void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
         layer.nextn.shared_head_norm = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_NORM, "weight", il), { n_embd },              mtp_flags|TENSOR_NOT_REQUIRED);
     };
 
-    const int64_t n_v_heads = hparams.ssm_dt_rank;
-    const int64_t qkv_dim   = hparams.ssm_d_state * (hparams.ssm_n_group * 2 + n_v_heads);
-    for (int i = 0; i < n_layer_all; ++i) {
-        ml.split_weight(tn(LLM_TENSOR_ATTN_QKV_GATE, "weight", i).str(), tn(LLM_TENSOR_ATTN_QKV, "weight", i).str(), qkv_dim,
-                tn(LLM_TENSOR_ATTN_GATE, "weight", i).str());
-        ml.split_weight(tn(LLM_TENSOR_SSM_BETA_ALPHA_CAT, "weight", i).str(), tn(LLM_TENSOR_SSM_BETA, "weight", i).str(), n_v_heads,
-                tn(LLM_TENSOR_SSM_ALPHA, "weight", i).str());
-    }
-
     for (int i = 0; i < n_layer; ++i) {
         load_block_trunk(i, trunk_flags);
     }
@@ -244,9 +235,6 @@ llama_model_qwen35::graph::graph(const llm_graph_params & params) :
 
     // LM head
     cur = build_lora_mm(model.output, cur, model.output_s);
-    if (cparams.embeddings_nextn && n_tokens <= 16 && cur->op == GGML_OP_MUL_MAT) {
-        ggml_mul_mat_set_hint(cur, GGML_HINT_EXACT_BATCH);
-    }
 
     cb(cur, "result_output", -1);
     res->t_logits = cur;
@@ -311,16 +299,6 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
             n_embd_head,     n_head_kv,
             n_embd_head,     n_head_kv,
             il, false);
-    if (cparams.embeddings_nextn && n_tokens <= 16) {
-        for (ggml_tensor * projection : { Qcur_full, Kcur, Vcur }) {
-            while (projection->view_src != nullptr || projection->op == GGML_OP_CONT) {
-                projection = projection->src[0];
-            }
-            if (projection->op == GGML_OP_MUL_MAT) {
-                ggml_mul_mat_set_hint(projection, GGML_HINT_EXACT_BATCH);
-            }
-        }
-    }
     cb(Qcur_full, "Qcur_full", il);
     cb(Kcur, "Kcur", il);
     cb(Vcur, "Vcur", il);
@@ -440,7 +418,7 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
 
     ggml_tensor * conv_input = build_conv_state(inp, conv_states_all, qkv_mixed, conv_kernel_size, conv_channels, il);
 
-    ggml_tensor * state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs, nullptr, /*allow_inplace=*/true);
+    ggml_tensor * state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
     state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
     cb(state, "state_predelta", il);
 
@@ -496,16 +474,13 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     ggml_tensor * output = build_recurrent_attn(inp, ssm_states_all, q_conv, k_conv, v_conv, gate, beta, state, il);
 
     // z: [head_dim, n_heads, n_tokens, n_seqs] -> [n_heads * n_tokens * n_seqs, head_dim]
-    // a z from separate weights stays a reshape: the fused GDN decode paths match that graph
-    ggml_tensor * z_2d = ggml_is_contiguous(z)
-            ? ggml_reshape_4d(ctx0, z, head_v_dim, num_v_heads, n_seq_tokens, n_seqs)
-            : ggml_view_4d(ctx0, z, head_v_dim, num_v_heads, n_seq_tokens, n_seqs,
-                    ggml_row_size(z->type, head_v_dim), z->nb[1], z->nb[1] * n_seq_tokens, 0);
+    ggml_tensor * z_2d = ggml_view_4d(ctx0, z, head_v_dim, num_v_heads, n_seq_tokens, n_seqs,
+            ggml_row_size(z->type, head_v_dim), z->nb[1], z->nb[1] * n_seq_tokens, 0);
 
     // Apply gated normalization: self.norm(core_attn_out, z)
     ggml_tensor * attn_out_norm = build_norm_gated(output, model.layers[il].ssm_norm, z_2d, il);
 
-    // 2-D: with a [d, n_seq_tokens, n_seqs] src1 the projection is n_seqs matmuls that each read the whole ssm_out weight
+    // Final reshape: [head_dim, n_heads, n_tokens, n_seqs] -> [n_heads * head_dim , n_tokens * n_seqs ]
     ggml_tensor * final_output = ggml_reshape_2d(ctx0, attn_out_norm, head_v_dim * num_v_heads, n_seq_tokens * n_seqs);
     cb(final_output, "final_output", il);
 
@@ -565,7 +540,7 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llm_graph_params & params)
     if (ubatch.token) {
         ggml_tensor * tok_embd_w = layer.nextn.embed_tokens ? layer.nextn.embed_tokens : model.tok_embd;
 
-        tok_embd = build_get_rows(tok_embd_w, inp->tokens);
+        tok_embd = ggml_get_rows(ctx0, tok_embd_w, inp->tokens);
 
         // a Hadamard-latent table stores rotated rows; restore the primal basis
         if (hdmd) {
@@ -687,18 +662,7 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llm_graph_params & params)
     ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;
     ggml_tensor * head_s = layer.nextn.shared_head_head ? layer.nextn.shared_head_head_s : model.output_s;
     GGML_ASSERT(head_w && "QWEN35 MTP: missing LM head (nextn.shared_head_head or model.output)");
-    if (mtp_draft != nullptr && head_w == model.output && n_outputs == 1) {
-        // this context drafts over a row subset of the LM head: scatter its logits into a full-vocab row of -inf
-        GGML_ASSERT(mtp_draft->n_keep == cparams.mtp_draft_vocab);
-        const int64_t n_sel = mtp_draft->head->ne[1];
-        const int64_t n_row = model.output->ne[1];
-        ggml_tensor * sub = build_lora_mm(mtp_draft->head, cur, head_s);
-        cur = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 1, n_row), -INFINITY);
-        cur = ggml_set_rows(ctx0, cur, ggml_reshape_2d(ctx0, sub, 1, n_sel), mtp_draft->ids);
-        cur = ggml_reshape_2d(ctx0, cur, n_row, 1);
-    } else {
-        cur = build_lora_mm(head_w, cur, head_s);
-    }
+    cur = build_lora_mm(head_w, cur, head_s);
     cb(cur, "result_output", -1);
 
     res->t_logits = cur;

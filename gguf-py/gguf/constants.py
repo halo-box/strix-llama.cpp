@@ -325,13 +325,6 @@ class Keys:
         L_CYCLES         = "{arch}.hrm.l_cycles"
         PREFIX_LM        = "{arch}.hrm.prefix_lm"
 
-    class Loop:
-        START     = "{arch}.loop.start"
-        END       = "{arch}.loop.end"
-        COUNT     = "{arch}.loop.count"
-        GATE_RANK = "{arch}.loop.gate_rank"
-        VARYING   = "{arch}.loop.varying"
-
     class Metis:
         PASS_COUNT               = "{arch}.metis.pass_count"
         MEMORY_LENGTH            = "{arch}.metis.memory_length"
@@ -593,18 +586,6 @@ class Keys:
         INVERSE_WEIGHT_NAMES = "prism.hadamard.inverse_weight_names"
         GDN_V_GROUPED        = "prism.hadamard.gdn_v_grouped"
 
-    class AgentionTrellis:
-        STATE_BITS = "agention.trellis.state_bits"  # uint32; TQ2_T / TQK / TQP files must say 15
-
-    class Exl3:
-        VERSION             = "exl3.version"
-        CODEBOOK            = "exl3.codebook"
-        HADAMARD_SIZE       = "exl3.hadamard_size"
-        ROWS_VERSION        = "exl3.rows.version"
-        PERMUTATION         = "exl3.permutation"
-        PERMUTED_TENSORS    = "exl3.permuted_tensors"
-        SOURCE_QUANT_CONFIG = "exl3.source.quantization_config"
-
 
 #
 # recommended mapping of model tensor names for storage in gguf
@@ -793,7 +774,6 @@ class MODEL_ARCH(IntEnum):
     KOLIBRI1         = auto()
     LIMITE           = auto()
     INKLING2         = auto()
-    INKLING2_LOOP    = auto()
 
 
 class VISION_PROJECTOR_TYPE(IntEnum):
@@ -894,19 +874,6 @@ class MODEL_TENSOR(IntEnum):
     MOE_LATENT_UP        = auto() # nemotron 3 super
     FFN_POST_CONV        = auto()
     FFN_RES_QUERY        = auto()
-    LOOP_MSG_QUERY       = auto()
-    LOOP_Q_CTRL_DOWN     = auto()
-    LOOP_Q_CTRL_GAIN     = auto()
-    LOOP_Q_CTRL_FORGET   = auto()
-    LOOP_K_CTRL_DOWN     = auto()
-    LOOP_K_CTRL_GAIN     = auto()
-    LOOP_K_CTRL_FORGET   = auto()
-    LOOP_V_CTRL_DOWN     = auto()
-    LOOP_V_CTRL_GAIN     = auto()
-    LOOP_V_CTRL_FORGET   = auto()
-    LOOP_FFN_CTRL_DOWN   = auto()
-    LOOP_FFN_CTRL_GAIN   = auto()
-    LOOP_FFN_CTRL_FORGET = auto()
     STREAM_EMBD          = auto()
     DEPTH_MEM_STATE_WRITE = auto()
     DEPTH_MEM_META_WRITE = auto()
@@ -1532,8 +1499,6 @@ class MODEL_TENSOR(IntEnum):
     NEXTN_HC_HEAD_NORM     = auto()
     NEXTN_HC_HEAD_DOWN     = auto()
     NEXTN_HC_HEAD_UP       = auto()
-    NEXTN_E_PROJ           = auto() # eh_proj in two parts (EXL3 qwen4exp)
-    NEXTN_H_PROJ           = auto()
     # eagle3
     FC                     = auto()  # feature fusion layer
     D2T                    = auto()  # draft to target vocabulary mapping
@@ -1794,7 +1759,6 @@ MODEL_ARCH_NAMES: dict[MODEL_ARCH, str] = {
     MODEL_ARCH.KOLIBRI1:         "kolibri1",
     MODEL_ARCH.LIMITE:           "limite",
     MODEL_ARCH.INKLING2:         "inkling2",
-    MODEL_ARCH.INKLING2_LOOP:    "inkling2_loop",
 }
 
 VISION_PROJECTOR_TYPE_NAMES: dict[VISION_PROJECTOR_TYPE, str] = {
@@ -1895,19 +1859,6 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.MOE_LATENT_UP:             "blk.{bid}.ffn_latent_up",        # nemotron 3 super
     MODEL_TENSOR.FFN_POST_CONV:             "blk.{bid}.ffn_post_conv",
     MODEL_TENSOR.FFN_RES_QUERY:             "blk.{bid}.ffn_res_query",
-    MODEL_TENSOR.LOOP_MSG_QUERY:            "blk.{bid}.loop_msg_query",
-    MODEL_TENSOR.LOOP_Q_CTRL_DOWN:          "blk.{bid}.loop_q_ctrl_down",
-    MODEL_TENSOR.LOOP_Q_CTRL_GAIN:          "blk.{bid}.loop_q_ctrl_gain",
-    MODEL_TENSOR.LOOP_Q_CTRL_FORGET:        "blk.{bid}.loop_q_ctrl_forget",
-    MODEL_TENSOR.LOOP_K_CTRL_DOWN:          "blk.{bid}.loop_k_ctrl_down",
-    MODEL_TENSOR.LOOP_K_CTRL_GAIN:          "blk.{bid}.loop_k_ctrl_gain",
-    MODEL_TENSOR.LOOP_K_CTRL_FORGET:        "blk.{bid}.loop_k_ctrl_forget",
-    MODEL_TENSOR.LOOP_V_CTRL_DOWN:          "blk.{bid}.loop_v_ctrl_down",
-    MODEL_TENSOR.LOOP_V_CTRL_GAIN:          "blk.{bid}.loop_v_ctrl_gain",
-    MODEL_TENSOR.LOOP_V_CTRL_FORGET:        "blk.{bid}.loop_v_ctrl_forget",
-    MODEL_TENSOR.LOOP_FFN_CTRL_DOWN:        "blk.{bid}.loop_ffn_ctrl_down",
-    MODEL_TENSOR.LOOP_FFN_CTRL_GAIN:        "blk.{bid}.loop_ffn_ctrl_gain",
-    MODEL_TENSOR.LOOP_FFN_CTRL_FORGET:      "blk.{bid}.loop_ffn_ctrl_forget",
     MODEL_TENSOR.STREAM_EMBD:               "stream_embd",
     MODEL_TENSOR.DEPTH_MEM_STATE_WRITE:     "depth_mem_state_write",
     MODEL_TENSOR.DEPTH_MEM_META_WRITE:      "depth_mem_meta_write",
@@ -2574,8 +2525,6 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.NEXTN_HC_HEAD_NORM:        "blk.{bid}.nextn.hc_head_norm",
     MODEL_TENSOR.NEXTN_HC_HEAD_DOWN:        "blk.{bid}.nextn.hc_head_down",
     MODEL_TENSOR.NEXTN_HC_HEAD_UP:          "blk.{bid}.nextn.hc_head_up",
-    MODEL_TENSOR.NEXTN_E_PROJ:              "blk.{bid}.nextn.e_proj",
-    MODEL_TENSOR.NEXTN_H_PROJ:              "blk.{bid}.nextn.h_proj",
     MODEL_TENSOR.FC:                        "fc",
     MODEL_TENSOR.DSPARK_MARKOV_W1:          "markov_w1",
     MODEL_TENSOR.DSPARK_MARKOV_W2:          "markov_w2",
@@ -3874,9 +3823,6 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.NEXTN_HC_HEAD_NORM,
         MODEL_TENSOR.NEXTN_HC_HEAD_DOWN,
         MODEL_TENSOR.NEXTN_HC_HEAD_UP,
-        # EXL3: fc_embedding and fc_hidden stay two linears
-        MODEL_TENSOR.NEXTN_E_PROJ,
-        MODEL_TENSOR.NEXTN_H_PROJ,
     ],
     MODEL_ARCH.PLAMO: [
         MODEL_TENSOR.TOKEN_EMBD,
@@ -6134,7 +6080,6 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
     MODEL_ARCH.LFM2MOE: [
         MODEL_TENSOR.TOKEN_EMBD,
         MODEL_TENSOR.TOKEN_EMBD_NORM,
-        MODEL_TENSOR.OUTPUT, # an untied head (EXL3 checkpoints store one)
         MODEL_TENSOR.SHORTCONV_CONV,
         MODEL_TENSOR.SHORTCONV_INPROJ,
         MODEL_TENSOR.SHORTCONV_OUTPROJ,
@@ -7055,55 +7000,6 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.FFN_POST_CONV,
         MODEL_TENSOR.FFN_RES_QUERY,
     ],
-    MODEL_ARCH.INKLING2_LOOP: [
-        MODEL_TENSOR.TOKEN_EMBD,
-        MODEL_TENSOR.TOKEN_EMBD_NORM,
-        MODEL_TENSOR.OUTPUT,
-        MODEL_TENSOR.OUTPUT_NORM,
-        MODEL_TENSOR.OUTPUT_RES_QUERY,
-        MODEL_TENSOR.ATTN_NORM,
-        MODEL_TENSOR.ATTN_Q,
-        MODEL_TENSOR.ATTN_K,
-        MODEL_TENSOR.ATTN_V,
-        MODEL_TENSOR.ATTN_OUT,
-        MODEL_TENSOR.ATTN_GATE,
-        MODEL_TENSOR.ATTN_REL,
-        MODEL_TENSOR.ATTN_REL_BIAS,
-        MODEL_TENSOR.ATTN_Q_CLIP,
-        MODEL_TENSOR.ATTN_REL_CLIP,
-        MODEL_TENSOR.ATTN_SINK_PROJ,
-        MODEL_TENSOR.ATTN_Q_INP_NORM,
-        MODEL_TENSOR.ATTN_K_INP_NORM,
-        MODEL_TENSOR.ATTN_V_INP_NORM,
-        MODEL_TENSOR.ATTN_K_CONV,
-        MODEL_TENSOR.ATTN_V_CONV,
-        MODEL_TENSOR.ATTN_K_CONV_PROJ,
-        MODEL_TENSOR.ATTN_V_CONV_PROJ,
-        MODEL_TENSOR.ATTN_POST_CONV,
-        MODEL_TENSOR.ATTN_RES_QUERY,
-        MODEL_TENSOR.FFN_NORM,
-        MODEL_TENSOR.FFN_GATE_INP,
-        MODEL_TENSOR.FFN_EXP_PROBS_B,
-        MODEL_TENSOR.FFN_GATE_EXP,
-        MODEL_TENSOR.FFN_UP_EXP,
-        MODEL_TENSOR.FFN_GATE_UP_EXP,
-        MODEL_TENSOR.FFN_DOWN_EXP,
-        MODEL_TENSOR.FFN_POST_CONV,
-        MODEL_TENSOR.FFN_RES_QUERY,
-        MODEL_TENSOR.LOOP_MSG_QUERY,
-        MODEL_TENSOR.LOOP_Q_CTRL_DOWN,
-        MODEL_TENSOR.LOOP_Q_CTRL_GAIN,
-        MODEL_TENSOR.LOOP_Q_CTRL_FORGET,
-        MODEL_TENSOR.LOOP_K_CTRL_DOWN,
-        MODEL_TENSOR.LOOP_K_CTRL_GAIN,
-        MODEL_TENSOR.LOOP_K_CTRL_FORGET,
-        MODEL_TENSOR.LOOP_V_CTRL_DOWN,
-        MODEL_TENSOR.LOOP_V_CTRL_GAIN,
-        MODEL_TENSOR.LOOP_V_CTRL_FORGET,
-        MODEL_TENSOR.LOOP_FFN_CTRL_DOWN,
-        MODEL_TENSOR.LOOP_FFN_CTRL_GAIN,
-        MODEL_TENSOR.LOOP_FFN_CTRL_FORGET,
-    ],
 }
 
 # tensors that will not be serialized
@@ -7254,20 +7150,7 @@ class GGMLQuantizationType(IntEnum):
     MXFP4   = 39
     NVFP4   = 40
     Q1_0    = 41
-    Q4_0_ROCMFP4      = 100
-    Q4_0_ROCMFP4_FAST = 101
-    Q6_0_ROCMFPX      = 102
-    Q8_0_ROCMFPX      = 103
-    Q3_0_ROCMFPX      = 104
-    Q2_0_ROCMFPX      = 107
     Q2_0    = 42
-    PTQ1_0  = 143
-    TQ2_T   = 144
-    TQK6    = 145
-    TQK7    = 146
-    TQP5    = 147
-    TQP6    = 148
-    TQP7    = 149
     F8_E4M3 = 43
 
 
@@ -7326,30 +7209,6 @@ class LlamaFileType(IntEnum):
     MOSTLY_Q1_0          = 40  # except 1d tensors
     MOSTLY_Q2_0          = 41  # except 1d tensors
     MOSTLY_F8_E4M3       = 42  # except 1d tensors
-
-    MOSTLY_Q4_0_ROCMFP4          = 100
-    MOSTLY_Q4_0_ROCMFP4_LEAN     = 101
-    MOSTLY_Q4_0_ROCMFP4_COHERENT = 102
-    MOSTLY_Q4_0_ROCMFP4_FAST     = 103
-    MOSTLY_Q4_0_ROCMFP4_FAST_COHERENT = 104
-    MOSTLY_Q4_0_ROCMFP4_STRIX    = 105
-    MOSTLY_Q4_0_ROCMFP4_STRIX_LEAN = 106
-    MOSTLY_Q6_0_ROCMFPX          = 110
-    MOSTLY_Q8_0_ROCMFPX          = 111
-    MOSTLY_Q3_0_ROCMFPX          = 112
-    MOSTLY_Q3_0_ROCMFPX_AGENT    = 113
-    MOSTLY_Q6_0_ROCMFPX_AGENT    = 114
-    MOSTLY_Q8_0_ROCMFPX_AGENT    = 115
-    MOSTLY_Q6_0_ROCMFPX_LEAN     = 116
-    MOSTLY_Q6_0_ROCMFPX_AGENT_LEAN = 117
-    MOSTLY_Q2_0_ROCMFPX  = 119  # as in charlie12345/ROCmFPX (ciru-ai uses 122 and puts Q7_0_ROCMFPX here)
-    MOSTLY_PTQ1_0        = 143  # except 1d tensors
-    MOSTLY_TQ2_T         = 144  # except 1d tensors
-    MOSTLY_TQK6          = 145  # except 1d tensors
-    MOSTLY_TQK7          = 146  # except 1d tensors
-    MOSTLY_TQP5          = 147  # except 1d tensors
-    MOSTLY_TQP6          = 148  # except 1d tensors
-    MOSTLY_TQP7          = 149  # except 1d tensors
 
     GUESSED              = 1024  # not specified in the model file
 
@@ -7535,20 +7394,7 @@ GGML_QUANT_SIZES: dict[GGMLQuantizationType, tuple[int, int]] = {
     GGMLQuantizationType.MXFP4:   (32, 1 + 16),
     GGMLQuantizationType.NVFP4:   (64, 4 + 32),
     GGMLQuantizationType.Q1_0:    (128, 2 + 16),
-    GGMLQuantizationType.Q4_0_ROCMFP4:      (32, 2 + 16),
-    GGMLQuantizationType.Q4_0_ROCMFP4_FAST: (32, 1 + 16),
-    GGMLQuantizationType.Q6_0_ROCMFPX:      (32, 24 + 2),
-    GGMLQuantizationType.Q8_0_ROCMFPX:      (32, 32 + 1),
-    GGMLQuantizationType.Q3_0_ROCMFPX:      (32, 12 + 2),
-    GGMLQuantizationType.Q2_0_ROCMFPX:      (32, 8 + 2),
     GGMLQuantizationType.Q2_0:    (64, 2 + 16),
-    GGMLQuantizationType.PTQ1_0:  (128, 24 + 2 + 2),
-    GGMLQuantizationType.TQ2_T:   (128, 2 + 32),
-    GGMLQuantizationType.TQK6:    (128, 2 + 24),
-    GGMLQuantizationType.TQK7:    (128, 2 + 28),
-    GGMLQuantizationType.TQP5:    (128, 2 + 40),
-    GGMLQuantizationType.TQP6:    (128, 2 + 48),
-    GGMLQuantizationType.TQP7:    (128, 2 + 56),
     GGMLQuantizationType.F8_E4M3: (1, 1),
 }
 

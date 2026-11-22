@@ -26,7 +26,6 @@ enum server_task_type {
     SERVER_TASK_TYPE_NEXT_RESPONSE,
     SERVER_TASK_TYPE_METRICS,
     SERVER_TASK_TYPE_SLOT_GET,
-    SERVER_TASK_TYPE_DASHBOARD, // used by /dashboard/stats
     SERVER_TASK_TYPE_SLOT_SAVE,
     SERVER_TASK_TYPE_SLOT_RESTORE,
     SERVER_TASK_TYPE_SLOT_ERASE,
@@ -97,6 +96,7 @@ struct task_params {
 
     std::map<int, float> lora; // mapping adapter ID -> scale
 
+    common_json hooks_data; // HOOK(server-task-params): request data kept by the server hooks
     std::vector<std::string> antiprompt;
     std::vector<std::string> response_fields;
 
@@ -409,9 +409,6 @@ struct completion_token_output {
 struct server_task_result_cmpl_final : server_task_result {
     common_chat_input content;
     llama_tokens tokens;
-    const llama_vocab * vocab_usage = nullptr;
-    int32_t n_reasoning_tokens = 0;
-
 
     bool stream;
     bool include_usage;
@@ -466,8 +463,6 @@ struct server_task_result_cmpl_final : server_task_result {
     json to_json_non_oaicompat();
 
     json usage_json_oaicompat();
-    int32_t count_reasoning_tokens();
-
 
     json to_json_oaicompat();
 
@@ -633,15 +628,6 @@ struct server_task_result_metrics : server_task_result {
         double value; // prometheus values are always float64
     };
     std::string to_metrics();
-};
-
-// used by /dashboard/stats
-struct server_task_result_dashboard : server_task_result {
-    json data;
-
-    virtual json to_json() override {
-        return data;
-    }
 };
 
 // used by /slots API

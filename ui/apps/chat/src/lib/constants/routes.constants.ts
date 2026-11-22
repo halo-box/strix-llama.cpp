@@ -23,12 +23,6 @@ export const ROUTES = {
 	START: '#/'
 } as const;
 
-/**
- * llama-server's monitoring page. Relative so it resolves next to the UI,
- * including when the server runs under `--api-prefix`.
- */
-export const SERVER_DASHBOARD_URL = './dashboard';
-
 /** SvelteKit route id of the models manager, as `page.route.id` reports it. */
 export const MODELS_ROUTE_ID = '/models';
 

@@ -30,9 +30,6 @@ constexpr float MAX_DOT_PRODUCT_ERROR_LOWBIT = 0.04f;
 constexpr float MAX_DOT_PRODUCT_ERROR_FP4 = 0.03f;
 constexpr float MAX_DOT_PRODUCT_ERROR_BINARY = 0.40f;
 constexpr float MAX_DOT_PRODUCT_ERROR_TERNARY = 0.15f;
-// TQK6/TQK7 from_float is a greedy placeholder over a Gaussian codebook (real files come
-// from an offline encoder); on this cosine (arcsine-distributed) data it lands at 0.40-0.47.
-constexpr float MAX_DOT_PRODUCT_ERROR_TRELLIS_PLACEHOLDER = 0.60f;
 
 static const char* RESULT_STR[] = {"ok", "FAILED"};
 
@@ -159,38 +156,6 @@ static int test_vec_dot_f32(bool verbose) {
     return num_failed;
 }
 
-#ifdef GGML_USE_TRELLIS
-// Check arithmetic separately from the unavoidable loss of ternary quantization.
-static int test_vec_dot_ptq1_0(bool verbose) {
-    const auto * q = ggml_get_type_traits(GGML_TYPE_PTQ1_0);
-    const auto * cpu = ggml_get_type_traits_cpu(GGML_TYPE_PTQ1_0);
-    const auto * v = ggml_get_type_traits(cpu->vec_dot_type);
-    const auto * vcpu = ggml_get_type_traits_cpu(cpu->vec_dot_type);
-    int num_failed = 0;
-    for (int n : {128, 256, 384, 4096, 5120, 17408}) {
-        std::vector<float> a(n), b(n), da(n), db(n);
-        std::vector<uint8_t> qa(ggml_row_size(GGML_TYPE_PTQ1_0, n));
-        std::vector<uint8_t> qb(ggml_row_size(cpu->vec_dot_type, n));
-        generate_data(0.0f, n, a.data());
-        generate_data(1.0f, n, b.data());
-        cpu->from_float(a.data(), qa.data(), n);
-        vcpu->from_float(b.data(), qb.data(), n);
-        q->to_float(qa.data(), da.data(), n);
-        v->to_float(qb.data(), db.data(), n);
-        float result = INFINITY;
-        cpu->vec_dot(n, &result, 0, qa.data(), 0, qb.data(), 0, 1);
-        const float ref = dot_product(da.data(), db.data(), n);
-        const float error = fabsf(result - ref) / n;
-        const bool failed = !(error < MAX_QUANTIZATION_REFERENCE_ERROR);
-        num_failed += failed;
-        if (failed || verbose) {
-            printf("ptq1_0 dequantized dot n=%5d: %s (ref=%f got=%f err=%f)\n",
-                   n, RESULT_STR[failed], ref, result, error);
-        }
-    }
-    return num_failed;
-}
-#endif // GGML_USE_TRELLIS
 // Positive finite E4M3 values in encoding order, from OCP FP8 rev. 1.1, section 5.1.
 static const float F8_E4M3_VALUES[] = {
     0.0f, 0.001953125f, 0.00390625f, 0.005859375f, 0.0078125f, 0.009765625f, 0.01171875f, 0.013671875f,
@@ -371,16 +336,6 @@ static int test_vec_dot_q(bool verbose) {
             const float total_error = total_quantization_error(qfns, qfns_cpu, test_size, test_data.data());
             const float max_quantization_error =
                 type == GGML_TYPE_Q1_0    ? MAX_QUANTIZATION_TOTAL_ERROR_BINARY :
-                type == GGML_TYPE_PTQ1_0  ? MAX_QUANTIZATION_TOTAL_ERROR_TERNARY :
-                // TQ2_T's from_float is a greedy placeholder (real files come from an
-                // offline encoder), and this cosine data is far from the Gaussian
-                // its codebook targets: hold it to the binary-class bounds.
-                type == GGML_TYPE_TQ2_T   ? MAX_QUANTIZATION_TOTAL_ERROR_BINARY :
-                // TQK6 / TQK7: same placeholder encoder and codebook, same bounds.
-                type == GGML_TYPE_TQK6    ? MAX_QUANTIZATION_TOTAL_ERROR_BINARY :
-                type == GGML_TYPE_TQK7    ? MAX_QUANTIZATION_TOTAL_ERROR_BINARY :
-                // TQP5 / TQP6 / TQP7: same placeholder scheme (pair codebook), same bounds.
-                type == GGML_TYPE_TQP5 || type == GGML_TYPE_TQP6 || type == GGML_TYPE_TQP7 ? MAX_QUANTIZATION_TOTAL_ERROR_BINARY :
                 type == GGML_TYPE_TQ1_0   ? MAX_QUANTIZATION_TOTAL_ERROR_TERNARY :
                 type == GGML_TYPE_TQ2_0   ? MAX_QUANTIZATION_TOTAL_ERROR_TERNARY :
                 type == GGML_TYPE_Q2_0    ? MAX_QUANTIZATION_TOTAL_ERROR_TERNARY :
@@ -389,10 +344,7 @@ static int test_vec_dot_q(bool verbose) {
                 type == GGML_TYPE_Q3_K    ? MAX_QUANTIZATION_TOTAL_ERROR_3BITS :
                 type == GGML_TYPE_IQ3_S   ? MAX_QUANTIZATION_TOTAL_ERROR_3BITS :
                 type == GGML_TYPE_IQ3_XXS ? MAX_QUANTIZATION_TOTAL_ERROR_3BITS_XXS :
-                type == GGML_TYPE_NVFP4   ? MAX_QUANTIZATION_TOTAL_ERROR_FP4 :
-                // ROCmFPx sub-4-bit types: same budget as the other types of their width
-                type == GGML_TYPE_Q3_0_ROCMFPX ? MAX_QUANTIZATION_TOTAL_ERROR_3BITS :
-                type == GGML_TYPE_Q2_0_ROCMFPX ? MAX_QUANTIZATION_TOTAL_ERROR_2BITS : MAX_QUANTIZATION_TOTAL_ERROR;
+                type == GGML_TYPE_NVFP4   ? MAX_QUANTIZATION_TOTAL_ERROR_FP4 : MAX_QUANTIZATION_TOTAL_ERROR;
             bool failed = !(total_error < max_quantization_error);
             num_failed += failed;
             if (failed || verbose) {
@@ -408,20 +360,11 @@ static int test_vec_dot_q(bool verbose) {
 
             const float vec_dot_error = dot_product_error(qfns_cpu, type, test_size, test_data.data(), test_data2.data(), nullptr, nullptr, 1);
             const float max_allowed_error = type == GGML_TYPE_Q2_K || type == GGML_TYPE_IQ2_XS || type == GGML_TYPE_IQ2_XXS ||
-                type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_IQ3_S || type == GGML_TYPE_IQ2_S ||
-                type == GGML_TYPE_Q3_0_ROCMFPX
+                type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_IQ3_S || type == GGML_TYPE_IQ2_S
                 ? MAX_DOT_PRODUCT_ERROR_LOWBIT
-                : type == GGML_TYPE_TQ2_T
-                ? MAX_DOT_PRODUCT_ERROR_BINARY
-                : type == GGML_TYPE_TQK6 || type == GGML_TYPE_TQK7 ||
-                  type == GGML_TYPE_TQP5 || type == GGML_TYPE_TQP6 || type == GGML_TYPE_TQP7
-                ? MAX_DOT_PRODUCT_ERROR_TRELLIS_PLACEHOLDER
-                : type == GGML_TYPE_PTQ1_0
-                ? MAX_DOT_PRODUCT_ERROR_TERNARY
                 : type == GGML_TYPE_Q1_0
                 ? MAX_DOT_PRODUCT_ERROR_BINARY
-                : type == GGML_TYPE_TQ1_0 || type == GGML_TYPE_TQ2_0 || type == GGML_TYPE_Q2_0 ||
-                  type == GGML_TYPE_Q2_0_ROCMFPX
+                : type == GGML_TYPE_TQ1_0 || type == GGML_TYPE_TQ2_0 || type == GGML_TYPE_Q2_0
                 ? MAX_DOT_PRODUCT_ERROR_TERNARY
                 : type == GGML_TYPE_NVFP4
                 ? MAX_DOT_PRODUCT_ERROR_FP4
@@ -506,9 +449,6 @@ int main(int argc, char * argv[]) {
     num_failed += test_f8_e4m3(verbose);
     num_failed += test_vec_dot_q(verbose);
     num_failed += test_quantize_imatrix_degenerate(verbose);
-#ifdef GGML_USE_TRELLIS
-    num_failed += test_vec_dot_ptq1_0(verbose);
-#endif
 
     if (num_failed || verbose) {
         printf("%d tests failed\n", num_failed);

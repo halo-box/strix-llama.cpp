@@ -5,12 +5,7 @@
 #include "ggml.h"
 
 #ifdef GGML_CUDA_USE_CUB
-#   ifdef GGML_CUDA_CUB_IS_HIPCUB
-#       include <hipcub/hipcub.hpp>
-namespace cub = hipcub;
-#   else
-#       include <cub/cub.cuh>
-#   endif // GGML_CUDA_CUB_IS_HIPCUB
+#   include <cub/cub.cuh>
 #endif // GGML_CUDA_USE_CUB
 
 template<typename T, int BLOCK_SIZE>
@@ -200,18 +195,18 @@ static void cumsum_cub(ggml_cuda_pool & pool,
     size_t tmp_size = 0;
 
     // Query how much temp storage CUDA UnBound (CUB) needs
-    CUDA_CHECK(cub::DeviceScan::InclusiveSum(nullptr,   // d_temp_storage (null = just query size)
+    cub::DeviceScan::InclusiveSum(nullptr,   // d_temp_storage (null = just query size)
                                   tmp_size,  // reference to size (will be set by CUB)
                                   src,       // input pointer
                                   dst,       // output pointer
                                   ne,        // number of elements
                                   stream     // CUDA stream to use
-    ));
+    );
 
     ggml_cuda_pool_alloc<uint8_t> tmp_alloc(pool, tmp_size);
 
     // Perform the inclusive scan
-    CUDA_CHECK(cub::DeviceScan::InclusiveSum((void *) tmp_alloc.get(), tmp_size, src, dst, ne, stream));
+    cub::DeviceScan::InclusiveSum((void *) tmp_alloc.get(), tmp_size, src, dst, ne, stream);
 }
 #endif // GGML_CUDA_USE_CUB
 

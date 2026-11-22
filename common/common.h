@@ -10,7 +10,6 @@
 
 #include <array>
 #include <list>
-#include <memory>
 #include <set>
 #include <sstream>
 #include <string>
@@ -294,31 +293,12 @@ struct common_params_sampling {
 
     // reasoning budget sampler parameters
     // these are populated by the server/CLI based on chat template params
-    bool reasoning_budget_enabled =
-        false;  // Master switch for the budget, soft warnings, intro, grace, and reasoning control.
     int32_t                   reasoning_budget_tokens   = -1;  // -1 = disabled, >= 0 = token budget
-    std::vector<llama_token>  reasoning_budget_start;          // Start tag token sequence.
-    std::vector<llama_tokens> reasoning_budget_end;            // End tag token sequences. First is forced.
-    std::vector<llama_token>  reasoning_budget_forced;         // Forced sequence: message and first end tag.
-    std::string               reasoning_budget_message;        // Message injected before the forced end tag.
-    bool                      reasoning_control = false;       // Create sampler for runtime reasoning control.
-
-    float reasoning_budget_soft_ratio = -1.0f;  // <= 0 disables the first soft warning.
-    std::vector<llama_token> reasoning_budget_soft_forced;
-    std::string              reasoning_budget_soft_message;
-
-    float                    reasoning_budget_soft2_ratio = -1.0f;
-    std::vector<llama_token> reasoning_budget_soft2_forced;
-    std::string              reasoning_budget_soft2_message;
-
-    std::vector<llama_token> reasoning_budget_intro_forced;
-    std::string reasoning_budget_intro_message =
-        "I'll keep this reasoning under {budget} tokens, so I'll stay focused and efficient. ";
-    std::string reasoning_budget_intro_mode =
-        "every";
-
-    int32_t reasoning_budget_grace_tokens =
-        0;  // <= 0 forces immediately. Positive values wait for a paragraph break.
+    std::vector<llama_token>  reasoning_budget_start;          // start tag token sequence
+    std::vector<llama_tokens> reasoning_budget_end;            // end tag token sequences; the first tag is used as the forcing sequence
+    std::vector<llama_token>  reasoning_budget_forced;         // forced sequence (message + first end tag)
+    std::string               reasoning_budget_message;        // message injected before end tag when budget exhausted
+    bool                      reasoning_control = false;       // create the budget sampler on demand so reasoning can be ended at runtime
 
     bool backend_sampling = false;
 
@@ -332,7 +312,6 @@ struct common_params_model {
     std::string hf_repo     = ""; // HF repo
     std::string hf_file     = ""; // HF file
     std::string docker_repo = ""; // Docker repo
-    std::string ple         = ""; // GGUF with per-layer embedding tables used instead of the model's own
 
     std::vector<std::string> shards;
 
@@ -369,11 +348,6 @@ struct common_params_speculative_draft {
     float p_split = 0.1f; // speculative decoding split probability
     float p_min   = 0.0f; // minimum speculative decoding probability (greedy)
 
-    // Qwen3.8-Flash-Next, gfx1151 HIP, 2026-10-22: K4096 vs K16384 gave 29.218 vs 28.563 tok/s at d0 and 33.237 vs 32.452 at d40000; head time fell 19.5%, with no omitted winners or acceptance change.
-    // Throughput was not separated beyond one SD (K4096 n=6/4, K16384 n=6/2); K4096 is opt-in and off by default until measured further; 0 keeps the full head.
-    // Revisit after a paired measurement separates throughput beyond the noise floor on the qualified model/backend.
-    int32_t vocab_dynamic = 0;
-
     bool backend_sampling = true; // offload draft sampling to the backend (default: on)
 
     bool probabilistic = false; // sample the draft and verify by rejection, instead of argmax and match
@@ -389,18 +363,6 @@ struct common_params_speculative_draft {
 
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
     ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
-
-    // size each draft from measured acceptance instead of always drafting n_max
-    bool adaptive = false;
-    // server: no new drafts while more than this many slots are generating (0 = no limit)
-    int32_t max_slots = 0;
-
-    // MTP only: draft over token ids < N plus control tokens (0 = full vocabulary)
-    int32_t mtp_vocab = 0;
-    // MTP only (7a, Gufo #603): stop the draft chain before a token whose inclusion drops the product of the drafts' top-1
-    // probabilities below this (0 = off); the first draft token is always kept. Width-only: the emitted stream is unchanged
-    // (hi5/ITEM7-DRAFT-POLICY.md section 1) when the verify batch computes each row as the one-row decode does.
-    float mtp_pcum = 0.0f;
 
     common_cpu_params cpuparams;
     common_cpu_params cpuparams_batch;
@@ -428,20 +390,6 @@ struct common_params_speculative_ngram_cache {
     std::string lookup_cache_dynamic; // path of dynamic ngram cache file for lookup decoding
 };
 
-struct common_params_speculative_prefill {
-    bool                enabled          = false; // enable speculative prefill
-    common_params_model model;                    // draft model for speculative prefill
-    int32_t             n_ctx            = 0;     // context size for draft model (0 = default/target context size)
-    int32_t             n_gpu_layers     = -1;    // max draft model layers to store in VRAM (-1 - use default)
-    std::vector<ggml_backend_dev_t> devices;      // devices to use for offloading the draft model
-    float               percentage       = 0.3f;  // fraction of prompt tokens to retain (0.0 < p <= 1.0)
-    int32_t             chunk_size       = 32;    // chunk grouping size (0 to disable chunking)
-    int32_t             look_ahead_cnt   = 8;     // lookahead decode steps on draft model
-    int32_t             pool_kernel_size = 13;    // 1D average pooling kernel size for smoothing
-    bool                keep_bos         = true;  // preserve first token (BOS)
-    bool                keep_last        = true;  // preserve last token / tail chunk
-};
-
 struct common_params_speculative {
     std::vector<enum common_speculative_type> types = { COMMON_SPECULATIVE_TYPE_NONE };
 
@@ -458,8 +406,6 @@ struct common_params_speculative {
 
     common_params_speculative_ngram_cache ngram_cache;
 
-    common_params_speculative_prefill prefill;
-
     bool has_dft() const {
         return !draft.mparams.empty();
     }
@@ -467,13 +413,6 @@ struct common_params_speculative {
     bool has_synth() const {
         return synth_len != -1.0 || !synth_rates.empty();
     }
-
-    bool has_prefill() const {
-        return prefill.enabled && !prefill.model.empty();
-    }
-
-    // cap on the rollback snapshot slots, -1 = follow draft.n_max (see need_n_rs_seq)
-    int32_t n_rs_seq_max = -1;
 
     uint32_t need_n_rs_seq() const {
         bool needs_rs_seq = std::any_of(types.begin(), types.end(), [&](auto t) {
@@ -485,16 +424,7 @@ struct common_params_speculative {
                    t == COMMON_SPECULATIVE_TYPE_DRAFT_LILICORR;
         });
 
-        if (!needs_rs_seq) {
-            return 0u;
-        }
-
-        // the recurrent cache holds (1 + n_rs_seq) copies of every sequence's state, which on a
-        // large linear-attention model is GiBs. Capping trades speed for memory: a rollback
-        // deeper than n_rs_seq is still correct, it just falls back to the host checkpoint.
-        const int32_t n = n_rs_seq_max >= 0 ? std::min(n_rs_seq_max, draft.n_max) : draft.n_max;
-
-        return (uint32_t) std::max(0, n);
+        return needs_rs_seq ? draft.n_max : 0u;
     }
 };
 
@@ -731,8 +661,6 @@ struct common_params {
     int32_t n_ctx_checkpoints   = 32;    // max number of context checkpoints per slot
     int32_t kv_unified_per_slot = 0;     // max context per parallel slot; 0 = unset
     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
-    std::string ctx_checkpoints_dir;     // context checkpoints beyond ctx_checkpoints_ram_mib go to unlinked files here
-    int32_t ctx_checkpoints_ram_mib = 8192; // with ctx_checkpoints_dir: checkpoint memory kept before the oldest are written
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
     bool    cache_ram_explicit  = false; // set by --cache-ram, decision models disable the cache otherwise
 
@@ -1404,13 +1332,6 @@ struct common_no_init_allocator : std::allocator<T> {
 // sequence state data, filled by llama_state_seq_get_data_ext()
 using common_state_data = std::vector<uint8_t, common_no_init_allocator<uint8_t>>;
 
-// the target and draft state of a context checkpoint moved out of memory by common_prompt_checkpoint::spill()
-struct common_prompt_checkpoint_file {
-    int fd = -1; // an unlinked file: closing the last descriptor (or a crash) frees it
-
-    ~common_prompt_checkpoint_file();
-};
-
 struct common_prompt_checkpoint {
     int64_t n_tokens;
 
@@ -1427,27 +1348,7 @@ struct common_prompt_checkpoint {
     // (e.g. eagle3's deferred-boundary g_embd row)
     std::vector<uint8_t> data_spec;
 
-    // (optional) data_tgt and data_dft after spill(): they are empty, and the state is in this file
-    // copies of the checkpoint share the file, the last one closes it
-    std::shared_ptr<common_prompt_checkpoint_file> file;
-    size_t file_size_tgt = 0;
-    size_t file_size_dft = 0;
-    size_t file_off_dft  = 0; // where the draft state starts in the file: clear_tgt() zeroes file_size_tgt, not this
-
-    // the size of the state, in memory or in the file
     size_t size() const;
-    size_t size_tgt() const;
-    size_t size_dft() const;
-
-    // the bytes held in memory: a spilled target and draft state do not count
-    size_t size_mem() const;
-
-    // moves data_tgt and data_dft into an unlinked file in dir; false if that failed (errno says why, the data stays in memory)
-    bool spill(const std::string & dir);
-
-    // copy the target / draft state, from memory or from the file, to dst (size_tgt() / size_dft() bytes)
-    bool copy_tgt(uint8_t * dst) const;
-    bool copy_dft(uint8_t * dst) const;
 
     bool empty() const;
     void clear();

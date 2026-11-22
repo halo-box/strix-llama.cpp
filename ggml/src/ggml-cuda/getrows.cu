@@ -1,9 +1,6 @@
 #include "getrows.cuh"
 #include "dequantize.cuh"
 #include "convert.cuh"
-#ifdef GGML_USE_TRELLIS
-#include "tq.cuh"
-#endif
 
 template<int qk, int qr, dequantize_kernel_t dequantize_kernel, typename dst_t>
 static __global__ void k_get_rows(
@@ -100,38 +97,6 @@ static __global__ void k_get_rows_float(
 
         for (int64_t i00 = blockIdx.y*blockDim.x + threadIdx.x; i00 < ne00; i00 += gridDim.y*blockDim.x) {
             dst_row[i00] = ggml_cuda_cast<dst_t>(src0_row[i00]);
-        }
-    }
-}
-
-template<typename src0_t, typename dst_t, int cols, int values_per_lane = 1>
-static __global__ void k_get_rows_float_packed(
-        const src0_t * src0, const int32_t * src1, dst_t * dst,
-        const int64_t ne00, const int64_t ne10, const int64_t ne11, const uint3 ne12_fdv,
-        const size_t s1, const size_t s2, const size_t s3,
-        const size_t nb01, const size_t nb02, const size_t nb03,
-        const size_t s10, const size_t s11, const size_t s12) {
-    constexpr int rows_per_block = CUDA_GET_ROWS_BLOCK_SIZE / cols;
-    const int64_t row = int64_t(blockIdx.x) * rows_per_block + threadIdx.x / cols;
-    const int col = threadIdx.x % cols;
-
-    ggml_cuda_pdl_lc();
-    ggml_cuda_pdl_sync();
-    if (row >= ne10 || col >= ne00) {
-        return;
-    }
-
-    for (int64_t z = blockIdx.y; z < ne11 * int64_t(ne12_fdv.z); z += gridDim.y) {
-        const uint2 dm = fast_div_modulo(uint32_t(z), ne12_fdv);
-        const int32_t index = src1[row * s10 + dm.x * s11 + dm.y * s12];
-        const src0_t * src_row = (const src0_t *) ((const char *) src0 + index * nb01 + dm.x * nb02 + dm.y * nb03);
-        dst_t * dst_row = dst + row * s1 + dm.x * s2 + dm.y * s3;
-#pragma unroll
-        for (int v = 0; v < values_per_lane; ++v) {
-            const int column = col + v * cols;
-            if (column < ne00) {
-                dst_row[column] = ggml_cuda_cast<dst_t>(src_row[column]);
-            }
         }
     }
 }
@@ -265,80 +230,6 @@ static void get_rows_cuda_kq(
         s10, s11, s12/*, s13*/);
 }
 
-#ifdef GGML_USE_TRELLIS
-// Trellis types: TQ_LANES threads per 128-weight block, codebook read through the cache
-// (a get_rows CTA touches too few blocks to amortize a shared-memory copy).
-#define CUDA_GET_ROWS_TQ_BLOCK_SIZE 256
-
-template<ggml_type type, typename dst_t>
-static __global__ void k_get_rows_tq(
-        const void * __restrict__ src0, const int32_t * __restrict__ src1, dst_t * __restrict__ dst,
-        const int64_t ne00, const int64_t ne11, const uint3 ne12_fdv,
-        const size_t s1, const size_t s2, const size_t s3,
-        const size_t nb01, const size_t nb02, const size_t nb03,
-        const size_t s10, const size_t s11, const size_t s12) {
-    typedef typename tq_block_info<type>::block_t block_t;
-
-    ggml_cuda_pdl_sync();
-    const int64_t nb   = ne00/QK_TQK; // blocks per row
-    const int     lane = threadIdx.x % TQ_LANES;
-    const uint32_t * lut = tq_lut_global();
-    for (int64_t z = blockIdx.z; z < ne11*(int64_t)ne12_fdv.z; z += gridDim.z) {
-        // The x and y dimensions of the grid are swapped because the maximum allowed grid size for x is higher.
-        const int i10 = blockIdx.x;
-        const uint2 dm  = fast_div_modulo((uint32_t)z, ne12_fdv);
-        const int i11 = dm.x;
-        const int i12 = dm.y;
-
-        const int i01 = src1[i10*s10 + i11*s11 + i12*s12];
-
-        dst_t * dst_row = dst + i10*s1 + i11*s2 + i12*s3;
-        const block_t * src0_row = (const block_t *) ((const char *) src0 + i01*nb01 + i11*nb02 + i12*nb03);
-
-        for (int64_t ib = (int64_t) blockIdx.y*(blockDim.x/TQ_LANES) + threadIdx.x/TQ_LANES; ib < nb;
-                ib += (int64_t) gridDim.y*(blockDim.x/TQ_LANES)) {
-            float v[16];
-            tq_dequant_lane<type>(src0_row + ib, lane, lut, v);
-            dst_t * y = dst_row + ib*QK_TQK + 16*lane;
-#pragma unroll
-            for (int j = 0; j < 16; ++j) {
-                y[j] = ggml_cuda_cast<dst_t>(v[j]);
-            }
-        }
-    }
-}
-
-template<ggml_type type, typename dst_t>
-static void get_rows_cuda_tq(
-        const void * src0_d, const int32_t * src1_d, dst_t * dst_d,
-        const int64_t ne00, const size_t nb01, const size_t nb02, const size_t nb03,
-        const int64_t ne10, const int64_t ne11, const int64_t ne12, const size_t nb10, const size_t nb11, const size_t nb12,
-        const size_t nb1, const size_t nb2, const size_t nb3,
-        cudaStream_t stream) {
-    GGML_ASSERT(ne00 % QK_TQK == 0);
-    const int64_t nb = ne00/QK_TQK;
-    const int64_t blocks_per_cta = CUDA_GET_ROWS_TQ_BLOCK_SIZE/TQ_LANES;
-
-    const dim3 block_dims(CUDA_GET_ROWS_TQ_BLOCK_SIZE, 1, 1);
-    const dim3 block_nums(ne10, MIN((nb + blocks_per_cta - 1)/blocks_per_cta, UINT16_MAX), MIN(ne11*ne12, UINT16_MAX));
-
-    const size_t s1 = nb1 / sizeof(dst_t);
-    const size_t s2 = nb2 / sizeof(dst_t);
-    const size_t s3 = nb3 / sizeof(dst_t);
-
-    const size_t s10 = nb10 / sizeof(int32_t);
-    const size_t s11 = nb11 / sizeof(int32_t);
-    const size_t s12 = nb12 / sizeof(int32_t);
-
-    GGML_ASSERT(ne12 > 0);
-    GGML_ASSERT(ne11 <= std::numeric_limits<uint32_t>::max() / ne12);
-    const uint3 ne12_fdv = init_fastdiv_values(ne12);
-
-    k_get_rows_tq<type, dst_t><<<block_nums, block_dims, 0, stream>>>(
-        src0_d, src1_d, dst_d, ne00, ne11, ne12_fdv, s1, s2, s3, nb01, nb02, nb03, s10, s11, s12);
-}
-#endif // GGML_USE_TRELLIS
-
 template<typename src0_t, typename dst_t>
 static void get_rows_cuda_float(
         const src0_t * src0_d, const int32_t * src1_d, dst_t * dst_d,
@@ -362,41 +253,6 @@ static void get_rows_cuda_float(
     GGML_ASSERT(ne12 > 0);
     GGML_ASSERT(ne11 <= std::numeric_limits<uint32_t>::max() / ne12);
     const uint3 ne12_fdv = init_fastdiv_values(ne12);
-
-    if constexpr (std::is_same<dst_t, float>::value &&
-                  (std::is_same<src0_t, float>::value || std::is_same<src0_t, half>::value)) {
-        if (ne00 > 0 && ne00 <= 128 && ne10 >= 128 &&
-                GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[ggml_cuda_get_device()].cc)) {
-            auto launch = [&](auto width, auto elements) {
-                constexpr int cols = decltype(width)::value;
-                constexpr int values = decltype(elements)::value;
-                constexpr int rows_per_block = CUDA_GET_ROWS_BLOCK_SIZE / cols;
-                const dim3 grid((ne10 + rows_per_block - 1) / rows_per_block, MIN(ne11 * ne12, UINT16_MAX), 1);
-                const ggml_cuda_kernel_launch_params params{grid, block_dims, 0, stream};
-                ggml_cuda_kernel_launch(k_get_rows_float_packed<src0_t, dst_t, cols, values>, params,
-                    src0_d, src1_d, dst_d, ne00, ne10, ne11, ne12_fdv,
-                    s1, s2, s3, nb01, nb02, nb03, s10, s11, s12);
-            };
-            constexpr auto one = std::integral_constant<int, 1>{};
-            if (ne00 > 32) {
-                if constexpr (std::is_same<src0_t, half>::value) {
-                    if (ne00 <= 64) launch(std::integral_constant<int, 32>{}, std::integral_constant<int, 2>{});
-                    else            launch(std::integral_constant<int, 32>{}, std::integral_constant<int, 4>{});
-                } else {
-                    if (ne00 <= 64) launch(std::integral_constant<int,  64>{}, one);
-                    else            launch(std::integral_constant<int, 128>{}, one);
-                }
-                return;
-            }
-            if      (ne00 <=  1) launch(std::integral_constant<int,   1>{}, one);
-            else if (ne00 <=  2) launch(std::integral_constant<int,   2>{}, one);
-            else if (ne00 <=  4) launch(std::integral_constant<int,   4>{}, one);
-            else if (ne00 <=  8) launch(std::integral_constant<int,   8>{}, one);
-            else if (ne00 <= 16) launch(std::integral_constant<int,  16>{}, one);
-            else                launch(std::integral_constant<int,  32>{}, one);
-            return;
-        }
-    }
 
     if constexpr (std::is_same<src0_t, dst_t>::value) {
         constexpr int VEC = 16 / sizeof(dst_t);
@@ -552,40 +408,6 @@ static void ggml_cuda_get_rows_switch_src0_type(
             get_rows_cuda_kq<32, dst_t, dequantize_mxfp4<dst_t>>(src0_d, src1_d, dst_d,
                 ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
             break;
-        case GGML_TYPE_Q4_0_ROCMFP4:
-            get_rows_cuda_kq<32, dst_t, dequantize_rocmfp4<dst_t>>(src0_d, src1_d, dst_d,
-                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
-            break;
-        case GGML_TYPE_Q4_0_ROCMFP4_FAST:
-            get_rows_cuda_kq<32, dst_t, dequantize_rocmfp4_fast<dst_t>>(src0_d, src1_d, dst_d,
-                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
-            break;
-#ifdef GGML_USE_TRELLIS
-        case GGML_TYPE_TQ2_T:
-            get_rows_cuda_tq<GGML_TYPE_TQ2_T, dst_t>(src0_d, src1_d, dst_d,
-                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
-            break;
-        case GGML_TYPE_TQK6:
-            get_rows_cuda_tq<GGML_TYPE_TQK6, dst_t>(src0_d, src1_d, dst_d,
-                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
-            break;
-        case GGML_TYPE_TQK7:
-            get_rows_cuda_tq<GGML_TYPE_TQK7, dst_t>(src0_d, src1_d, dst_d,
-                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
-            break;
-        case GGML_TYPE_TQP5:
-            get_rows_cuda_tq<GGML_TYPE_TQP5, dst_t>(src0_d, src1_d, dst_d,
-                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
-            break;
-        case GGML_TYPE_TQP6:
-            get_rows_cuda_tq<GGML_TYPE_TQP6, dst_t>(src0_d, src1_d, dst_d,
-                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
-            break;
-        case GGML_TYPE_TQP7:
-            get_rows_cuda_tq<GGML_TYPE_TQP7, dst_t>(src0_d, src1_d, dst_d,
-                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
-            break;
-#endif // GGML_USE_TRELLIS
         default:
             GGML_ABORT("%s: unsupported src0 type: %s\n", __func__, ggml_type_name(src0_type));
     }
@@ -667,44 +489,4 @@ void ggml_cuda_op_get_rows_back(ggml_backend_cuda_context & ctx, ggml_tensor * d
     const dim3 block_nums(block_num_x, MIN(ne1, (int64_t)UINT16_MAX), 1);
 
     k_get_rows_back_float<<<block_nums, block_dims, 0, stream>>>(src0_d, src1_d, dst_d, ne00, ne10, ne1);
-}
-
-// QSA indexer key pooling: mean of the 4 member rows of every block, 128-wide rows, one thread per column.
-// Fuses get_rows -> reshape -> 4 x (view, cont, add) -> scale on the same summation order as the graph.
-template<typename T>
-static __global__ void get_rows_mean4_128(
-        const char * src, const char * ids, float * dst,
-        size_t src_row_stride, size_t src_stream_stride, size_t ids_stream_stride,
-        float scale, float bias) {
-    ggml_cuda_pdl_lc();
-    ggml_cuda_pdl_sync();
-    const int64_t group = blockIdx.x;
-    const int64_t stream = blockIdx.y;
-    const int col = threadIdx.x;
-    const int32_t * selected = (const int32_t *) (ids + stream*ids_stream_stride) + 4*group;
-    const char * input = src + stream*src_stream_stride;
-    float sum = (float) ((const T *) (input + selected[0]*src_row_stride))[col];
-#pragma unroll
-    for (int i = 1; i < 4; ++i) {
-        sum += (float) ((const T *) (input + selected[i]*src_row_stride))[col];
-    }
-    dst[(stream*gridDim.x + group)*128 + col] = scale*sum + bias;
-}
-
-void ggml_cuda_op_get_rows_mean4(
-        ggml_backend_cuda_context & ctx, const ggml_tensor * src, const ggml_tensor * ids, ggml_tensor * dst) {
-    const dim3 grid(dst->ne[1], dst->ne[2], 1);
-    const ggml_cuda_kernel_launch_params params(grid, dim3(128, 1, 1), 0, ctx.stream());
-    const float scale = ggml_get_op_params_f32(dst, 0);
-    const float bias = ggml_get_op_params_f32(dst, 1);
-    if (src->type == GGML_TYPE_F16) {
-        ggml_cuda_kernel_launch(get_rows_mean4_128<half>, params,
-                (const char *) src->data, (const char *) ids->data, (float *) dst->data,
-                src->nb[1], src->nb[2], ids->nb[1], scale, bias);
-    } else {
-        GGML_ASSERT(src->type == GGML_TYPE_F32);
-        ggml_cuda_kernel_launch(get_rows_mean4_128<float>, params,
-                (const char *) src->data, (const char *) ids->data, (float *) dst->data,
-                src->nb[1], src->nb[2], ids->nb[1], scale, bias);
-    }
 }

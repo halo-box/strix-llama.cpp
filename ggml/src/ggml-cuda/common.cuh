@@ -39,9 +39,6 @@
 #endif // defined(GGML_USE_HIP)
 
 #include "ggml-common.h"
-#include "../../rocmfp4/rocmfp4.h"
-// device-side UE4M3 scale decoder for ROCmFP4 (needs the runtime header above)
-#include "../../rocmfp4/rocmfp4_hip_scale.cuh"
 
 #define STRINGIZE_IMPL(...) #__VA_ARGS__
 #define STRINGIZE(...) STRINGIZE_IMPL(__VA_ARGS__)
@@ -105,10 +102,6 @@
 #define GGML_CUDA_CC_IS_CDNA3(cc)   (GGML_CUDA_CC_IS_CDNA(cc) && cc >= GGML_CUDA_CC_CDNA3 && cc < GGML_CUDA_CC_CDNA4)
 #define GGML_CUDA_CC_IS_CDNA4(cc)   (GGML_CUDA_CC_IS_CDNA(cc) && cc >= GGML_CUDA_CC_CDNA4 && cc < GGML_CUDA_CC_RDNA1)
 
-// max keys of the QSA selected-key kernels: the 1M context of Qwen3.8 Flash Next with YaRN x4, not an id-space limit
-// QSA_MASKLESS_MAX_KV in qwen4exp.cpp must match, so a deeper n_kv takes the masked route instead of a refused op
-#define GGML_QSA_MAX_KEYS 1048576
-
 // Moore Threads
 #define MUSART_HMASK 40300 // MUSA rc4.3, min. ver. for half2 -> uint mask comparisons
 
@@ -124,14 +117,6 @@
 #if !defined(GGML_USE_HIP) && (defined(GGML_USE_MUSA) || CUDART_VERSION >= 11070)
 #    define GGML_CUDA_USE_CUB
 #endif  // !defined(GGML_USE_HIP) && (defined(GGML_USE_MUSA) || CUDART_VERSION >= 11070)
-
-// hipCUB (rocPRIM) offers the same device-wide radix sort / scan / reduce entry points as CUB. Using it lifts the
-// ncols <= 1024 limit of ARGSORT / TOP_K on HIP, which otherwise falls back to the CPU (e.g. the QSA indexer top-k
-// of qwen4exp / DeepSeek-V3.2 at contexts beyond 2k tokens).
-#if defined(GGML_USE_HIP) && !defined(GGML_HIP_NO_CUB) && __has_include(<hipcub/hipcub.hpp>)
-#    define GGML_CUDA_USE_CUB
-#    define GGML_CUDA_CUB_IS_HIPCUB
-#endif
 
 // PDL host-side support (cudaLaunchKernelEx) requires CUDART >= 11.8.
 // However, this has been bugged in CTK < 12.3 for MSVC builds, see
@@ -774,36 +759,6 @@ static __device__ __forceinline__ uint32_t __hgt2_mask(const half2 a, const half
 }
 #endif // (defined(CUDART_VERSION) && CUDART_VERSION < CUDART_HMASK) || defined(GGML_USE_HIP) || (defined(MUSART_VERSION) && MUSART_VERSION < MUSART_HMASK)
 
-// Rounds x to a float in a register before its next use, so the compiler cannot contract it into the following add or multiply.
-static __device__ __forceinline__ float ggml_cuda_materialize(float x) {
-#if defined(GGML_USE_HIP)
-    asm volatile("" : "+v"(x));
-#else
-    volatile float v = x;
-    x = v;
-#endif // defined(GGML_USE_HIP)
-    return x;
-}
-
-// F32 -> BF16, round to nearest even: the rounding of the MMB activation conversion (mmb_cvt_f32_bf16).
-static __device__ __forceinline__ uint16_t ggml_cuda_f32_to_bf16_rne(const float f) {
-    uint32_t u = __float_as_uint(f);
-    u += 0x7fffu + ((u >> 16) & 1u);
-    return (uint16_t) (u >> 16);
-}
-
-// F32 -> F16 (RNE), saturated to +-65504 (NaN stays NaN): the MMB_DENSE_F16 activation copy (mmb_f2h_sat)
-static __device__ __forceinline__ uint16_t ggml_cuda_f32_to_f16_sat(const float f) {
-    const float c = f != f ? f : fminf(fmaxf(f, -65504.0f), 65504.0f);
-    const half h = __float2half_rn(c);
-    return *(const uint16_t *) &h;
-}
-
-// the 16-bit activation copy an MMB GEMM reads: BF16 (RNE), or F16 (saturating RNE) for an MMB_DENSE_F16 reader
-static __device__ __forceinline__ uint16_t ggml_cuda_f32_to_act16(const float f, const bool f16) {
-    return f16 ? ggml_cuda_f32_to_f16_sat(f) : ggml_cuda_f32_to_bf16_rne(f);
-}
-
 static __device__ __forceinline__ int ggml_cuda_dp4a(const int a, const int b, int c) {
 #if defined(GGML_USE_HIP)
 #if defined(CDNA) || defined(RDNA2) || defined(__gfx906__)
@@ -1210,20 +1165,6 @@ struct ggml_cuda_type_traits<GGML_TYPE_NVFP4> {
 };
 
 template<>
-struct ggml_cuda_type_traits<GGML_TYPE_Q4_0_ROCMFP4> {
-    static constexpr int qk = QK_ROCMFP4;
-    static constexpr int qr = QR_ROCMFP4;
-    static constexpr int qi = QI_ROCMFP4;
-};
-
-template<>
-struct ggml_cuda_type_traits<GGML_TYPE_Q4_0_ROCMFP4_FAST> {
-    static constexpr int qk = QK_ROCMFP4;
-    static constexpr int qr = QR_ROCMFP4;
-    static constexpr int qi = QI_ROCMFP4;
-};
-
-template<>
 struct ggml_cuda_type_traits<GGML_TYPE_Q2_K> {
     static constexpr int qk = QK_K;
     static constexpr int qr = QR2_K;
@@ -1335,63 +1276,6 @@ struct ggml_cuda_type_traits<GGML_TYPE_IQ3_S> {
     static constexpr int bs = sizeof(block_iq3_s);
 };
 
-#ifdef GGML_USE_TRELLIS
-// Trellis types (TQ2_T, TQK6, TQK7, TQP5/6/7): 128 weights per block, 32 ints of 4 weights
-// (32 TQ/TQK steps of 4 weights, 64 TQP steps of 2). qi counts those ints (each pairs with one
-// int of q8_1 values); see tq.cuh.
-#define QR_TQ 4
-#define QI_TQ (QK_TQK/QR_TQ)
-static_assert(QK_TQ2_T == QK_TQK, "trellis block sizes differ");
-
-template<>
-struct ggml_cuda_type_traits<GGML_TYPE_TQ2_T> {
-    static constexpr int qk = QK_TQ2_T;
-    static constexpr int qr = QR_TQ;
-    static constexpr int qi = QI_TQ;
-    static constexpr int bs = sizeof(block_tq2_t);
-};
-
-template<>
-struct ggml_cuda_type_traits<GGML_TYPE_TQK6> {
-    static constexpr int qk = QK_TQK;
-    static constexpr int qr = QR_TQ;
-    static constexpr int qi = QI_TQ;
-    static constexpr int bs = sizeof(block_tqk6);
-};
-
-template<>
-struct ggml_cuda_type_traits<GGML_TYPE_TQK7> {
-    static constexpr int qk = QK_TQK;
-    static constexpr int qr = QR_TQ;
-    static constexpr int qi = QI_TQ;
-    static constexpr int bs = sizeof(block_tqk7);
-};
-
-template<>
-struct ggml_cuda_type_traits<GGML_TYPE_TQP5> {
-    static constexpr int qk = QK_TQP;
-    static constexpr int qr = QR_TQ;
-    static constexpr int qi = QI_TQ;
-    static constexpr int bs = sizeof(block_tqp5);
-};
-
-template<>
-struct ggml_cuda_type_traits<GGML_TYPE_TQP6> {
-    static constexpr int qk = QK_TQP;
-    static constexpr int qr = QR_TQ;
-    static constexpr int qi = QI_TQ;
-    static constexpr int bs = sizeof(block_tqp6);
-};
-
-template<>
-struct ggml_cuda_type_traits<GGML_TYPE_TQP7> {
-    static constexpr int qk = QK_TQP;
-    static constexpr int qr = QR_TQ;
-    static constexpr int qi = QI_TQ;
-    static constexpr int bs = sizeof(block_tqp7);
-};
-#endif // GGML_USE_TRELLIS
-
 //////////////////////
 
 struct ggml_cuda_device_info {
@@ -1494,21 +1378,6 @@ struct ggml_tensor_extra_gpu {
 struct ggml_cuda_graph;
 struct ggml_cuda_stream_context;
 
-struct ggml_cuda_mmb_context;
-
-// Intra-graph concurrency (RDNA3.5): graph_optimize reorders a region of the graph into [S nodes][M nodes] (no data
-// dependency between the two sets) and records it; graph_compute runs S on a side stream while M runs on the main
-// stream and joins before `end` (the first node that may read S). Every tensor touched in the region is kept allocated
-// through `end` (add_alloc_dep), so no buffer is reused while both streams run.
-#define GGML_CUDA_SIDE_STREAM 1
-struct ggml_cuda_ovl_region {
-    const ggml_tensor * s_first = nullptr;   // first S node (side stream)
-    const ggml_tensor * m_first = nullptr;   // first M node (main stream); S occupies [s_first, m_first)
-    const ggml_tensor * end     = nullptr;   // join before this node
-    int  kind     = 0;                       // 1 = GDN z-proj, 2 = FFN shared expert, 4 = attention K/V
-    bool deferred = false;                   // the end node's op joins itself (ggml_cuda_ovl_join) before reading S
-};
-
 struct ggml_backend_cuda_context {
     int device;
     std::string name;
@@ -1523,22 +1392,6 @@ struct ggml_backend_cuda_context {
 #endif
 
     int curr_stream_no = 0;
-
-    // intra-graph concurrency state (see ggml_cuda_ovl_region)
-    std::unordered_map<const ggml_tensor *, ggml_cuda_ovl_region> ovl_regions;   // keyed by s_first
-    bool     ovl_open      = false;   // side stream forked and not yet joined
-    int      ovl_side      = 1;       // stream index of the open side stream
-    uint32_t ovl_slot_mask = 0;       // MMB slots of the main workspace read by side-stream ops of the open region
-    cudaEvent_t ovl_ev[2]  = { nullptr, nullptr };
-
-    ggml_cuda_mmb_context * mmb = nullptr;
-    bool mmb_opt_in = false; // set by ggml_backend_cuda_set_mmb_enabled, before the first graph
-    bool mmb_small_batch = false; // set by ggml_backend_cuda_set_mmb_small_batch, before the first graph
-    bool mmb_after_compute = true;
-    const void * mmb_first_split = nullptr;
-    std::vector<uint64_t> mmb_graph_sigs;
-    // HC residuals whose remaining readers live in a later split of the same graph on this device: tensor -> uses left
-    std::unordered_map<const ggml_tensor *, int> mmb_res16_pending;
 
 #ifdef USE_CUDA_GRAPH
     // Map from first_node_ptr to cuda_graph - allows multiple graphs per context
@@ -1626,31 +1479,6 @@ struct ggml_backend_cuda_context {
     }
 };
 
-// join the open intra-graph concurrency side stream into the main stream (no-op when none is open)
-static inline void ggml_cuda_ovl_join(ggml_backend_cuda_context & ctx) {
-    if (!ctx.ovl_open) {
-        return;
-    }
-    CUDA_CHECK(cudaEventRecord(ctx.ovl_ev[1], ctx.stream(ctx.device, ctx.ovl_side)));
-    CUDA_CHECK(cudaStreamWaitEvent(ctx.stream(ctx.device, 0), ctx.ovl_ev[1], 0));
-    ctx.ovl_open      = false;
-    ctx.ovl_slot_mask = 0;
-}
-
-// a side-stream op of the open region read MMB slot `slot` of the main stream's workspace
-static inline void ggml_cuda_ovl_note_slot_read(ggml_backend_cuda_context & ctx, int owner_stream, int slot) {
-    if (ctx.ovl_open && ctx.curr_stream_no == ctx.ovl_side && owner_stream == 0) {
-        ctx.ovl_slot_mask |= 1u << slot;
-    }
-}
-
-// the main stream is about to overwrite MMB slot `slot`: join first if the open region reads it
-static inline void ggml_cuda_ovl_slot_write(ggml_backend_cuda_context & ctx, int slot) {
-    if (ctx.ovl_open && ctx.curr_stream_no == 0 && (ctx.ovl_slot_mask >> slot) & 1u) {
-        ggml_cuda_ovl_join(ctx);
-    }
-}
-
 struct ggml_cuda_mm_fusion_args_host {
     const ggml_tensor * x_bias = nullptr;
     const ggml_tensor * gate = nullptr;
@@ -1663,10 +1491,6 @@ struct ggml_cuda_mm_fusion_args_host {
     const ggml_tensor * shared_up = nullptr;
     const ggml_tensor * shared_gate = nullptr;
     ggml_tensor * shared_dst = nullptr;
-    // RDNA3.5 fused-quantize matvec prologue (y_op == 3), see ggml_cuda_mm_fusion_args_device
-    const ggml_tensor * y_gate = nullptr;
-    const ggml_tensor * y_norm_w = nullptr;
-    float y_eps = 0.0f;
 };
 struct ggml_cuda_mm_fusion_args_device {
     const void * x_bias = nullptr;
@@ -1680,12 +1504,6 @@ struct ggml_cuda_mm_fusion_args_device {
     const void * shared_gate = nullptr;
     float * shared_dst = nullptr;
     uint32_t shared_stride_col_dst = 0;
-    // RDNA3.5 fused-quantize matvec prologue (y_op == 3): y' = sigmoid(y_gate) * (rms_norm_128(y) * y_norm_w)
-    const void * y_gate = nullptr;
-    const void * y_norm_w = nullptr;
-    float y_eps = 0.0f;
-    // MMB_DENSE_R2: the Q8_0 weight (x) is in the in-place 128-row x 64-K tile layout (RDNA3.5 fused-quantize matvecs only)
-    int x_pk = 0;
 };
 
 struct ggml_cuda_kernel_launch_params {
