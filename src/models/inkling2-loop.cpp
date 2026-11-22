@@ -60,8 +60,10 @@ void llama_model_inkling2_loop::load_arch_tensors(llama_model_loader & ml) {
             l.ctrl_forget[c] = create_tensor(tn(forget[c], "weight", il), {rank, n_embd}, 0);
         }
     }
+}
 
-    // share the physical weights, each cache slot keeps its own KV and conv state
+// share the physical weights and their scales, each cache slot keeps its own KV and conv state
+void llama_model_inkling2_loop::alias_layers() {
     for (int il = n_phys; il < (int) hparams.n_layer(); ++il) {
         layers[il] = layers[layer_phys(il)];
     }

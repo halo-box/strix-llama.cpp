@@ -1807,6 +1807,7 @@ struct llama_model_metis16 : public llama_model_base {
     llama_model_metis16(const struct llama_model_params & params) : llama_model_base(params) {}
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
+    void alias_layers() override;
 
     uint32_t n_pass       = 1;
     uint32_t n_stream     = 1;
@@ -2505,6 +2506,7 @@ struct llama_model_inkling2_loop : public llama_model_inkling2 {
     llama_model_inkling2_loop(const struct llama_model_params & params) : llama_model_inkling2(params) {}
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
+    void alias_layers() override;
 
     int n_layer_phys() const override { return n_phys; }
     int layer_phys(int il) const;

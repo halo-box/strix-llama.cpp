@@ -1077,6 +1077,9 @@ struct llama_model {
     // model must define these
     virtual void load_arch_hparams(llama_model_loader & ml) = 0;
     virtual void load_arch_tensors(llama_model_loader & ml) = 0;
+    // looped archs: point the layers of later passes at the physical layers they repeat. Called after the generic
+    // optional-tensor pass, so the copies carry the physical layers' scales (no blk.N.*.scale exists for a repeat)
+    virtual void alias_layers() {}
     virtual std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const = 0;
 
     // work a model runs beside one llama_context::decode of the whole batch; `state` belongs to the calling context and
