@@ -3,8 +3,9 @@
 # Differences: builds this repository instead of cloning upstream llama.cpp, releases on every merge to
 # master instead of nightly, pins ROCm 10.1 (the version halo-box HIP work is built and tested on), adds
 # Linux and Windows Vulkan zips, uses the job token when no GH_TOKEN secret exists, and runs the self-hosted
-# Strix Halo tests only when the runners are registered. Windows builds are best effort: a failed Windows
-# job leaves its zip out of the release instead of blocking the Linux zips.
+# Strix Halo tests only when the runners are registered. The Windows HIP build is best effort: a failed
+# Windows HIP job leaves its zip out of the release instead of blocking the Linux zips. Every Vulkan
+# build that runs must succeed before a release is made.
 name: Build Llama.cpp + ROCm
 on:
   workflow_dispatch:
@@ -118,6 +119,7 @@ jobs:
     # constexpr (implicitly __host__ __device__), which collides with ROCm clang's
     # __device__-only HIP math wrappers and breaks the HIP build. See llama.cpp#22570.
     runs-on: windows-2022
+    timeout-minutes: 75
     needs: prepare-matrix
     if: needs.prepare-matrix.outputs.should_build_windows == 'true'
     strategy:
@@ -918,6 +920,7 @@ jobs:
     # The clang toolchain matches upstream's Windows CPU release build. Not pinned to windows-2022 like the
     # HIP job: that image has Clang 19, and the fetched LLVM OpenMP needs Clang 20.
     runs-on: windows-2025-vs2026
+    timeout-minutes: 60
     needs: prepare-matrix
     if: |
       github.event.inputs.vulkan != 'false' &&
@@ -1021,11 +1024,12 @@ jobs:
     permissions:
       contents: write
       pull-requests: write
-    # Windows jobs are best effort and do not gate the release; a missing Windows zip is left out
+    # the Windows HIP job is best effort and does not gate the release; a missing Windows HIP zip is left out
     if: |
       always() &&
       (needs.build-ubuntu.result == 'success' || needs.build-ubuntu.result == 'skipped') &&
       (needs.build-ubuntu-vulkan.result == 'success' || needs.build-ubuntu-vulkan.result == 'skipped') &&
+      (needs.build-windows-vulkan.result == 'success' || needs.build-windows-vulkan.result == 'skipped') &&
       (needs.build-windows.result == 'success' || needs.build-ubuntu.result == 'success') &&
       (needs.test-stx-halo.result == 'success' || needs.test-stx-halo.result == 'skipped') &&
       github.event_name != 'pull_request' &&
