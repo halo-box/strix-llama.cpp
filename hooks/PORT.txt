@@ -1406,6 +1406,7 @@ variant  AGENTS.md:234  the fork version is active at its path (repository file,
 variant  AGENTS.md:236  the fork version is active at its path (repository file, hooks/tools/import-files.py)
 dropped  AGENTS.md:238  the link to halo-box/llama.cpp as the place of general changes: that repository is archived
 variant  AGENTS.md:240  the fork version is active at its path (repository file, hooks/tools/import-files.py)
+adapted  CONTRIBUTING.md:0  the repository map and where a change goes: without halo-box/llama.cpp (archived), as the PR template
 variant  CONTRIBUTING.md:7  the fork version is active at its path (repository file, hooks/tools/import-files.py)
 variant  CONTRIBUTING.md:13  the fork version is active at its path (repository file, hooks/tools/import-files.py)
 variant  CONTRIBUTING.md:15  the fork version is active at its path (repository file, hooks/tools/import-files.py)
@@ -1414,16 +1415,16 @@ variant  CONTRIBUTING.md:21  the fork version is active at its path (repository 
 variant  CONTRIBUTING.md:23  the fork version is active at its path (repository file, hooks/tools/import-files.py)
 variant  CONTRIBUTING.md:29  the fork version is active at its path (repository file, hooks/tools/import-files.py)
 variant  CONTRIBUTING.md:31  the fork version is active at its path (repository file, hooks/tools/import-files.py)
-variant  CONTRIBUTING.md:45  the fork version is active at its path (repository file, hooks/tools/import-files.py)
+adapted  CONTRIBUTING.md:45  before you start: without halo-box/llama.cpp (archived), with where the fork code goes (import-files.py)
 variant  CONTRIBUTING.md:56  the fork version is active at its path (repository file, hooks/tools/import-files.py)
 variant  CONTRIBUTING.md:58  the fork version is active at its path (repository file, hooks/tools/import-files.py)
 variant  CONTRIBUTING.md:74  the fork version is active at its path (repository file, hooks/tools/import-files.py)
 variant  CONTRIBUTING.md:82  the fork version is active at its path (repository file, hooks/tools/import-files.py)
 variant  CONTRIBUTING.md:86  the fork version is active at its path (repository file, hooks/tools/import-files.py)
-variant  CONTRIBUTING.md:91  the fork version is active at its path (repository file, hooks/tools/import-files.py)
+adapted  CONTRIBUTING.md:91  the reasons to close a PR: without halo-box/llama.cpp (archived)
 variant  CONTRIBUTING.md:95  the fork version is active at its path (repository file, hooks/tools/import-files.py)
 variant  CONTRIBUTING.md:204  the fork version is active at its path (repository file, hooks/tools/import-files.py)
-variant  CONTRIBUTING.md:219  the fork version is active at its path (repository file, hooks/tools/import-files.py)
+dropped  CONTRIBUTING.md:219  the link to halo-box/llama.cpp for upstream-bound changes: that repository is archived
 variant  README.md:1  the fork README is the root README.md (hooks/tools/import-files.py)
 variant  README.md:3  the fork README is the root README.md (hooks/tools/import-files.py)
 variant  README.md:5  the fork README is the root README.md (hooks/tools/import-files.py)

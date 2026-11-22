@@ -97,3 +97,12 @@ for old, new in AGENTS_EDITS:
     assert t.count(old) == 1, old[:60]
     t = t.replace(old, new)
 open(p, 'w').write(t)
+
+# CONTRIBUTING.md: without the halo-box/llama.cpp rule (archived), and where the fork code goes
+CONTRIBUTING_EDITS = [('ggml-org/llama.cpp            upstream\n  |\n  +-- halo-box/llama.cpp      staging fork for changes intended to go upstream\n        |\n        +-- halo-box/strix-llama.cpp   <-- this repo', 'ggml-org/llama.cpp            upstream\n  |\n  +-- halo-box/strix-llama.cpp   <-- this repo'), ("- **Strix Halo specific, or justified by measurements on Strix Halo** -> open the PR here.\n- **A general llama.cpp improvement** -> open it against\n  [halo-box/llama.cpp](https://github.com/halo-box/llama.cpp) instead, and follow that repo's (upstream's) rules,\n  including its AI policy. Nothing is submitted upstream from this repo.\n", '- **Strix Halo specific, or justified by measurements on Strix Halo** -> open the PR here. Nothing is submitted\n  upstream from this repo.\n'), ('- Confirm the change belongs in this repo and not in [halo-box/llama.cpp](https://github.com/halo-box/llama.cpp);\n  see [Where does my change go?](#where-does-my-change-go).\n', '- Confirm the change belongs in this repo; see [Where does my change go?](#where-does-my-change-go).\n- Put the code in `hooks/`: upstream files only take `HOOK(name)` lines. See\n  [Where fork code goes](AGENTS.md#where-fork-code-goes) and [hooks/README.md](hooks/README.md).\n'), ('- The change belongs in [halo-box/llama.cpp](https://github.com/halo-box/llama.cpp) or upstream instead.\n', '- The change belongs upstream instead.\n'), ('- [halo-box/llama.cpp](https://github.com/halo-box/llama.cpp) - where upstream-bound changes go instead\n', '')]
+p = 'CONTRIBUTING.md'
+t = open(p).read()
+for old, new in CONTRIBUTING_EDITS:
+    assert t.count(old) == 1, old[:60]
+    t = t.replace(old, new)
+open(p, 'w').write(t)

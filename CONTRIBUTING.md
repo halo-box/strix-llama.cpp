@@ -10,15 +10,11 @@ further down are upstream's and are kept as-is, because this fork stays mergeabl
 ```
 ggml-org/llama.cpp            upstream
   |
-  +-- halo-box/llama.cpp      staging fork for changes intended to go upstream
-        |
-        +-- halo-box/strix-llama.cpp   <-- this repo
+  +-- halo-box/strix-llama.cpp   <-- this repo
 ```
 
-- **Strix Halo specific, or justified by measurements on Strix Halo** -> open the PR here.
-- **A general llama.cpp improvement** -> open it against
-  [halo-box/llama.cpp](https://github.com/halo-box/llama.cpp) instead, and follow that repo's (upstream's) rules,
-  including its AI policy. Nothing is submitted upstream from this repo.
+- **Strix Halo specific, or justified by measurements on Strix Halo** -> open the PR here. Nothing is submitted
+  upstream from this repo.
 
 If you are unsure, open an issue here and ask. Landing something in the wrong repo costs everyone more than asking.
 
@@ -68,8 +64,9 @@ discovering it later is not.
 ### Before you start
 
 - Search existing issues and PRs first - duplicates will likely be closed.
-- Confirm the change belongs in this repo and not in [halo-box/llama.cpp](https://github.com/halo-box/llama.cpp);
-  see [Where does my change go?](#where-does-my-change-go).
+- Confirm the change belongs in this repo; see [Where does my change go?](#where-does-my-change-go).
+- Put the code in `hooks/`: upstream files only take `HOOK(name)` lines. See
+  [Where fork code goes](AGENTS.md#where-fork-code-goes) and [hooks/README.md](hooks/README.md).
 - For anything large, or anything that introduces a new pattern or subsystem, open an issue first. Small, measured,
   device-specific changes can go straight to a PR.
 - Check whether upstream has already fixed it. Carrying a patch we do not need is a permanent merge cost.
@@ -188,7 +185,7 @@ A speedup that changes results is a bug, so speed numbers alone are not enough:
 - Wait for CI results before merging, including the self-hosted `gfx1151` job where it applies
 
 Maintainers reserve the right to decline review or close pull requests, particularly under any of the following conditions:
-- The change belongs in [halo-box/llama.cpp](https://github.com/halo-box/llama.cpp) or upstream instead.
+- The change belongs upstream instead.
 - The pull request duplicates an existing one.
 - The contributor fails to adhere to this contributing guide or the AI policy.
 - Performance claims are not backed by measurements from the hardware.
@@ -319,7 +316,6 @@ Maintainers reserve the right to decline review or close pull requests, particul
 - [AGENTS.md](AGENTS.md) - rules for AI coding agents working in this repo, including how to open a PR here
 - [README.md](README.md) - what this fork is, how to build it, and the Strix Halo specific notes
 - [Issues](https://github.com/halo-box/strix-llama.cpp/issues) and [PRs](https://github.com/halo-box/strix-llama.cpp/pulls) in this repo
-- [halo-box/llama.cpp](https://github.com/halo-box/llama.cpp) - where upstream-bound changes go instead
 
 Upstream's issues, PRs and discussions remain the best source of background on the codebase itself, and its Github
 projects collect the most important of it:
