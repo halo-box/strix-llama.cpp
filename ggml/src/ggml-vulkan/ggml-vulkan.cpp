@@ -9074,24 +9074,25 @@ static bool ggml_vk_mmv_wide(ggml_backend_vk_context * ctx, const ggml_tensor * 
     // RADV gfx1151, 2026-11-19: one pass only inside an (m, k) region where it was at least 3% faster than the stock path
     // for every one of the 190 dense weight shapes of 19 common GGUF models in it (n = 9/10/12/14/16, a width between two
     // measured ones takes the wider rule), and at least 3 shapes support the region. q4_K m=6144 k=5120 at n=12: 0.51x.
-    // It loses on thin k (q8_0 m=10240 k=320) and as n grows (16 accumulators per row). Below m=64 (q4_K m=4, q8_0 m=32)
-    // it is up to 1.34x slower at n=12-14. q5_K m=1024 k=2560 is 0.29x alone at n=13-14 but makes Qwen3-4B IQ4_XS 2-5%
-    // slower at 14 rows, so q5_K above 12 columns needs k >= 4096. Re-measure when the int8 matmul gets a 9-16 column
-    // tile or RADV changes its code generation for these shaders; drop the cells that no longer win.
+    // It loses on thin k (q8_0 m=10240 k=320), on small m (q4_K m=64-192 at n=13-14: up to 1.31x, q8_0 m=32 at n=12:
+    // 1.03x, q8_0 m=64-256 at n=15-16: up to 1.67x) and as n grows (16 accumulators per row). q5_K m=1024 and iq4_xs
+    // m=9728 with k=2560 are faster alone at n=13-14 but make Qwen3-4B IQ4_XS 2-5% slower at 14 rows, so above 12
+    // columns both need k >= 4096. Re-measure when the int8 matmul gets a 9-16 column tile or RADV changes its code
+    // generation for these shaders; drop the cells that no longer win.
     const int64_t n = dst->ne[1];
     const int64_t m = src0->ne[1];
     const int64_t k = src0->ne[0];
     const auto in = [&](int64_t m0, int64_t m1, int64_t k0) { return m >= m0 && m <= m1 && k >= k0; };
     switch (src0->type) {
-        case GGML_TYPE_Q4_K:   return m >= 64 && (n <= 12 ? k >= 1024 : n <= 14 ? k >= 4096 : in(512, 15360, 2048));
+        case GGML_TYPE_Q4_K:   return m >= 256 && (n <= 12 ? k >= 1024 : n <= 14 ? k >= 4096 : in(512, 15360, 2048));
         case GGML_TYPE_Q5_K:   return in(1024, 202048, n <= 12 ? 2560 : 4096);
         case GGML_TYPE_Q6_K:   return n == 9 ? in(1536, 248320, 1024) : n == 10 ? in(1536, 248320, 1536) :
                                       n <= 12 ? in(10240, 248320, 1024) : n <= 14 && in(17408, 248320, 2048);
         case GGML_TYPE_Q8_0:   return n == 9 ? in(64, 12288, 512) : n <= 12 ? in(64, 12288, 2048) :
-                                      n <= 14 ? in(320, 2880, 2048) : in(64, 4096, 4096);
+                                      n <= 14 ? in(320, 2880, 2048) : in(1024, 4096, 4096);
         case GGML_TYPE_Q4_0:   return n <= 12 ? in(1024, 17408, 2560) : in(1024, 2560, 2560);
         case GGML_TYPE_Q4_1:   return n <= 12 ? in(1024, 12288, 4096) : n <= 14 ? in(1024, 5120, 4096) : in(1024, 2560, 4096);
-        case GGML_TYPE_IQ4_XS: return n <= 14 ? in(5120, 17408, 2560) : in(5120, 12288, 4096);
+        case GGML_TYPE_IQ4_XS: return n <= 12 ? in(5120, 17408, 2560) : in(5120, n <= 14 ? 17408 : 12288, 4096);
         case GGML_TYPE_IQ4_NL: return n <= 10 && in(5120, 17408, 5120);
         default:               return false;
     }
