@@ -1807,6 +1807,7 @@ struct llama_model_metis16 : public llama_model_base {
     llama_model_metis16(const struct llama_model_params & params) : llama_model_base(params) {}
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
+    void post_arch_tensors(llama_model_loader & ml) override;
 
     uint32_t n_pass       = 1;
     uint32_t n_stream     = 1;

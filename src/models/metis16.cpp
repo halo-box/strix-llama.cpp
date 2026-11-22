@@ -158,8 +158,11 @@ void llama_model_metis16::load_arch_tensors(llama_model_loader &) {
         layer.ffn_up_shexp     = create_tensor(tn(LLM_TENSOR_FFN_UP_SHEXP,     "weight", il), {n_latent, n_ff_shexp}, 0);
         layer.ffn_down_shexp   = create_tensor(tn(LLM_TENSOR_FFN_DOWN_SHEXP,   "weight", il), {n_ff_shexp, n_latent}, 0);
     }
+}
 
-    // the virtual layers of later passes share the physical layer's weights
+void llama_model_metis16::post_arch_tensors(llama_model_loader &) {
+    // the virtual layers of later passes share the physical layer's weights, scales included
+    const int n_layer = hparams.n_layer();
     for (int il = n_layer_phys; il < n_layer; ++il) {
         layers[il] = layers[il % n_layer_phys];
     }
