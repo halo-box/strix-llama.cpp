@@ -35,11 +35,26 @@ is_active() {
     return 1
 }
 
+# upstream files changed beyond a hook point, each for a reason:
+#   ggml/src/ggml-cpu/arch/x86/quants.c  the 4 (const char *) casts of the fork: clang refuses the implicit pointer
+#                                        conversion, a hook cannot fix a build error
+#   .flake8 ty.toml .ecrc                the linter rules of the originals for their copies in hooks/ (.ecrc is JSON: no
+#                                        marker can go in it)
+own_changes=(ggml/src/ggml-cpu/arch/x86/quants.c .flake8 ty.toml .ecrc)
+is_own_change() {
+    local a
+    for a in "${own_changes[@]}"; do
+        [[ "$1" == "$a" ]] && return 0
+    done
+    return 1
+}
+
 fail=0
 total=0
 
 while IFS= read -r file; do
     is_active "$file" && continue
+    is_own_change "$file" && continue
     # one hunk per line: "<start> <changed lines> <names>"
     while read -r start n names; do
         total=$((total + n))
@@ -96,7 +111,7 @@ done
 # only with one that upstream adds later at the same path
 n_new=$(git diff --name-only --diff-filter=A "$base" -- . ':!hooks' | wc -l)
 echo "hook points: ${#want_file[@]}, changed lines in upstream files: $total (base $(git rev-parse --short "$base"))"
-echo "new files outside hooks/: $n_new" 
+echo "new files outside hooks/: $n_new"
 if [ "$fail" != 0 ]; then
     echo "FAIL: move the change to hooks/, or add the hook point to $manifest"
     exit 1

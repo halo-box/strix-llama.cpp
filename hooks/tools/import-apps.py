@@ -167,3 +167,14 @@ t = t.replace(old, """        bool result = ggml_gallocr_alloc_graph(galloc.get(
         GGML_ASSERT(backend.context->allocated_total() == 44); // hooks: the fork allocator keeps the 24 B chunk""")
 open(p, 'w').write(t)
 print('adapted')
+
+# no trailing whitespace in the generated code: the fork has none (its CI checks it), a hooks: marker can leave one
+import pathlib as _pathlib  # noqa: E402
+_CODE = ('.c', '.cc', '.cpp', '.h', '.hpp', '.cu', '.cuh', '.inc', '.comp', '.glsl', '.cmake', '.py')
+for _d in ['hooks/apps']:
+    for _f in _pathlib.Path(_d).rglob('*'):
+        if _f.is_file() and not _f.is_symlink() and (_f.suffix in _CODE or _f.name == 'CMakeLists.txt'):
+            _t = _f.read_text(encoding='utf-8', errors='surrogateescape')
+            _u = '\n'.join(_l.rstrip(' \t') for _l in _t.split('\n'))
+            if _u != _t:
+                _f.write_text(_u, encoding='utf-8', errors='surrogateescape')

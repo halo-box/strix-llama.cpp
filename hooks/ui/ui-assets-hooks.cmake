@@ -1,5 +1,5 @@
-# Included by HOOK(ui-assets) in scripts/ui-assets.cmake (cmake -P), through the file that hooks/llama/llama-hooks.cmake
-# writes next to the UI build. The functions of the fork (scripts/ui-assets.cmake of 1fe05fa45, upstream 9048bad8d),
+# Included by HOOK(ui-assets) in scripts/ui-assets.cmake (cmake -P), with or without the hooks build (the UI is built
+# on every platform). The functions of the fork (scripts/ui-assets.cmake of 1fe05fa45, upstream 9048bad8d),
 # verbatim: they replace the upstream ones. The prebuilt archives after about b12500 are split builds (the entry is
 # _app/immutable/entry/start[hash].js, the CSS in _app/immutable/assets), which the upstream check refuses, and they
 # ship .mjs files.

@@ -21,9 +21,6 @@
 #include <stdatomic.h>
 #include <string.h>
 
-// set by the q4_0 variant for the thread, see mul-mat.cpp
-_Thread_local ggml_vec_dot_t ggml_hook_fork_vec_dot = NULL;
-
 void ggml_hook_fork_mul_mat(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 
 // the src1 check of ggml_tiled_supported in the fork (ggml/src/ggml-cpu/tiled/tiled.cpp line 629, fork 1fe05fa45): the
@@ -53,7 +50,7 @@ static void fork_mul_mat_one_chunk(
 
     const bool src1_cont = ggml_is_contiguous(src1);
 
-    ggml_vec_dot_t const vec_dot      = ggml_hook_fork_vec_dot ? ggml_hook_fork_vec_dot : (*ggml_get_type_traits_cpu(type)).vec_dot; // adapted: the q4_0 variant
+    ggml_vec_dot_t const vec_dot      = (*ggml_get_type_traits_cpu(type)).vec_dot;
     enum ggml_type const vec_dot_type = (*ggml_get_type_traits_cpu(type)).vec_dot_type;
 
     // broadcast factors

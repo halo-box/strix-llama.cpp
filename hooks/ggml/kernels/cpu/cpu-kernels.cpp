@@ -1,5 +1,5 @@
 // Hook kernels of the fork CPU code: the fork versions of upstream CPU functions (mul-mat.c, ops-q.inc,
-// binary-ops.inc, q4_0-x86.c). The cases that upstream does not run are on by default; the cases where the
+// binary-ops.inc). The cases that upstream does not run are on by default; the cases where the
 // fork changes what upstream runs are variants, off by default (GGML_HOOKS=+name), until a benchmark decides.
 
 #include "ggml-hooks-cpu.h"
@@ -20,8 +20,6 @@ extern "C" {
 void   ggml_hook_fork_mul_mat(const ggml_compute_params * params, ggml_tensor * dst);
 void   ggml_hook_fork_mul_mat_id(const ggml_compute_params * params, ggml_tensor * dst);
 size_t ggml_hook_fork_mul_mat_id_work_size(int n_tasks, const ggml_tensor * node);
-void   ggml_hook_fork_vec_dot_q4_0_q8_0(int n, float * s, size_t bs, const void * vx, size_t bx, const void * vy, size_t by, int nrc);
-extern thread_local ggml_vec_dot_t ggml_hook_fork_vec_dot;
 }
 
 #include "binary-ops.inc"
@@ -62,17 +60,6 @@ size_t mul_mat_id_work_size(int n_threads, const ggml_tensor * op) {
     return ggml_hook_fork_mul_mat_id_work_size(n_threads, op);
 }
 
-#if (defined(__x86_64__) || defined(__i386__) || defined(_M_IX86) || defined(_M_X64)) && !defined(GGML_CPU_GENERIC)
-bool q4_0_casts_supports(const ggml_hook_dev *, const ggml_tensor * t) {
-    return t->src[0]->type == GGML_TYPE_Q4_0 && t->type == GGML_TYPE_F32 && t->src[1]->type == GGML_TYPE_F32;
-}
-
-void q4_0_casts_compute(const ggml_compute_params * params, ggml_tensor * dst) {
-    ggml_hook_fork_vec_dot = ggml_hook_fork_vec_dot_q4_0_q8_0;
-    ggml_hook_fork_mul_mat(params, dst);
-    ggml_hook_fork_vec_dot = nullptr;
-}
-#endif
 
 // the generic quantized paths of add, out_prod and get_rows, for the fork types (the fork added their case labels)
 
@@ -143,10 +130,6 @@ GGML_HOOK_REGISTER_KERNEL([] {
     return k;
 }());
 
-#if (defined(__x86_64__) || defined(__i386__) || defined(_M_IX86) || defined(_M_X64)) && !defined(GGML_CPU_GENERIC)
-// variant: the x86 q4_0 kernel of the fork (two casts)
-FORK_CPU_KERNEL("cpu_q4_0_prefetch_casts", GGML_OP_MUL_MAT, q4_0_casts_supports, q4_0_casts_compute, false);
-#endif
 
 FORK_CPU_KERNEL("cpu_add_q",      GGML_OP_ADD,      add_q_supports,      add_q_compute,      true);
 FORK_CPU_KERNEL("cpu_out_prod_q", GGML_OP_OUT_PROD, out_prod_q_supports, out_prod_q_compute, true);

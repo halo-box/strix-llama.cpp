@@ -134,3 +134,14 @@ open(os.path.join(DST, 'ggml-impl.h'), 'w').write(
     f'// hooks: ggml/src/ggml-impl.h of the fork ({FORK}, upstream {BASE}), for the fork code only, verbatim\n' +
     git('show', f'{REF}:ggml/src/ggml-impl.h'))
 print('ggml-impl.h')
+
+# no trailing whitespace in the generated code: the fork has none (its CI checks it), a hooks: marker can leave one
+import pathlib as _pathlib  # noqa: E402
+_CODE = ('.c', '.cc', '.cpp', '.h', '.hpp', '.cu', '.cuh', '.inc', '.comp', '.glsl', '.cmake', '.py')
+for _d in ['hooks/ggml/cuda']:
+    for _f in _pathlib.Path(_d).rglob('*'):
+        if _f.is_file() and not _f.is_symlink() and (_f.suffix in _CODE or _f.name == 'CMakeLists.txt'):
+            _t = _f.read_text(encoding='utf-8', errors='surrogateescape')
+            _u = '\n'.join(_l.rstrip(' \t') for _l in _t.split('\n'))
+            if _u != _t:
+                _f.write_text(_u, encoding='utf-8', errors='surrogateescape')

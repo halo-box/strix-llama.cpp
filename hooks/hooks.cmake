@@ -1,12 +1,16 @@
-# Entry point of the hooks build. No upstream CMakeLists.txt includes it, configure with:
-#   cmake -B build -DCMAKE_PROJECT_INCLUDE=<repo>/hooks/hooks.cmake ...
-# CMake includes this file after every project() call. The setup runs at the end of the top-level directory,
-# when every upstream target exists. Without the option, the build is pure upstream.
+# Entry point of the hooks build, included by HOOK(hooks) in the top CMakeLists.txt after project(). The setup runs at
+# the end of the top-level directory, when every upstream target exists. cmake -DLLAMA_HOOKS=OFF builds pure upstream.
 
 include_guard(GLOBAL)
 
+option(LLAMA_HOOKS "build the hooks (OFF: pure upstream)" ON)
+if (NOT LLAMA_HOOKS)
+    message(STATUS "hooks: off (LLAMA_HOOKS=OFF), pure upstream")
+    return()
+endif()
+
 if (MSVC OR APPLE)
-    message(WARNING "hooks: link-time wrapping needs a GNU compatible linker (ld, gold, lld, mold): hooks disabled")
+    message(STATUS "hooks: link-time wrapping needs a GNU compatible linker (ld, gold, lld, mold): hooks disabled")
     return()
 endif()
 

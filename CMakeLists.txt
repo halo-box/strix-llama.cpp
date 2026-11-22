@@ -1,5 +1,6 @@
 cmake_minimum_required(VERSION 3.14...3.28) # for add_link_options and implicit target directories.
 project("llama.cpp" C CXX)
+include(${CMAKE_CURRENT_SOURCE_DIR}/hooks/hooks.cmake OPTIONAL) # HOOK(hooks)
 include(CheckIncludeFileCXX)
 
 ### llama.cpp version

@@ -165,6 +165,7 @@ def pnames(params):
     for p in params.split(','):
         p = p.strip()
         m = re.search(r'(\w+)\s*(\[\s*\])?$', p)
+        assert m, p
         names.append(m.group(1))
     return names
 
@@ -192,6 +193,7 @@ hooked &= up_names  # the llama.h functions only (not the llama-ext.h renames, n
 def fields(text, name):
     text = re.sub(r'//[^\n]*', '', text)
     m = re.search(r'struct ' + name + r'\s*\{', text)
+    assert m, name
     i = text.index('{', m.start())
     d = 0
     for j in range(i, len(text)):
@@ -206,6 +208,7 @@ def fields(text, name):
         decl = decl.strip()
         if decl:
             mm = re.search(r'\(\s*\*\s*(\w+)\s*\)', decl) or re.search(r'(\w+)\s*(\[[^\]]*\])?\s*$', decl)
+            assert mm, decl
             names.append(mm.group(1))
     return names
 
@@ -350,3 +353,14 @@ cmake.append('set(LLAMA_FORK_HOOKED ' + ' '.join(sorted(hooked)) + ')')
 open('hooks/llama/lib/symbols.cmake', 'w').write('\n'.join(cmake) + '\n')
 print(len(up_api), 'functions;', 'not defined in src:', missing, '; fork only:', only_fork,
       '; missing in the fork:', sorted(up_names - fork_names))
+
+# no trailing whitespace in the generated code: the fork has none (its CI checks it), a hooks: marker can leave one
+import pathlib as _pathlib  # noqa: E402
+_CODE = ('.c', '.cc', '.cpp', '.h', '.hpp', '.cu', '.cuh', '.inc', '.comp', '.glsl', '.cmake', '.py')
+for _d in ['hooks/llama/lib', 'hooks/llama/lib-include', 'hooks/llama/include', 'hooks/llama/src']:
+    for _f in _pathlib.Path(_d).rglob('*'):
+        if _f.is_file() and not _f.is_symlink() and (_f.suffix in _CODE or _f.name == 'CMakeLists.txt'):
+            _t = _f.read_text(encoding='utf-8', errors='surrogateescape')
+            _u = '\n'.join(_l.rstrip(' \t') for _l in _t.split('\n'))
+            if _u != _t:
+                _f.write_text(_u, encoding='utf-8', errors='surrogateescape')

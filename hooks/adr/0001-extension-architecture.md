@@ -110,7 +110,7 @@ Positive:
 - Kernels can reuse upstream launchers and templates, so upstream improvements to them carry over.
 - The hook points are 63 lines in 21 files (`hooks/HOOKS.txt`), most of them one line each. Their number is the fixed
   cost of an upstream update.
-- Without `CMAKE_PROJECT_INCLUDE`, the same tree builds as pure upstream, for comparisons.
+- With `-DLLAMA_HOOKS=OFF`, the same tree builds as pure upstream, for comparisons.
 
 Negative:
 - Our code depends on upstream internals: interface layouts and backend context structs. An upstream change there

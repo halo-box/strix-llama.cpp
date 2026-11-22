@@ -1,5 +1,5 @@
 [environment]
-extra-paths = ["./gguf-py", "./examples/model-conversion/scripts", "./tools/server/tests", "./scripts/snapdragon/qdc/tests"]
+extra-paths = ["./gguf-py", "./examples/model-conversion/scripts", "./tools/server/tests", "./scripts/snapdragon/qdc/tests", "./hooks/apps/server/tests"] # hooks: the copy of the server tests
 python-version = "3.10"
 
 [rules]
@@ -8,6 +8,8 @@ deprecated = "warn"
 [src]
 exclude = [
     "./tools/mtmd/legacy-models/**",
+    "./hooks/apps/mtmd/legacy-models/**", # hooks: the copy of tools/mtmd
+    "./hooks/python/**", # hooks: the fork converter uses its own gguf-py, which ty cannot put on the path of one directory
 ]
 
 [[overrides]]
@@ -15,6 +17,8 @@ include = [
     "./tools/server/tests/**",
     "./scripts/snapdragon/qdc/**",
     "./tools/mtmd/tests/**",
+    "./hooks/apps/server/tests/**", # hooks: the copies of the server and mtmd tests
+    "./hooks/apps/mtmd/tests/**",
 ]
 
 [overrides.rules]

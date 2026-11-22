@@ -3,26 +3,26 @@
 Fork code that changes llama.cpp without editing upstream files. The decision is in `adr/0001-extension-architecture.md`.
 
 ```
-cmake -B build -DCMAKE_PROJECT_INCLUDE=$PWD/hooks/hooks.cmake ...   # with the hooks
-cmake -B build ...                                                  # pure upstream, same tree
+cmake -B build ...                    # with the hooks (HOOK(hooks) in CMakeLists.txt)
+cmake -B build -DLLAMA_HOOKS=OFF ...  # pure upstream, same tree
 ```
 
 ## How hooks connect to upstream
 
 | Mechanism | Upstream lines | Used for |
 |---|---|---|
-| CMake: `CMAKE_PROJECT_INCLUDE` + `cmake_language(DEFER)` | 0 | sources, include dirs, link options of upstream targets |
+| CMake: `HOOK(hooks)` after `project()` + `cmake_language(DEFER)` | 1 | sources, include dirs, link options of upstream targets |
 | Run-time wrapping of the backend interfaces | 0 | kernels, fusions, graph passes of the backends, buffer types, device memory |
 | Link-time wrapping (`-Wl,--wrap`) | 0 | activation of the backend wrapper, libllama callbacks, sampler creation, server request fields and routes |
 | Private member access (`llama-hooks-access.h`) | 0 | reading upstream state without a `friend` line |
-| Hook points (`HOOK(name)`, listed in `HOOKS.txt`) | 54 (63 lines) in 21 files | ggml types and scheduler, KV cache events and other points inside libllama, CLI arguments, quantize types, server loop |
+| Hook points (`HOOK(name)`, listed in `HOOKS.txt`) | 55 (64 lines) in 22 files | ggml types and scheduler, KV cache events and other points inside libllama, CLI arguments, quantize types, server loop |
 
 Link-time wrapping needs a GNU compatible linker (ld, gold, lld, mold). On MSVC and macOS the hooks are disabled.
 
 ## Layout
 
 ```
-hooks.cmake                 entry point (CMAKE_PROJECT_INCLUDE)
+hooks.cmake                 entry point (HOOK(hooks) in CMakeLists.txt)
 HOOKS.txt                   manifest of the hook points
 cmake/hooks-link.cmake      hooks_link (registrar, static builds), hooks_wrap (link-time wrapping)
 ggml/                       ggml-base registry, backend wrapper, CPU/CUDA/Vulkan drivers, hook types
@@ -178,7 +178,9 @@ running `llama_process`.
 - `hooks/tools/check-ctest.py <fork build> <build>`: every ctest test of a fork build is registered here, with the same
   labels.
 - `hooks/tools/check-hooks.sh <upstream base>`: every changed line outside `hooks/` belongs to a hook point of `HOOKS.txt`,
-  except in the repository files that are the fork ones (`ACTIVE_FORK_PATHS` of `import-files.py`).
+  except in the repository files that are the fork ones (`ACTIVE_FORK_PATHS` of `import-files.py`) and the upstream
+  files listed in the script with their reason: the 4 casts of the fork in `ggml-cpu/arch/x86/quants.c` (a clang build
+  error) and the linter rules of the copies in `hooks/` (`.flake8`, `ty.toml`, `.ecrc`).
 - `hooks/tools/check-port.py <upstream base> <fork>`: every line the fork added is in this branch, and every
   fork change that is not kept as it is has an entry in `hooks/PORT.txt` (adapted, restored, variant, dropped,
   pending) with its reason. `--files` gives the state of each file.

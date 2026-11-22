@@ -543,7 +543,7 @@ function(hf_download version out_var out_resolved)
     endforeach()
 endfunction()
 
-include("${UI_BINARY_DIR}/hooks-ui-assets.cmake" OPTIONAL) # HOOK(ui-assets)
+include("${CMAKE_CURRENT_LIST_DIR}/../hooks/ui/ui-assets-hooks.cmake" OPTIONAL) # HOOK(ui-assets)
 # ---------------------------------------------------------------------------
 # 1. Priority 1: pre-built assets supplied in ui/apps/chat/dist
 # ---------------------------------------------------------------------------

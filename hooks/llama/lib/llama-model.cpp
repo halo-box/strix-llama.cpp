@@ -3017,7 +3017,7 @@ static ggml_backend_buffer_type_t select_buft(const buft_list_t & buft_list, con
 }
 
 ggml_backend_buffer_type_t llama_model::select_buft(int il) const {
-    return ggml_fork::select_buft( /* hooks: namespaced */ 
+    return ggml_fork::select_buft( /* hooks: namespaced */
             *pimpl->dev_layer.at(il).buft_list,
             [&](ggml_context * ctx) {
                 ggml_tensor * cur = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hparams.n_embd);
