@@ -458,6 +458,139 @@ struct case_rollback_bound : ctx_test {
     }
 };
 
+// three sequences, then one batch in which a 5-token draft verify of one sequence is split from a later ubatch
+// of 1-token steps of the two others, as in the server with several slots. Only the verified sequence is rolled
+// back: the rollback must not be refused (the server aborts) and must read the snapshot of that sequence,
+// compared against a reference context that verified the same draft alone
+struct case_rollback_cell_move : ctx_test {
+    test_group group() const override { return TEST_GROUP_RS; }
+
+    const char * name() const override { return "rollback_cell_move"; }
+
+    const char * description() const override {
+        return "a later ubatch of the same batch does not lose or swap the rollback snapshots of a sequence";
+    }
+
+    std::string skip_reason(model_run & mr) const override {
+        if (arch_reserves_single_seq(mr.model)) {
+            return "the verify batch is a multi-seq graph";
+        }
+
+        char arch_name[64] = {};
+        llama_model_meta_val_str(mr.model, "general.architecture", arch_name, sizeof(arch_name));
+        const llm_arch arch = llama_arch_from_string(arch_name);
+        if (arch == LLM_ARCH_DEEPSEEK4 || arch == LLM_ARCH_DEEPSEEK41) {
+            return "the DSV4 cache keeps its snapshots per sequence, not per cell";
+        }
+
+        return ctx_test::skip_reason(mr);
+    }
+
+    case_result run(model_run & mr) const override {
+        const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(mr.model));
+
+        constexpr llama_pos n_prefix   = 16;
+        constexpr uint32_t  n_verify   = 5;
+        constexpr uint32_t  n_rollback = 3;
+
+        // order: the sequences decode their prefix in this order, which places them in the cells
+        // n_last: the last prefix ubatch of every sequence, a stale bound of n_last - 1 allows the rollback
+        // the split takes the verified sequence alone, then the two others, whose cells are not adjacent when
+        //   the first sequence did not get cell 0 (non-unified) or always (unified, the ids are not consecutive)
+        struct layout {
+            int          kv_unified;
+            llama_seq_id seq_verify;
+            llama_seq_id order[3];
+            llama_pos    n_last;
+        };
+
+        for (const layout & lt : {
+                layout { 0, 0, { 1, 0, 2 }, (llama_pos) n_verify - 1 },
+                layout { 0, 0, { 1, 0, 2 }, n_prefix - 4 },
+                layout { 1, 1, { 0, 1, 2 }, (llama_pos) n_verify - 1 } }) {
+            const auto make_ctx = [&]() {
+                ctx_opts opts;
+                opts.n_ctx      = 256;
+                opts.n_batch    = 64;
+                opts.n_ubatch   = 64;
+                opts.n_seq_max  = 3;
+                opts.n_rs_seq   = n_verify - 1;
+                opts.kv_unified = lt.kv_unified;
+                return mr.ctx(opts);
+            };
+
+            llama_context_ptr ctx_roll = make_ctx();
+            llama_context_ptr ctx_ref  = make_ctx();
+            if (!ctx_roll || !ctx_ref) {
+                return case_result::fail();
+            }
+
+            if (llama_n_rs_seq(ctx_roll.get()) < n_verify - 1) {
+                return case_result::skip("n_rs_seq is too small");
+            }
+
+            const std::string tag = std::string(lt.kv_unified ? "unified" : "non-unified") + ", n_last " + std::to_string(lt.n_last);
+
+            bool ok = true;
+
+            for (const llama_seq_id s : lt.order) {
+                ok = ok && decode_gen(ctx_roll.get(), n_vocab, s, 0, n_prefix - lt.n_last);
+                ok = ok && decode_gen(ctx_roll.get(), n_vocab, s, n_prefix - lt.n_last, n_prefix);
+            }
+            ok = ok && decode_gen(ctx_ref.get(), n_vocab, lt.seq_verify, 0, n_prefix - lt.n_last);
+            ok = ok && decode_gen(ctx_ref.get(), n_vocab, lt.seq_verify, n_prefix - lt.n_last, n_prefix);
+            CTX_REQUIRE(ok, tag + ": the prefix decode failed");
+
+            // the reference verifies the same draft alone, so it rolls back to a snapshot of the same ubatch
+            const auto decode_verify = [&](llama_context * ctx, bool others) {
+                common_batch batch(ctx);
+                for (uint32_t i = 0; i < n_verify; ++i) {
+                    const llama_pos pos = n_prefix + (llama_pos) i;
+                    batch.add(gen_token(n_vocab, lt.seq_verify, pos), pos, lt.seq_verify, true);
+                }
+                for (llama_seq_id s = 0; s < 3 && others; ++s) {
+                    if (s != lt.seq_verify) {
+                        batch.add(gen_token(n_vocab, s, n_prefix), n_prefix, s, true);
+                    }
+                }
+                return llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get()) == 0;
+            };
+            CTX_REQUIRE(decode_verify(ctx_roll.get(), true) && decode_verify(ctx_ref.get(), false),
+                    tag + ": the verify batch decode failed");
+
+            const llama_pos p0 = n_prefix + (llama_pos) (n_verify - n_rollback);
+
+            CTX_REQUIRE(llama_memory_seq_rm(llama_get_memory(ctx_ref.get()), lt.seq_verify, p0, -1),
+                    tag + ": the rollback of the reference was refused");
+
+            if (!llama_memory_seq_rm(llama_get_memory(ctx_roll.get()), lt.seq_verify, p0, -1)) {
+                CTX_REQUIRE(lt.kv_unified, tag + ": the rollback of the verified sequence was refused");
+                TLOG_INF("%s: %s: the rollback was refused, the snapshots of the moved sequence are gone\n", __func__, tag.c_str());
+                continue;
+            }
+
+            const llama_token tok = gen_token(n_vocab, lt.seq_verify, p0);
+            CTX_REQUIRE(decode_one(ctx_roll.get(), tok, p0, lt.seq_verify) && decode_one(ctx_ref.get(), tok, p0, lt.seq_verify),
+                    tag + ": the decode after the rollback failed");
+
+            const float * l_roll = llama_get_logits_ith(ctx_roll.get(), 0);
+            const float * l_ref  = llama_get_logits_ith(ctx_ref.get(),  0);
+            if (l_roll == nullptr || l_ref == nullptr) {
+                TLOG_ERR("%s: %s: missing logits after the rollback\n", __func__, tag.c_str());
+                return case_result::fail();
+            }
+
+            const logits_diff diff = compare_logits(l_roll, l_ref, n_vocab);
+            CTX_REQUIRE(diff.nmse() <= 1e-6,
+                    tag + ": the rollback restored another state (nmse " + std::to_string(diff.nmse()) + ")");
+
+            TLOG_INF("%s: %s: the rolled-back sequence matched (nmse %g)\n", __func__, tag.c_str(), diff.nmse());
+        }
+
+        return case_result::pass();
+    }
+};
+
 // decode a prompt into seq 0, share its cells with a second sequence, then keep decoding both
 struct case_shared_seq_reserve : ctx_test {
     test_group group() const override { return TEST_GROUP_RS; }
@@ -540,6 +673,7 @@ std::vector<ctx_test_ptr> make_rs_cases() {
 
     cases.push_back(std::make_unique<case_rollback>());
     cases.push_back(std::make_unique<case_rollback_bound>());
+    cases.push_back(std::make_unique<case_rollback_cell_move>());
     cases.push_back(std::make_unique<case_multi_seq_split_replay>());
     cases.push_back(std::make_unique<case_shared_seq_reserve>());
 
