@@ -51,7 +51,8 @@ handled = ('ggml/', 'src/', 'include/', 'common/', 'tools/server/', 'tools/mtmd/
 ACTIVE_FORK_PATHS = ('README.md', 'AGENTS.md', 'CONTRIBUTING.md', '.editorconfig', '.github/', '.agents/', '.claude/', 'docs/',
                      '.devops/',
                      # the READMEs of the programs, and the HIP register check that the fork CI runs
-                     'scripts/hip/gcn-cdna-vgpr-check.py', 'gguf-py/README.md', 'tools/cli/README.md', 'tools/completion/README.md', 'tools/llama-bench/README.md', 'tools/server/README.md', 'ui/apps/chat/README.md')
+                     'scripts/hip/gcn-cdna-vgpr-check.py', 'gguf-py/README.md', 'tools/cli/README.md', 'tools/completion/README.md', 'tools/llama-bench/README.md', 'tools/server/README.md', 'ui/apps/chat/README.md',
+                     'tests/.gitignore')  # keeps the fork test corpus (tests/corpus, tests/data) tracked
 
 
 def active(f):

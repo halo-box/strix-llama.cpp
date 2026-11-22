@@ -111,7 +111,8 @@ switch selects it. Upstream stays the default.
   scripts, tools and examples files, not active (`hooks/tools/import-fork-files.py`).
   The repository files are the fork ones, at their path: `README.md`, `AGENTS.md`, `CONTRIBUTING.md`,
   `.editorconfig`, `.github/` (CI workflows, issue and PR templates), `.devops/` (Dockerfiles), `.agents/`, `.claude/`, `docs/`, the
-  READMEs of the programs and `scripts/hip/gcn-cdna-vgpr-check.py` (run by the HIP quality check of the CI). They
+  READMEs of the programs, `scripts/hip/gcn-cdna-vgpr-check.py` (run by the HIP quality check of the CI) and
+  `tests/.gitignore` (keeps the test corpus of `tests/corpus` and `tests/data` tracked). They
   describe and test this repository and are no build input; `check-hooks.sh` skips them. The PR template drops the
   requirement to send general improvements to halo-box/llama.cpp, which is archived.
 - Upstream files that the hooks must reach inside are compiled through a hooks file that includes them
