@@ -1,4 +1,4 @@
-// hooks: ggml/src/ggml-cuda/fp8.cu of the fork (3b76dee48, upstream 9048bad8d, changed in the fork), verbatim inside
+// hooks: ggml/src/ggml-cuda/fp8.cu of the fork (403dfcb03, upstream 9048bad8d, changed in the fork), verbatim inside
 // namespace ggml_fork. Adapted lines carry "hooks:".
 #include "fp8.cuh"
 namespace ggml_fork { // hooks: the fork code is namespaced, see hooks/ggml/cuda/README.md

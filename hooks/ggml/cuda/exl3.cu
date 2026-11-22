@@ -1,4 +1,4 @@
-// hooks: ggml/src/ggml-cuda/exl3.cu of the fork (3b76dee48, upstream 9048bad8d, new in the fork), verbatim inside
+// hooks: ggml/src/ggml-cuda/exl3.cu of the fork (403dfcb03, upstream 9048bad8d, new in the fork), verbatim inside
 // namespace ggml_fork. Adapted lines carry "hooks:".
 namespace ggml_fork { // hooks: the fork code is namespaced, see hooks/ggml/cuda/README.md
 // EXL3 (exllamav3) linear on RDNA3 / RDNA4: GGML_OP_EXL3_MUL_MAT, see ggml/exl3/README.md.

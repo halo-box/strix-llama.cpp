@@ -1,4 +1,4 @@
-// hooks: src/llama-context.cpp of the fork (3b76dee48, upstream 9048bad8d, changed in the fork), verbatim inside
+// hooks: src/llama-context.cpp of the fork (403dfcb03, upstream 9048bad8d, changed in the fork), verbatim inside
 // namespace ggml_fork. Adapted lines carry "hooks:".
 struct ggml_tensor; struct ggml_context; struct ggml_cgraph; struct gguf_context; struct ggml_backend; struct ggml_backend_buffer; struct ggml_backend_buffer_type; struct ggml_backend_device; struct ggml_backend_reg; struct ggml_backend_sched; struct ggml_threadpool; struct ggml_opt_context; struct ggml_backend_event; // hooks: global
 #include "llama-context.h"
@@ -3325,7 +3325,8 @@ uint32_t llama_context::graph_max_nodes() const {
         model.arch == LLM_ARCH_MINIMAX_01 ||
         model.arch == LLM_ARCH_MINIMAX_M3 ||
         model.arch == LLM_ARCH_HY_V4 ||
-        model.arch == LLM_ARCH_INKLING2) {
+        model.arch == LLM_ARCH_INKLING2 ||
+        model.arch == LLM_ARCH_INKLING2_LOOP) {  // upstream: inkling2_loop inherits inkling2's 32 nodes per tensor
         res = std::max<uint32_t>(std::max<uint32_t>(1024u, n_ubatch * 40), 32u * model.n_tensors());
     } else if (model.arch == LLM_ARCH_DFLASH && model.hparams.dflash_selector_rank > 0) {
         // DFlash2's convolutions and selector are shape work rather than matmuls,

@@ -1,4 +1,4 @@
-// hooks: ggml/src/ggml-cuda/mmq-config-pascal-older.cuh of the fork (3b76dee48, upstream 9048bad8d, changed in the fork), verbatim inside
+// hooks: ggml/src/ggml-cuda/mmq-config-pascal-older.cuh of the fork (403dfcb03, upstream 9048bad8d, changed in the fork), verbatim inside
 // namespace ggml_fork. Adapted lines carry "hooks:".
 namespace ggml_fork { // hooks: the fork code is namespaced, see hooks/ggml/cuda/README.md
 static constexpr __host__ __device__ ggml_cuda_mmq_config ggml_cuda_mmq_get_config_pascal_older(ggml_type type, int J, bool fallback) {

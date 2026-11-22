@@ -1,4 +1,4 @@
-// hooks: ggml/src/ggml-impl.h of the fork (3b76dee48, upstream 9048bad8d), for the fork code only, verbatim
+// hooks: ggml/src/ggml-impl.h of the fork (403dfcb03, upstream 9048bad8d), for the fork code only, verbatim
 #pragma once
 
 // GGML internal header

@@ -1,4 +1,4 @@
-// hooks: ggml/src/ggml-cuda/hyperconn.cu of the fork (3b76dee48, upstream 9048bad8d, new in the fork), verbatim inside
+// hooks: ggml/src/ggml-cuda/hyperconn.cu of the fork (403dfcb03, upstream 9048bad8d, new in the fork), verbatim inside
 // namespace ggml_fork. Adapted lines carry "hooks:".
 #include <vector>
 #include <algorithm>

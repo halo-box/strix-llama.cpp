@@ -1672,3 +1672,63 @@ variant  tools/server/server-slot-sched.cpp:98  tools: the fork version in hooks
 variant  tools/server/server-slot-sched.h:24  tools: the fork version in hooks/apps, upstream by default
 variant  tools/server/server-slot-sched.h:67  tools: the fork version in hooks/apps, upstream by default
 variant  tools/server/tests/unit/test_slot_save.py:786  tools: the fork version in hooks/apps, upstream by default
+
+# fork commits 3b76dee48..403dfcb03
+variant  conversion/inkling2.py:72  the fork converter in hooks/python (python3 hooks/python/convert_hf_to_gguf.py), the upstream one unchanged
+variant  conversion/inkling2.py:277  the fork converter in hooks/python (python3 hooks/python/convert_hf_to_gguf.py), the upstream one unchanged
+adapted  src/llama-context.cpp:2923         the EXL3 op checks of the graph: ggml_fork_op(), the EXL3 ops are custom nodes
+variant  src/llama-graph.cpp:3037  llama: the fork version in hooks/llama/lib, upstream by default
+variant  src/llama-graph.cpp:3120  llama: the fork version in hooks/llama/lib, upstream by default
+variant  src/llama-graph.cpp:3611  llama: the fork version in hooks/llama/lib, upstream by default
+variant  src/llama-graph.cpp:3623  llama: the fork version in hooks/llama/lib, upstream by default
+variant  src/llama-graph.cpp:3662  llama: the fork version in hooks/llama/lib, upstream by default
+variant  src/llama-graph.cpp:3680  llama: the fork version in hooks/llama/lib, upstream by default
+variant  src/llama-graph.cpp:3689  llama: the fork version in hooks/llama/lib, upstream by default
+variant  src/llama-graph.cpp:3691  llama: the fork version in hooks/llama/lib, upstream by default
+variant  src/llama-graph.cpp:3698  llama: the fork version in hooks/llama/lib, upstream by default
+variant  src/llama-graph.cpp:4234  llama: the fork version in hooks/llama/lib, upstream by default
+variant  src/llama-graph.h:1390  llama: the fork version in hooks/llama/lib, upstream by default
+variant  src/llama-model.cpp:3346  llama: the fork version in hooks/llama/lib, upstream by default
+variant  src/llama-quant.cpp:343  llama: the fork version in hooks/llama/lib, upstream by default
+variant  src/models/inkling2.cpp:5  llama: the fork version in hooks/llama/lib, upstream by default
+variant  src/models/inkling2.cpp:9  llama: the fork version in hooks/llama/lib, upstream by default
+variant  src/models/inkling2.cpp:13  llama: the fork version in hooks/llama/lib, upstream by default
+variant  src/models/inkling2.cpp:17  llama: the fork version in hooks/llama/lib, upstream by default
+variant  src/models/inkling2.cpp:19  llama: the fork version in hooks/llama/lib, upstream by default
+variant  src/models/inkling2.cpp:31  llama: the fork version in hooks/llama/lib, upstream by default
+variant  src/models/inkling2.cpp:40  llama: the fork version in hooks/llama/lib, upstream by default
+variant  src/models/inkling2.cpp:44  llama: the fork version in hooks/llama/lib, upstream by default
+variant  src/models/inkling2.cpp:51  llama: the fork version in hooks/llama/lib, upstream by default
+variant  src/models/inkling2.cpp:53  llama: the fork version in hooks/llama/lib, upstream by default
+variant  src/models/inkling2.cpp:56  llama: the fork version in hooks/llama/lib, upstream by default
+variant  src/models/inkling2.cpp:65  llama: the fork version in hooks/llama/lib, upstream by default
+variant  src/models/inkling2.cpp:67  llama: the fork version in hooks/llama/lib, upstream by default
+variant  src/models/inkling2.cpp:70  llama: the fork version in hooks/llama/lib, upstream by default
+variant  src/models/inkling2.cpp:93  llama: the fork version in hooks/llama/lib, upstream by default
+variant  src/models/inkling2.cpp:95  llama: the fork version in hooks/llama/lib, upstream by default
+variant  src/models/inkling2.cpp:102  llama: the fork version in hooks/llama/lib, upstream by default
+variant  src/models/inkling2.cpp:104  llama: the fork version in hooks/llama/lib, upstream by default
+variant  src/models/inkling2.cpp:117  llama: the fork version in hooks/llama/lib, upstream by default
+variant  src/models/inkling2.cpp:148  llama: the fork version in hooks/llama/lib, upstream by default
+variant  src/models/inkling2.cpp:150  llama: the fork version in hooks/llama/lib, upstream by default
+variant  src/models/inkling2.cpp:155  llama: the fork version in hooks/llama/lib, upstream by default
+variant  src/models/inkling2.cpp:160  llama: the fork version in hooks/llama/lib, upstream by default
+variant  src/models/inkling2.cpp:166  llama: the fork version in hooks/llama/lib, upstream by default
+variant  src/models/inkling2.cpp:175  llama: the fork version in hooks/llama/lib, upstream by default
+variant  src/models/inkling2.cpp:179  llama: the fork version in hooks/llama/lib, upstream by default
+variant  src/models/inkling2.cpp:185  llama: the fork version in hooks/llama/lib, upstream by default
+variant  src/models/inkling2.cpp:190  llama: the fork version in hooks/llama/lib, upstream by default
+variant  src/models/inkling2.cpp:193  llama: the fork version in hooks/llama/lib, upstream by default
+variant  src/models/inkling2.cpp:213  llama: the fork version in hooks/llama/lib, upstream by default
+variant  src/models/inkling2.cpp:218  llama: the fork version in hooks/llama/lib, upstream by default
+variant  src/models/inkling2.cpp:237  llama: the fork version in hooks/llama/lib, upstream by default
+variant  src/models/inkling2.cpp:245  llama: the fork version in hooks/llama/lib, upstream by default
+variant  src/models/inkling2.cpp:259  llama: the fork version in hooks/llama/lib, upstream by default
+variant  src/models/inkling2.cpp:273  llama: the fork version in hooks/llama/lib, upstream by default
+variant  src/models/inkling2.cpp:304  llama: the fork version in hooks/llama/lib, upstream by default
+variant  src/models/inkling2.cpp:310  llama: the fork version in hooks/llama/lib, upstream by default
+variant  src/models/inkling2.cpp:313  llama: the fork version in hooks/llama/lib, upstream by default
+variant  src/models/models.h:2455  llama: the fork version in hooks/llama/lib, upstream by default
+variant  tests/test-llama-archs.cpp:329  the fork test in hooks/apps/tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-llama-archs.cpp:699  the fork test in hooks/apps/tests (test-<name>-fork), the upstream test unchanged
+variant  tests/test-llama-archs.cpp:822  the fork test in hooks/apps/tests (test-<name>-fork), the upstream test unchanged

@@ -1,4 +1,4 @@
-// hooks: src/llama-arch.h of the fork (3b76dee48, upstream 9048bad8d, changed in the fork), verbatim inside
+// hooks: src/llama-arch.h of the fork (403dfcb03, upstream 9048bad8d, changed in the fork), verbatim inside
 // namespace ggml_fork. Adapted lines carry "hooks:".
 #pragma once
 struct ggml_tensor; struct ggml_context; struct ggml_cgraph; struct gguf_context; struct ggml_backend; struct ggml_backend_buffer; struct ggml_backend_buffer_type; struct ggml_backend_device; struct ggml_backend_reg; struct ggml_backend_sched; struct ggml_threadpool; struct ggml_opt_context; struct ggml_backend_event; // hooks: global
@@ -193,6 +193,7 @@ enum llm_arch {
     LLM_ARCH_LIMITE,
     LLM_ARCH_RICURSIVE,
     LLM_ARCH_INKLING2,
+    LLM_ARCH_INKLING2_LOOP,
     LLM_ARCH_UNKNOWN,
 };
 
@@ -292,6 +293,11 @@ enum llm_kv {
     LLM_KV_HRM_H_CYCLES,
     LLM_KV_HRM_L_CYCLES,
     LLM_KV_HRM_PREFIX_LM,
+    LLM_KV_LOOP_START,
+    LLM_KV_LOOP_END,
+    LLM_KV_LOOP_COUNT,
+    LLM_KV_LOOP_GATE_RANK,
+    LLM_KV_LOOP_VARYING,
     LLM_KV_METIS_PASS_COUNT,
     LLM_KV_METIS_MEMORY_LENGTH,
     LLM_KV_METIS_ROUTE_LENGTH,
@@ -617,6 +623,19 @@ enum llm_tensor {
     LLM_TENSOR_FFN_LATENT_UP,
     LLM_TENSOR_FFN_POST_CONV,
     LLM_TENSOR_FFN_RES_QUERY,
+    LLM_TENSOR_LOOP_MSG_QUERY,
+    LLM_TENSOR_LOOP_Q_CTRL_DOWN,
+    LLM_TENSOR_LOOP_Q_CTRL_GAIN,
+    LLM_TENSOR_LOOP_Q_CTRL_FORGET,
+    LLM_TENSOR_LOOP_K_CTRL_DOWN,
+    LLM_TENSOR_LOOP_K_CTRL_GAIN,
+    LLM_TENSOR_LOOP_K_CTRL_FORGET,
+    LLM_TENSOR_LOOP_V_CTRL_DOWN,
+    LLM_TENSOR_LOOP_V_CTRL_GAIN,
+    LLM_TENSOR_LOOP_V_CTRL_FORGET,
+    LLM_TENSOR_LOOP_FFN_CTRL_DOWN,
+    LLM_TENSOR_LOOP_FFN_CTRL_GAIN,
+    LLM_TENSOR_LOOP_FFN_CTRL_FORGET,
     LLM_TENSOR_STREAM_EMBD,
     LLM_TENSOR_DEPTH_MEM_STATE_WRITE,
     LLM_TENSOR_DEPTH_MEM_META_WRITE,

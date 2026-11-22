@@ -1,4 +1,4 @@
-// hooks: common/common.h of the fork (3b76dee48, upstream 9048bad8d, changed in the fork), verbatim inside
+// hooks: common/common.h of the fork (403dfcb03, upstream 9048bad8d, changed in the fork), verbatim inside
 // namespace ggml_fork. Adapted lines carry "hooks:".
 // Various helper functions and utilities
 

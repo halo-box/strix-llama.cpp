@@ -1,4 +1,4 @@
-// hooks: ggml/src/ggml-cuda/softmax.cu of the fork (3b76dee48, upstream 9048bad8d, changed in the fork), verbatim inside
+// hooks: ggml/src/ggml-cuda/softmax.cu of the fork (403dfcb03, upstream 9048bad8d, changed in the fork), verbatim inside
 // namespace ggml_fork. Adapted lines carry "hooks:".
 #include "common.cuh"
 #include "ggml.h"
