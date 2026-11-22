@@ -62,8 +62,8 @@ env:
   ROCM_VERSION: ${{ github.event.inputs.rocm_version || '10.1.0a20260910' }}
   VULKAN_SDK_VERSION: 1.4.357.0
   LLAMACPP_VERSION: ${{ github.event.inputs.llamacpp_version || 'latest' }}
-  # on a push, build exactly the merged commit
-  BUILD_SHA: ${{ github.event_name == 'push' && github.sha || '' }}
+  # on a push, build exactly the merged commit; on a pull request, its head
+  BUILD_SHA: ${{ github.event_name == 'push' && github.sha || github.event.pull_request.head.sha || '' }}
 
 jobs:
   prepare-matrix:
@@ -279,7 +279,7 @@ jobs:
           git clone --filter=blob:none --single-branch --branch $llamacppVersion https://github.com/${{ github.repository }}.git llama.cpp
         }
         cd llama.cpp
-        if ("${{ env.BUILD_SHA }}" -ne "") { git checkout --detach "${{ env.BUILD_SHA }}" }
+        if ("${{ env.BUILD_SHA }}" -ne "") { git fetch --filter=blob:none origin "${{ env.BUILD_SHA }}"; git checkout --detach "${{ env.BUILD_SHA }}" }
 
         # Get commit hash (5 digits) and store it as environment variable
         $commitHash = git rev-parse --short=5 HEAD
@@ -649,7 +649,7 @@ jobs:
           git clone --filter=blob:none --single-branch --branch "$llamacpp_version" https://github.com/${{ github.repository }}.git llama.cpp
         fi
         cd llama.cpp
-        if [ -n "${{ env.BUILD_SHA }}" ]; then git checkout --detach "${{ env.BUILD_SHA }}"; fi
+        if [ -n "${{ env.BUILD_SHA }}" ]; then git fetch --filter=blob:none origin "${{ env.BUILD_SHA }}"; git checkout --detach "${{ env.BUILD_SHA }}"; fi
 
         # Get commit hash (5 digits) and store it as environment variable
         commit_hash=$(git rev-parse --short=5 HEAD)
