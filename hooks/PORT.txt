@@ -1228,9 +1228,9 @@ variant  common/speculative.cpp:3115  fork_tools: the fork version in hooks/apps
 variant  tools/llama-bench/llama-bench.cpp:481  fork_tools: the fork version in hooks/apps, upstream by default
 variant  tools/llama-bench/llama-bench.cpp:1303  fork_tools: the fork version in hooks/apps, upstream by default
 variant  tools/llama-bench/llama-bench.cpp:1608  fork_tools: the fork version in hooks/apps, upstream by default
-variant  tools/server/README.md:243  fork_tools: the fork version in hooks/apps, upstream by default
-variant  tools/server/README.md:1578  fork_tools: the fork version in hooks/apps, upstream by default
-variant  tools/server/README.md:1597  fork_tools: the fork version in hooks/apps, upstream by default
+variant  tools/server/README.md:243  the fork version is active at its path (repository file, hooks/tools/import-fork-files.py)
+variant  tools/server/README.md:1578  the fork version is active at its path (repository file, hooks/tools/import-fork-files.py)
+variant  tools/server/README.md:1597  the fork version is active at its path (repository file, hooks/tools/import-fork-files.py)
 variant  tools/server/server-common.cpp:713  fork_tools: the fork version in hooks/apps, upstream by default
 variant  tools/server/server-common.cpp:800  fork_tools: the fork version in hooks/apps, upstream by default
 variant  tools/server/server-common.cpp:1679  fork_tools: the fork version in hooks/apps, upstream by default
@@ -1475,10 +1475,10 @@ variant  docs/speculative.md:485  the fork version is active at its path (reposi
 variant  gguf-py/gguf/gguf_writer.py:48  the fork version in hooks/python/gguf-py/gguf/gguf_writer.py (python3 hooks/python/convert_hf_to_gguf.py), upstream by default
 variant  gguf-py/gguf/gguf_writer.py:147  the fork version in hooks/python/gguf-py/gguf/gguf_writer.py (python3 hooks/python/convert_hf_to_gguf.py), upstream by default
 variant  gguf-py/gguf/gguf_writer.py:384  the fork version in hooks/python/gguf-py/gguf/gguf_writer.py (python3 hooks/python/convert_hf_to_gguf.py), upstream by default
-variant  scripts/hip/gcn-cdna-vgpr-check.py:3  the fork version in hooks/fork-files/scripts/hip/gcn-cdna-vgpr-check.py, not active; the upstream file stays
-variant  scripts/hip/gcn-cdna-vgpr-check.py:7  the fork version in hooks/fork-files/scripts/hip/gcn-cdna-vgpr-check.py, not active; the upstream file stays
-variant  scripts/hip/gcn-cdna-vgpr-check.py:67  the fork version in hooks/fork-files/scripts/hip/gcn-cdna-vgpr-check.py, not active; the upstream file stays
-variant  scripts/hip/gcn-cdna-vgpr-check.py:71  the fork version in hooks/fork-files/scripts/hip/gcn-cdna-vgpr-check.py, not active; the upstream file stays
+variant  scripts/hip/gcn-cdna-vgpr-check.py:3  the fork version is active at its path (repository file, hooks/tools/import-fork-files.py)
+variant  scripts/hip/gcn-cdna-vgpr-check.py:7  the fork version is active at its path (repository file, hooks/tools/import-fork-files.py)
+variant  scripts/hip/gcn-cdna-vgpr-check.py:67  the fork version is active at its path (repository file, hooks/tools/import-fork-files.py)
+variant  scripts/hip/gcn-cdna-vgpr-check.py:71  the fork version is active at its path (repository file, hooks/tools/import-fork-files.py)
 adapted  scripts/ui-assets.cmake:44  the fork validation of split UI builds: HOOK(ui-assets) includes hooks/ui/ui-assets-hooks.cmake
 adapted  scripts/ui-assets.cmake:101  the fork validation of split UI builds: HOOK(ui-assets) includes hooks/ui/ui-assets-hooks.cmake
 adapted  scripts/ui-assets.cmake:103  the fork validation of split UI builds: HOOK(ui-assets) includes hooks/ui/ui-assets-hooks.cmake
@@ -1606,7 +1606,7 @@ variant  tests/test-reasoning-budget.cpp:338  the fork test in hooks/apps/fork-t
 variant  tests/test-reasoning-budget.cpp:515  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
 variant  tests/test-server-component.cpp:760  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
 variant  tests/test-server-component.cpp:878  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
-variant  ui/apps/chat/README.md:131  the fork version in hooks/fork-files/ui/apps/chat/README.md, not active; the upstream file stays
+variant  ui/apps/chat/README.md:131  the fork version is active at its path (repository file, hooks/tools/import-fork-files.py)
 variant  ui/apps/chat/src/lib/components/app/navigation/SidebarNavigation/SidebarNavigationActions.svelte:96  the fork version in hooks/fork-files/ui/apps/chat/src/lib/components/app/navigation/SidebarNavigation/SidebarNavigationActions.svelte, not active; the upstream file stays
 variant  ui/apps/chat/src/lib/components/app/navigation/SidebarNavigation/SidebarNavigationActions.svelte:109  the fork version in hooks/fork-files/ui/apps/chat/src/lib/components/app/navigation/SidebarNavigation/SidebarNavigationActions.svelte, not active; the upstream file stays
 variant  ui/apps/chat/src/lib/constants/ui.constants.ts:8  the fork version in hooks/fork-files/ui/apps/chat/src/lib/constants/ui.constants.ts, not active; the upstream file stays

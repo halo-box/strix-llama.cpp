@@ -49,7 +49,9 @@ handled = ('ggml/', 'src/', 'include/', 'common/', 'tools/server/', 'tools/mtmd/
 # the fork version at its path, whole directories included (the fork deletes and renames files there); also listed in
 # hooks/tools/check-hooks.sh
 ACTIVE_FORK_PATHS = ('README.md', 'AGENTS.md', 'CONTRIBUTING.md', '.editorconfig', '.github/', '.agents/', '.claude/', 'docs/',
-                     '.devops/')
+                     '.devops/',
+                     # the READMEs of the programs, and the HIP register check that the fork CI runs
+                     'scripts/hip/gcn-cdna-vgpr-check.py', 'gguf-py/README.md', 'tools/cli/README.md', 'tools/completion/README.md', 'tools/llama-bench/README.md', 'tools/server/README.md', 'ui/apps/chat/README.md')
 
 
 def active(f):

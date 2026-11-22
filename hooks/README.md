@@ -110,7 +110,8 @@ switch selects it. Upstream stays the default.
   (`python3 hooks/python/convert_hf_to_gguf.py`); `fork-files/<path>` keeps the fork version of the UI sources,
   scripts, tools and examples files, not active (`hooks/tools/import-fork-files.py`).
   The repository files are the fork ones, at their path: `README.md`, `AGENTS.md`, `CONTRIBUTING.md`,
-  `.editorconfig`, `.github/` (CI workflows, issue and PR templates), `.devops/` (Dockerfiles), `.agents/`, `.claude/` and `docs/`. They
+  `.editorconfig`, `.github/` (CI workflows, issue and PR templates), `.devops/` (Dockerfiles), `.agents/`, `.claude/`, `docs/`, the
+  READMEs of the programs and `scripts/hip/gcn-cdna-vgpr-check.py` (run by the HIP quality check of the CI). They
   describe and test this repository and are no build input; `check-hooks.sh` skips them. The PR template drops the
   requirement to send general improvements to halo-box/llama.cpp, which is archived.
 - Upstream files that the hooks must reach inside are compiled through a hooks file that includes them

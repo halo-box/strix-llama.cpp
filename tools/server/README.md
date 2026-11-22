@@ -73,6 +73,7 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `--rpc SERVERS` | comma-separated list of RPC servers (host:port)<br/>(env: LLAMA_ARG_RPC) |
 | `-lm, --load-mode MODE` | model loading mode (default: auto)<br/>- auto: mmap, unless a device does not support it<br/>- none: no special loading mode<br/>- mmap: memory-map model (if mmap disabled, slower load but may reduce pageouts if not using mlock)<br/>- mlock: force system to keep model in RAM rather than swapping or compressing<br/>- mmap+mlock: mmap + force system to keep model in RAM rather than swapping or compressing<br/>- dio: use DirectIO if available<br/><br/>(env: LLAMA_ARG_LOAD_MODE) |
 | `-lzm, --lazy-mode MODE` | on-demand reading of certain tensors, for example per-layer embeddings (default: auto)<br/>- on: read the rows of such tensors from disk on demand instead of keeping them resident (requires mmap)<br/>- auto: on, but only for tensors larger than 4 GiB<br/>- off: always keep them resident<br/>(env: LLAMA_ARG_LAZY_MODE) |
+| `--ple FNAME` | GGUF with per-layer embedding (PLE) tables to use instead of the tables in the model file; each tensor in it replaces the lookup table of the same name in the model and must have the same shape (default: unused)<br/>(env: LLAMA_ARG_PLE) |
 | `--numa TYPE` | attempt optimizations that help on some NUMA systems<br/>- distribute: spread execution evenly over all nodes<br/>- isolate: only spawn threads on CPUs on the node that execution started on<br/>- numactl: use the CPU map provided by numactl<br/>if run without this previously, it is recommended to drop the system page cache before using this<br/>see https://github.com/ggml-org/llama.cpp/issues/1437<br/>(env: LLAMA_ARG_NUMA) |
 | `-dev, --device <dev1,dev2,..>` | comma-separated list of devices to use for offloading (none = don't offload)<br/>use --list-devices to see a list of available devices<br/>(env: LLAMA_ARG_DEVICE) |
 | `--list-devices` | print list of available devices and exit |
@@ -239,8 +240,16 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `--reasoning-format FORMAT` | controls whether thought tags are allowed and/or extracted from the response, and in which format they're returned; one of:<br/>- none: leaves thoughts unparsed in `message.content`<br/>- deepseek: puts thoughts in `message.reasoning_content`<br/>- deepseek-legacy: keeps `<think>` tags in `message.content` while also populating `message.reasoning_content`<br/>(default: auto)<br/>(env: LLAMA_ARG_THINK) |
 | `-rea, --reasoning [on\|off\|auto]` | Use reasoning/thinking in the chat ('on', 'off', or 'auto', default: 'auto' (detect from template))<br/>(env: LLAMA_ARG_REASONING) |
 | `--reasoning-effort LEVEL` | reasoning effort level given to the chat template: 'default' to keep the template default,<br/>or a level such as 'minimal', 'low', 'medium', 'high', 'xhigh' or 'max' (default: default)<br/>(env: LLAMA_ARG_REASONING_EFFORT) |
+| `--reasoning-budget-enable, --no-reasoning-budget-enable` | master switch for hard cutoff, soft warnings, intro message, grace period, and runtime reasoning control (default: disabled)<br/>(env: LLAMA_ARG_THINK_BUDGET_ENABLE) |
 | `--reasoning-budget N` | token budget for thinking: -1 for unrestricted, 0 for immediate end, N>0 for token budget (default: -1)<br/>(env: LLAMA_ARG_THINK_BUDGET) |
-| `--reasoning-budget-message MESSAGE` | message injected before the end-of-thinking tag when reasoning budget is exhausted (default: none)<br/>(env: LLAMA_ARG_THINK_BUDGET_MESSAGE) |
+| `--reasoning-budget-message MESSAGE` | message forced when the reasoning budget is exhausted; include the model's closing tag when required by the template (default: none)<br/>(env: LLAMA_ARG_THINK_BUDGET_MESSAGE) |
+| `--reasoning-budget-soft-ratio N` | fraction of the budget consumed before the first soft warning; <= 0 disables (default: -1) |
+| `--reasoning-budget-soft-message MESSAGE` | first soft-warning message, injected at a newline boundary |
+| `--reasoning-budget-soft2-ratio N` | fraction of the budget consumed before the second soft warning; <= 0 disables (default: -1) |
+| `--reasoning-budget-soft2-message MESSAGE` | second soft-warning message, injected at a newline boundary |
+| `--reasoning-budget-intro-mode MODE` | `every` forces the intro for every reasoning block; `once` suppresses it when already present in the prompt (default: every) |
+| `--reasoning-budget-intro-message MESSAGE` | message forced at the start of reasoning; `{budget}` is replaced by the configured budget |
+| `--reasoning-budget-grace-tokens N` | tokens to allow after budget exhaustion while waiting for a paragraph break (default: 0) |
 | `--reasoning-preserve, --no-reasoning-preserve` | preserve reasoning trace in the full history, not just the last assistant message (default: enabled)<br/>compatible with certain templates having 'supports_preserve_reasoning' capability<br/>example: https://docs.z.ai/guides/capabilities/thinking-mode#preserved-thinking<br/>(env: LLAMA_ARG_REASONING_PRESERVE) |
 | `--chat-template JINJA_TEMPLATE` | set custom jinja chat template (default: template taken from model's metadata)<br/>if suffix/prefix are specified, template will be disabled<br/>only commonly used templates are accepted (unless --jinja is set before this flag):<br/>list of built-in templates:<br/>bailing, bailing-think, bailing2, chatglm3, chatglm4, chatml, command-r, deepseek, deepseek-ocr, deepseek2, deepseek3, exaone-moe, exaone3, exaone4, falcon3, gemma, gigachat, glmedge, gpt-oss, granite, granite-4.0, granite-4.1, grok-2, hunyuan-dense, hunyuan-moe, hunyuan-vl, kimi-k2, llama2, llama2-sys, llama2-sys-bos, llama2-sys-strip, llama3, llama4, megrez, minicpm, mistral-v1, mistral-v3, mistral-v3-tekken, mistral-v7, mistral-v7-tekken, monarch, openchat, orion, pangu-embedded, phi3, phi4, rwkv-world, seed_oss, smolvlm, solar-open, vicuna, vicuna-orca, yandex, zephyr<br/>(env: LLAMA_ARG_CHAT_TEMPLATE) |
 | `--chat-template-file JINJA_TEMPLATE_FILE` | set custom jinja chat template file (default: template taken from model's metadata)<br/>if suffix/prefix are specified, template will be disabled<br/>only commonly used templates are accepted (unless --jinja is set before this flag):<br/>list of built-in templates:<br/>bailing, bailing-think, bailing2, chatglm3, chatglm4, chatml, command-r, deepseek, deepseek-ocr, deepseek2, deepseek3, exaone-moe, exaone3, exaone4, falcon3, gemma, gigachat, glmedge, gpt-oss, granite, granite-4.0, granite-4.1, grok-2, hunyuan-dense, hunyuan-moe, hunyuan-vl, kimi-k2, llama2, llama2-sys, llama2-sys-bos, llama2-sys-strip, llama3, llama4, megrez, minicpm, mistral-v1, mistral-v3, mistral-v3-tekken, mistral-v7, mistral-v7-tekken, monarch, openchat, orion, pangu-embedded, phi3, phi4, rwkv-world, seed_oss, smolvlm, solar-open, vicuna, vicuna-orca, yandex, zephyr<br/>(env: LLAMA_ARG_CHAT_TEMPLATE_FILE) |
@@ -1263,6 +1272,54 @@ In *router mode* the query param `?model={model_id}` has to be set. This endpoin
 | `llamacpp:spec_decode_num_drafts_total` | Counter | Total speculative decoding verification steps (0 when spec-decode is off). |
 | `llamacpp:spec_decode_num_accepted_tokens_per_pos_total` | Counter | Accepted tokens per draft position (labeled `position="N"`; absent when spec-decode is off or before the first completed speculative request). |
 
+### GET `/dashboard`: Live stats dashboard
+
+A single self-contained page (no external resources, works offline, light/dark, phone-sized screens) that polls `/dashboard/stats` every 1.5 s and shows, per model:
+
+- decode and prefill tokens/s: live (running slots), last request, average since start, and a 10-minute throughput chart for each
+- speculative / MTP draft acceptance rate and mean accepted length (when a `--spec-type` is set)
+- slots and their state, prompt progress, KV/context usage per slot and in total, deferred (queued) requests
+- the last finished requests with their timings, and the model/configuration (file, size, type, architecture, context, KV cache type, speculative settings, PLE on disk)
+
+It needs no flag and is independent of the chat UI (it is also served with `--no-ui`). The page itself is public and holds no data; the JSON it reads requires the API key when `--api-key` is set (the page asks for it and keeps it in the browser's localStorage). No prompts or generated text are exposed.
+
+In *router mode* (`--models-preset` / `--models-dir`) the dashboard lists every model with its status (`loaded`, `sleeping`, `loading`, `unloaded`, failed) and shows the live stats of the running ones.
+
+### GET `/dashboard/stats`: Dashboard data
+
+Returns the data behind `/dashboard`. Polling it does not reset the `--sleep-idle-seconds` timer and does not wake a sleeping model (the stats from before sleep are returned). In router mode the router queries each running child (in parallel, 1.5 s timeout) and adds the models that are not running.
+
+```json
+{
+  "mode": "single",            // or "router"
+  "build_info": "b11336-2e63e11b6",
+  "t_now_ms": 1790946801345,
+  "models": [{
+    "id": "qwen35-2b",
+    "status": "loaded",        // loaded | sleeping | loading | unloaded | downloading
+    "info": {
+      "file": "Qwen3.5-2B-UD-Q4_K_XL.gguf", "arch": "qwen35", "ftype": "Q4_K - Medium",
+      "size_bytes": 1328790784, "n_params": 1881825088, "n_ctx_train": 262144,
+      "config": { "n_ctx": 8192, "n_ctx_slot": 4096, "n_parallel": 2, "cache_type_k": "f16",
+                  "speculative": { "types": "ngram-simple", "n_max": 3, "n_min": 0 }, "lazy_mode": "auto", ... }
+    },
+    "stats": {                 // null when the model is not running
+      "slots":  [{ "id": 0, "state": "generating", "n_ctx": 4096, "n_tokens": 118, "n_gen": 45,
+                   "prompt_tps": 126.0, "gen_tps": 20.9, "draft": { "acceptance": 0.06, "mean_accepted_len": 3.0, ... } }],
+      "kv":     { "n_ctx": 8192, "n_ctx_slot": 4096, "n_used": 226, "unified": false },
+      "queue":  { "n_slots": 2, "n_processing": 1, "n_deferred": 0 },
+      "totals": { "n_requests": 9, "n_prompt": 157, "n_gen": 779, "prompt_tps": 133.0, "gen_tps": 21.6,
+                  "draft": { "n_draft": 66, "n_accepted": 4, "acceptance": 0.06, "mean_accepted_len": 3.0, "acceptance_per_pos": [1.0, 1.0] } },
+      "recent": [{ "t_end_ms": 1790946821451, "id_slot": 0, "n_prompt": 20, "n_cached": 0, "n_gen": 111,
+                   "prompt_tps": 166.1, "gen_tps": 26.1, "draft": { ... }, "stop": "eos", "truncated": false }],
+      "series": { "period_s": 2.0, "t_ms": [...], "gen_tps": [...], "prompt_tps": [...] }   // last 10 minutes
+    }
+  }]
+}
+```
+
+`gen_tps` follows the server's timings (decode steps per second, the first token is excluded); `series` is the aggregate throughput over all slots in 2 s buckets; `recent` keeps the last 64 requests.
+
 ### POST `/slots/{id_slot}?action=save`: Save the prompt cache of the specified slot to a file.
 
 *Options:*
@@ -1470,6 +1527,8 @@ The `response_format` parameter supports both plain JSON output (e.g. `{"type": 
 
 `reasoning_control`: Arms realtime reasoning control for this completion so it can be ended early via `/v1/chat/completions/control`. Defaults to `false`.
 
+`reasoning_budget_enabled`: Explicit master switch for reasoning budget, soft-warning, intro, grace, and runtime reasoning control fields. Omit it to keep the server or CLI default.
+
 `parallel_tool_calls` : Whether to enable parallel/multiple tool calls (only supported on some models, verification is based on jinja template).
 
 For multimodal input (typed content, `messages[i].content[j]`):
@@ -1575,7 +1634,11 @@ The response also includes a standard `usage` object:
         "total_tokens": 92,
         "prompt_tokens_details": {
             "cached_tokens": 0
-        }
+        },
+        "completion_tokens_details": {
+            "reasoning_tokens": 12
+        },
+        "reasoning": 12
     }
 }
 ```
@@ -1586,6 +1649,10 @@ The server supports parsing and returning reasoning via the `reasoning_content` 
 
 Reasoning input (preserve reasoning in history) is also supported by some specific templates. For more details, please refer to [PR#18994](https://github.com/ggml-org/llama.cpp/pull/18994).
 
+Reasoning budget controls can force a hard cutoff, insert soft warnings, insert an intro message, and wait for a paragraph break after budget exhaustion. Set `reasoning_budget_enabled` in a request to override the server or CLI default.
+
+Chat Completions usage reports reasoning tokens in `usage.reasoning` and `usage.completion_tokens_details.reasoning_tokens`. Responses usage reports them in `usage.reasoning` and `usage.output_tokens_details.reasoning_tokens`.
+
 ### POST `/v1/chat/completions/control`: Control a running chat completion in real time
 
 Acts on an in-flight completion identified by its `id` (the `id` field streamed back by `/v1/chat/completions`). The request is processed in parallel with the SSE stream, so the client sends it while still reading tokens.
@@ -1594,7 +1661,7 @@ Acts on an in-flight completion identified by its `id` (the `id` field streamed 
 
 `id`: (Required) The chat completion id to act on. A completion that has already finished matches nothing and the call is a no-op.
 
-`action`: (Required) The control action to perform. Currently the only supported value is `reasoning_end`, which forces the end of the current reasoning block so the model moves on to the final answer. Requires `reasoning_control: true` on the original completion request.
+`action`: (Required) The control action to perform. Currently the only supported value is `reasoning_end`, which forces the end of the current reasoning block so the model moves on to the final answer. Requires the reasoning budget master switch and `reasoning_control: true` on the original completion request.
 
 `model`: (Required in router mode) The model name, used to route the request to the right instance. Ignored in single model mode.
 
@@ -2177,6 +2244,15 @@ We also offer additional options that are exclusive to presets (these aren't tre
 - `load-on-startup` (boolean): Controls whether the model loads automatically when the server starts. Only applies at startup: if the model list is reloaded later (for example after editing the preset file), a newly added model is listed but not loaded
 - `stop-timeout` (int, seconds): After requested unload, wait for this many seconds before forcing termination (default: 10)
 - `dedup-cache-models` (boolean): When the preset uses `hf-repo` pointing to a model that is already downloaded, hide the corresponding cached model entry from `GET /models` (the preset entry remains visible). Set it in the `[*]` section to apply to all presets.
+- `hidden` (boolean): Omit this model from `GET /models` and `GET /v1/models`. The model can still be loaded and used by requesting it by name, so this only affects listings such as the model picker in the web UI. Useful for entries that are not meant to be picked directly, e.g. a draft/MTP GGUF that is discovered from the HF cache:
+
+  ```ini
+  ; hides the auto-discovered cache entry, which is only useful as a draft model
+  [ggml-org/MY-MODEL-MTP-GGUF:Q4_K_M]
+  hidden = 1
+  ```
+
+  A section whose name matches an existing model merges into that model's entry rather than creating a new one, so a stub section with just `hidden = 1` is enough to hide a model that came from the HF cache or from `--models-dir`.
 
 ### Routing requests
 
