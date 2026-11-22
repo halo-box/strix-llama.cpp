@@ -1661,3 +1661,14 @@ variant  tools/server/server-common.cpp:1820  tools: the fork version in hooks/a
 variant  tools/server/server-context.cpp:457  tools: the fork version in hooks/apps, upstream by default
 variant  tools/server/server-context.cpp:1988  tools: the fork version in hooks/apps, upstream by default
 variant  tools/server/server-context.cpp:2006  tools: the fork version in hooks/apps, upstream by default
+
+# fork commits 25b1c175e..3b76dee48
+variant  common/common.cpp:2421  tools: the fork version in hooks/apps, upstream by default
+variant  tools/server/server-context.cpp:2771  tools: the fork version in hooks/apps, upstream by default
+variant  tools/server/server-context.cpp:2830  tools: the fork version in hooks/apps, upstream by default
+variant  tools/server/server-context.cpp:4197  tools: the fork version in hooks/apps, upstream by default
+variant  tools/server/server-context.cpp:4200  tools: the fork version in hooks/apps, upstream by default
+variant  tools/server/server-slot-sched.cpp:98  tools: the fork version in hooks/apps, upstream by default
+variant  tools/server/server-slot-sched.h:24  tools: the fork version in hooks/apps, upstream by default
+variant  tools/server/server-slot-sched.h:67  tools: the fork version in hooks/apps, upstream by default
+variant  tools/server/tests/unit/test_slot_save.py:786  tools: the fork version in hooks/apps, upstream by default

@@ -155,6 +155,25 @@ for f in [x for x in git('ls-tree', '--name-only', REF, 'tests/').split() if x.e
                      global_main=True)
     open(os.path.join(tdir, os.path.basename(f)), 'w').write(src)
 
+# test-llama-context is built from several files (tests/llama-context/): when the fork changes one of them, the whole
+# test is copied, its layout kept (test-llama-context-fork in hooks/apps/apps.cmake)
+import shutil  # noqa: E402
+lc_files = ['tests/test-llama-context.cpp'] + [x for x in git('ls-tree', '-r', '--name-only', REF, 'tests/llama-context/').split() if x]
+for f in lc_files:
+    out = os.path.join(tdir, f[len('tests/'):])
+    if os.path.exists(out) and f != 'tests/test-llama-context.cpp':
+        os.remove(out)
+shutil.rmtree(os.path.join(tdir, 'llama-context'), ignore_errors=True)
+if os.path.exists(os.path.join(tdir, 'test-llama-context.cpp')):
+    os.remove(os.path.join(tdir, 'test-llama-context.cpp'))
+if any(f in changed for f in lc_files):
+    up = set(git('ls-tree', '-r', '--name-only', BASE, 'tests/').split())
+    for f in lc_files:
+        out = os.path.join(tdir, f[len('tests/'):])
+        os.makedirs(os.path.dirname(out), exist_ok=True)
+        state = 'new' if f not in up else ('changed' if f in changed else 'unchanged')
+        open(out, 'w').write(namespaced(f, git('show', f'{REF}:{f}'), state, out, global_main=f == 'tests/test-llama-context.cpp'))
+
 
 # test_reallocation: the fork allocator keeps each chunk at least its current size on a re-reserve (its cached plans
 # hold offsets into the chunks), so the second graph takes 24 + 20 bytes; the fork did not update its test

@@ -1,4 +1,4 @@
-// hooks: ggml/src/ggml-vulkan/ggml-vulkan-common.h of the fork (25b1c175e, upstream 9048bad8d, changed in the fork), verbatim inside
+// hooks: ggml/src/ggml-vulkan/ggml-vulkan-common.h of the fork (3b76dee48, upstream 9048bad8d, changed in the fork), verbatim inside
 // namespace ggml_fork. Adapted lines carry "hooks:".
 #pragma once
 #include "ggml-vulkan-push-constants.h"

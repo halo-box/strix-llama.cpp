@@ -1,4 +1,4 @@
-// hooks: ggml/src/ggml-cuda/ggml-cuda.cu of the fork (25b1c175e, upstream 9048bad8d, changed in the fork), verbatim inside
+// hooks: ggml/src/ggml-cuda/ggml-cuda.cu of the fork (3b76dee48, upstream 9048bad8d, changed in the fork), verbatim inside
 // namespace ggml_fork. Adapted lines carry "hooks:".
 #include "ggml-cuda.h"
 #define ggml_backend_cuda_init ggml_fork_backend_cuda_init // hooks: the fork definition, not the upstream API

@@ -1,4 +1,4 @@
-// hooks: ggml/src/ggml-cuda/qsa-prefill.cu of the fork (25b1c175e, upstream 9048bad8d, new in the fork), verbatim inside
+// hooks: ggml/src/ggml-cuda/qsa-prefill.cu of the fork (3b76dee48, upstream 9048bad8d, new in the fork), verbatim inside
 // namespace ggml_fork. Adapted lines carry "hooks:".
 #include "qsa-prefill.cuh"
 namespace ggml_fork { // hooks: the fork code is namespaced, see hooks/ggml/cuda/README.md

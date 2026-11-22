@@ -1,4 +1,4 @@
-// hooks: ggml/src/ggml-cuda/conv3d.cuh of the fork (25b1c175e, upstream 9048bad8d, changed in the fork), verbatim inside
+// hooks: ggml/src/ggml-cuda/conv3d.cuh of the fork (3b76dee48, upstream 9048bad8d, changed in the fork), verbatim inside
 // namespace ggml_fork. Adapted lines carry "hooks:".
 namespace ggml_fork { // hooks: the fork code is namespaced, see hooks/ggml/cuda/README.md
 #ifndef GGML_CUDA_CONV3D_CUH

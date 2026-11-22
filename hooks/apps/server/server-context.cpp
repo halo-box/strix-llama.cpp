@@ -1,4 +1,4 @@
-// hooks: tools/server/server-context.cpp of the fork (25b1c175e, upstream 9048bad8d, changed in the fork), verbatim inside
+// hooks: tools/server/server-context.cpp of the fork (3b76dee48, upstream 9048bad8d, changed in the fork), verbatim inside
 // namespace ggml_fork. Adapted lines carry "hooks:".
 struct ggml_tensor; struct ggml_context; struct ggml_cgraph; struct gguf_context; struct ggml_backend; struct ggml_backend_buffer; struct ggml_backend_buffer_type; struct ggml_backend_device; struct ggml_backend_reg; struct ggml_backend_sched; struct ggml_threadpool; struct ggml_opt_context; struct ggml_backend_event; // hooks: global
 #include "server-context.h"
@@ -38,6 +38,8 @@ namespace ggml_fork { // hooks: the fork code is namespaced, see hooks/apps/READ
 #include <deque>
 #include <cstddef>
 #include <cinttypes>
+#include <cerrno>
+#include <cstring>
 #include <deque>
 #include <exception>
 #include <memory>
@@ -1181,6 +1183,9 @@ private:
 
     std::unique_ptr<server_prompt_cache> prompt_cache;
 
+    // --ctx-checkpoints-dir: the checkpoints whose state is still in memory, oldest first
+    mutable std::list<std::weak_ptr<common_prompt_checkpoint>> ckpt_in_mem;
+
     server_metrics metrics;
 
     // queued prompt stats - llama_decode() is async, so the timing is only valid after a sync
@@ -1880,6 +1885,22 @@ private:
         if (params_base.n_ctx_checkpoints > 0) {
             SRV_TRC("context checkpoints enabled, max = %d, min spacing = %d\n",
                     params_base.n_ctx_checkpoints, params_base.checkpoint_min_step);
+            if (!params_base.ctx_checkpoints_dir.empty()) {
+#if defined(_WIN32)
+                SRV_WRN("%s", "--ctx-checkpoints-dir is not supported on Windows - context checkpoints stay in memory\n");
+                params_base.ctx_checkpoints_dir.clear();
+#else
+                common_prompt_checkpoint probe;
+                probe.data_tgt.resize(1);
+                if (!probe.spill(params_base.ctx_checkpoints_dir)) {
+                    const int err = errno;
+                    SRV_ERR("cannot create files in --ctx-checkpoints-dir %s: %s\n", params_base.ctx_checkpoints_dir.c_str(), strerror(err));
+                    return false;
+                }
+                SRV_INF("context checkpoints beyond %d MiB are written to unlinked files in %s, oldest first\n",
+                        params_base.ctx_checkpoints_ram_mib, params_base.ctx_checkpoints_dir.c_str());
+#endif
+            }
         } else {
             SRV_TRC("%s", "context checkpoints disabled\n");
         }
@@ -3033,12 +3054,55 @@ private:
         // stash the draft's speculative state with the checkpoint
         common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
 
+        hold_checkpoint(ckpt);
+
         slot.prompt.checkpoints.push_back(std::move(ckpt));
 
         SLT_TRC(slot,
                 "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                 (int) slot.prompt.checkpoints.size(), params_base.n_ctx_checkpoints, cur.pos_min,
                 cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
+    }
+
+    // --ctx-checkpoints-dir: checkpoints stay in memory while they fit in --ctx-checkpoints-ram, past that the
+    // oldest are written to unlinked files - a server with memory to spare writes nothing
+    void hold_checkpoint(const std::shared_ptr<common_prompt_checkpoint> & ckpt) const {
+        if (params_base.ctx_checkpoints_dir.empty()) {
+            return;
+        }
+
+        ckpt_in_mem.push_back(ckpt);
+
+        // checkpoints that are gone or already written no longer count
+        size_t n_mem = 0;
+        for (auto it = ckpt_in_mem.begin(); it != ckpt_in_mem.end(); ) {
+            const auto cur = it->lock();
+            if (!cur || cur->file) {
+                it = ckpt_in_mem.erase(it);
+                continue;
+            }
+            n_mem += cur->size_mem();
+            ++it;
+        }
+
+        const size_t n_max = (size_t) params_base.ctx_checkpoints_ram_mib * 1024 * 1024;
+
+        while (n_mem > n_max && !ckpt_in_mem.empty()) {
+            const auto cur = ckpt_in_mem.front().lock();
+            const size_t n_before = cur->size_mem();
+            if (!cur->spill(params_base.ctx_checkpoints_dir)) {
+                // it stays in memory and in the list, the next checkpoint tries again
+                const int err = errno;
+                SRV_WRN("could not move a context checkpoint to %s (%s) - it stays in memory\n",
+                        params_base.ctx_checkpoints_dir.c_str(), strerror(err));
+                break;
+            }
+            ckpt_in_mem.pop_front();
+            n_mem -= n_before - cur->size_mem();
+            SRV_DBG("wrote a context checkpoint of %.3f MiB to %s, %.3f MiB of checkpoints in memory\n",
+                    (float) (n_before - cur->size_mem()) / 1024 / 1024, params_base.ctx_checkpoints_dir.c_str(),
+                    (float) n_mem / 1024 / 1024);
+        }
     }
 
     // checkpoints are appended to the slot save file, after the llama state payload
@@ -3096,13 +3160,31 @@ private:
         ckpt_write(ofs, &magic,   sizeof(magic),   n_written);
         ckpt_write(ofs, &version, sizeof(version), n_written);
         ckpt_write(ofs, &count,   sizeof(count),   n_written);
+        std::vector<uint8_t> buf;
         for (const auto & ckpt : slot.prompt.checkpoints) {
             const auto & cur = *ckpt;
             ckpt_write(ofs, &cur.n_tokens, sizeof(cur.n_tokens), n_written);
             ckpt_write(ofs, &cur.pos_min,  sizeof(cur.pos_min),  n_written);
             ckpt_write(ofs, &cur.pos_max,  sizeof(cur.pos_max),  n_written);
-            ckpt_write_buf(ofs, cur.data_tgt,  n_written);
-            ckpt_write_buf(ofs, cur.data_dft,  n_written);
+            if (!cur.file) {
+                ckpt_write_buf(ofs, cur.data_tgt, n_written);
+                ckpt_write_buf(ofs, cur.data_dft, n_written);
+                ckpt_write_buf(ofs, cur.data_spec, n_written);
+                continue;
+            }
+            // a checkpoint written to --ctx-checkpoints-dir is read back one part at a time
+            buf.resize(cur.size_tgt());
+            if (!cur.copy_tgt(buf.data())) {
+                SRV_WRN("failed to read a context checkpoint for '%s' - the appendix is incomplete\n", filepath.c_str());
+                return false;
+            }
+            ckpt_write_buf(ofs, buf, n_written);
+            buf.resize(cur.size_dft());
+            if (!cur.copy_dft(buf.data())) {
+                SRV_WRN("failed to read a context checkpoint for '%s' - the appendix is incomplete\n", filepath.c_str());
+                return false;
+            }
+            ckpt_write_buf(ofs, buf, n_written);
             ckpt_write_buf(ofs, cur.data_spec, n_written);
         }
         ofs.flush();
@@ -3160,7 +3242,8 @@ private:
             }
         }
         // the slot file does not check the draft context - test-load one draft checkpoint, drop the draft data if it does not fit
-        if (ctx_dft != nullptr && !checkpoints.empty() && !checkpoints.back()->data_dft.empty()) {
+        //   size_dft(), not data_dft: with --ctx-checkpoints-dir the draft data is already in the checkpoint's file
+        if (ctx_dft != nullptr && !checkpoints.empty() && checkpoints.back()->size_dft() > 0) {
             const bool ok = checkpoints.back()->load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
             llama_memory_seq_rm(llama_get_memory(ctx_dft), slot.id, -1, -1);
             if (!ok) {
@@ -3169,6 +3252,10 @@ private:
                     cur->clear_dft();
                 }
             }
+        }
+        // after the trim and the draft test-load: a dropped checkpoint or dropped draft data is not written to --ctx-checkpoints-dir
+        for (const auto & cur : checkpoints) {
+            hold_checkpoint(cur);
         }
         slot.prompt.checkpoints.assign(checkpoints.begin(), checkpoints.end());
         SLT_INF(slot, "restored %zu context checkpoint(s) from '%s'\n", slot.prompt.checkpoints.size(), filepath.c_str());
@@ -4547,11 +4634,14 @@ private:
                                     // restore the context checkpoint
                                     if (!cur.load_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) ||
                                         !cur.load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY)) {
-                                        if (cur.id_task != -1) {
+                                        // a checkpoint made here and held in memory always loads - anything else is a bug
+                                        if (cur.id_task != -1 && !cur.file) {
                                             GGML_ABORT("failed to restore context checkpoint\n");
                                         }
-                                        // restored from a slot file, not guaranteed to load - fall back to full prompt re-processing
-                                        SLT_WRN(slot, "%s", "failed to load context checkpoint restored from a slot file\n");
+                                        // restored from a slot file (not guaranteed to load) or read back from --ctx-checkpoints-dir
+                                        // (a disk error) - fall back to full prompt re-processing
+                                        SLT_WRN(slot, "failed to load context checkpoint %s\n",
+                                                cur.id_task == -1 ? "restored from a slot file" : "from --ctx-checkpoints-dir");
                                         reuse = {};
                                     } else {
                                         // restore the draft's speculative state

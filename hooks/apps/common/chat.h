@@ -1,4 +1,4 @@
-// hooks: common/chat.h of the fork (25b1c175e, upstream 9048bad8d, unchanged in the fork), verbatim inside
+// hooks: common/chat.h of the fork (3b76dee48, upstream 9048bad8d, unchanged in the fork), verbatim inside
 // namespace ggml_fork. Adapted lines carry "hooks:".
 // Chat support (incl. tool call grammar constraining & output parsing) w/ generic & custom template handlers.
 

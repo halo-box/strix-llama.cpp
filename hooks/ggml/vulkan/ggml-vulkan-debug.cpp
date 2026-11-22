@@ -1,4 +1,4 @@
-// hooks: ggml/src/ggml-vulkan/ggml-vulkan-debug.cpp of the fork (25b1c175e, upstream 9048bad8d, changed in the fork), verbatim inside
+// hooks: ggml/src/ggml-vulkan/ggml-vulkan-debug.cpp of the fork (3b76dee48, upstream 9048bad8d, changed in the fork), verbatim inside
 // namespace ggml_fork. Adapted lines carry "hooks:".
 #include "ggml-vulkan-common.h"
 namespace ggml_fork { // hooks: the fork code is namespaced, see hooks/ggml/vulkan/README.md

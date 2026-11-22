@@ -1,4 +1,4 @@
-// hooks: common/arg.cpp of the fork (25b1c175e, upstream 9048bad8d, changed in the fork), verbatim inside
+// hooks: common/arg.cpp of the fork (3b76dee48, upstream 9048bad8d, changed in the fork), verbatim inside
 // namespace ggml_fork. Adapted lines carry "hooks:".
 struct ggml_tensor; struct ggml_context; struct ggml_cgraph; struct gguf_context; struct ggml_backend; struct ggml_backend_buffer; struct ggml_backend_buffer_type; struct ggml_backend_device; struct ggml_backend_reg; struct ggml_backend_sched; struct ggml_threadpool; struct ggml_opt_context; struct ggml_backend_event; // hooks: global
 #include "arg.h"
@@ -1726,6 +1726,26 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.checkpoint_min_step = value;
         }
     ).set_env("LLAMA_ARG_CHECKPOINT_MIN_SPACING_NT").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--ctx-checkpoints-dir"}, "PATH",
+        "write the context checkpoints that do not fit in --ctx-checkpoints-ram to unlinked files in this directory, "
+        "oldest first; they are read back only to rewind a slot. Each checkpoint written costs its size in disk writes, "
+        "and a directory on tmpfs saves no RAM (default: none, all checkpoints stay in memory)",
+        [](common_params & params, const std::string & value) {
+            params.ctx_checkpoints_dir = value;
+        }
+    ).set_env("LLAMA_ARG_CTX_CHECKPOINTS_DIR").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--ctx-checkpoints-ram"}, "N",
+        string_format("with --ctx-checkpoints-dir, the MiB of context checkpoints kept in memory; past that the oldest are "
+                      "written to the directory (default: %d, 0 = write every checkpoint)", params.ctx_checkpoints_ram_mib),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("ctx-checkpoints-ram must be non-negative");
+            }
+            params.ctx_checkpoints_ram_mib = value;
+        }
+    ).set_env("LLAMA_ARG_CTX_CHECKPOINTS_RAM").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"-cram", "--cache-ram"}, "N",
         string_format("set the maximum cache size in MiB (default: %d, 0 for decision models, -1 - no limit, 0 - disable)"
