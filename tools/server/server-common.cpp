@@ -1847,7 +1847,10 @@ std::vector<llama_token_data> get_token_probabilities(llama_context * ctx, int i
     const auto * logits = llama_get_logits_ith(ctx, idx);
     const llama_token * sampled_ids = llama_get_sampled_candidates_ith(ctx, idx);
 
-    const int n_logits = llama_get_sampled_logits_count_ith(ctx, idx);
+    // the row was not backend-sampled: report the raw logits over the full vocab
+    const int n_logits = llama_get_sampled_logits_ith(ctx, idx)
+        ? (int) llama_get_sampled_logits_count_ith(ctx, idx)
+        : llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx)));
 
     cur.resize(n_logits);
     if (sampled_ids) {
