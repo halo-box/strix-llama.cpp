@@ -95,6 +95,8 @@ int dev_index_of(ggml_backend_dev_t dev) {
 
 ggml_backend_dev_t cuda_dev(int device) {
     static ggml_backend_dev_t devs[GGML_CUDA_MAX_DEVICES] = {};
+    static std::mutex m; // the first fork node can come from several threads
+    std::lock_guard<std::mutex> lock(m);
     if (!devs[device]) {
         devs[device] = ggml_backend_reg_dev_get(ggml_backend_cuda_reg(), device);
     }

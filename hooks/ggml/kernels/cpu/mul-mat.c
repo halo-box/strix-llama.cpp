@@ -688,6 +688,6 @@ size_t ggml_hook_fork_mul_mat_id_work_size(int n_tasks, const struct ggml_tensor
     cur += CACHE_LINE_SIZE*n_as + CACHE_LINE_SIZE;
     // Workspace for tiled (see tiled.h)
     cur = GGML_PAD(cur, 64);
-    cur += ggml_tiled_wdata_size(n_tasks, node);
+    cur += ggml_tiled_wdata_size(n_tasks, (struct ggml_tensor *) (uintptr_t) node); // hooks: the upstream declaration takes a non-const tensor
     return cur;
 }

@@ -119,6 +119,10 @@ for src_dir, dst_dir in TREES:
         os.makedirs(os.path.dirname(out), exist_ok=True)
         if not f.endswith(('.cpp', '.h', '.hpp')):
             data = subprocess.run(['git', 'show', f'{REF}:{f}'], capture_output=True, check=True).stdout
+            if f.endswith('.py') and f in upstream and data == subprocess.run(['git', 'show', f'{BASE}:{f}'], capture_output=True, check=True).stdout:
+                if os.path.exists(out):
+                    os.remove(out)
+                continue  # a Python file the fork did not change: the upstream one runs (the server tests grep the tree)
             open(out, 'wb').write(data)  # as it is (CMake files, scripts, assets)
             continue
         src = git('show', f'{REF}:{f}')

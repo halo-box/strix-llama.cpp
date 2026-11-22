@@ -33,16 +33,28 @@ bool graph_on() {
     return on;
 }
 
+// the fork registry: its first call initializes the fork Vulkan instance, which has no lock of its own. Upstream does it
+// once at backend load; the bridge does it at the first fork node, maybe from several threads (contexts created in
+// parallel), so once here.
+ggml_backend_reg_t fork_reg() {
+    static ggml_backend_reg_t reg = ggml_fork::ggml_fork_backend_vk_reg();
+    return reg;
+}
+
+std::mutex dev_mutex;
+
 ggml_backend_dev_t fork_dev(size_t device) {
     static ggml_backend_dev_t devs[64] = {};
+    std::lock_guard<std::mutex> lock(dev_mutex);
     if (!devs[device]) {
-        devs[device] = ggml_backend_reg_dev_get(ggml_fork::ggml_fork_backend_vk_reg(), device);
+        devs[device] = ggml_backend_reg_dev_get(fork_reg(), device);
     }
     return devs[device];
 }
 
 ggml_backend_dev_t upstream_dev(size_t device) {
     static ggml_backend_dev_t devs[64] = {};
+    std::lock_guard<std::mutex> lock(dev_mutex);
     if (!devs[device]) {
         devs[device] = ggml_hook_vk_upstream_dev(device);
     }
@@ -57,7 +69,7 @@ size_t dev_index(ggml_backend_dev_t dev) {
 
 // an object the fork created for a fork device: the upstream device of the same index instead
 ggml_backend_dev_t to_upstream(ggml_backend_dev_t dev) {
-    ggml_backend_reg_t freg = ggml_fork::ggml_fork_backend_vk_reg();
+    ggml_backend_reg_t freg = fork_reg();
     for (size_t i = 0; i < ggml_backend_reg_dev_count(freg); ++i) {
         if (dev == fork_dev(i)) {
             return upstream_dev(i);
@@ -129,7 +141,7 @@ void * graph_proc_address(ggml_backend_reg_t, const char * name) {
     if (!graph_on()) {
         return nullptr;
     }
-    ggml_backend_reg_t freg = ggml_fork::ggml_fork_backend_vk_reg();
+    ggml_backend_reg_t freg = fork_reg();
     return freg->iface.get_proc_address ? freg->iface.get_proc_address(freg, name) : nullptr;
 }
 
