@@ -148,12 +148,32 @@ target_compile_features(test-ggml-hooks PRIVATE cxx_std_17)
 # the test declares a backend extension: it needs the registrar of the executable
 hooks_link(test-ggml-hooks UNITS)
 
-# the EXL3 decode self-test of the fork (tests/CMakeLists.txt of the fork), next to the decoder
-if (GGML_EXL3 AND TARGET vendor::hash)
-    add_executable(test-exl3 ${GGML_HOOKS_DIR}/exl3/test_exl3.c)
-    target_link_libraries(test-exl3 PRIVATE ggml vendor::hash)
-    target_include_directories(test-exl3 PRIVATE ${GGML_HOOKS_DIR}/exl3 ${CMAKE_SOURCE_DIR}/vendor)
-    add_test(NAME test-exl3 COMMAND test-exl3)
+# the codec and EXL3 self-tests of the fork (tests/CMakeLists.txt of the fork), next to their sources, with the fork
+# conditions and the main label
+if (LLAMA_BUILD_TESTS AND NOT GGML_BACKEND_DL AND GGML_CPU)
+    # rocmfpx.c is part of ggml-base (GGML_API entry points): linked, not compiled a second time
+    add_executable(test-rocmfpx ${GGML_HOOKS_DIR}/types/rocmfpx/test_rocmfpx.c)
+    target_link_libraries(test-rocmfpx PRIVATE ggml $<$<NOT:$<C_COMPILER_ID:MSVC>>:m>) # the codecs use libm
+    target_include_directories(test-rocmfpx PRIVATE ${GGML_HOOKS_DIR}/types/rocmfpx)
+    add_test(NAME test-rocmfpx COMMAND test-rocmfpx WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+    set_tests_properties(test-rocmfpx PROPERTIES LABELS main)
+    # the standalone ROCmFP2 reference encoder: compiled into its test
+    add_executable(test-rocmfp2-reference ${GGML_HOOKS_DIR}/types/rocmfpx/test_rocmfp2_reference.c
+                                          ${GGML_HOOKS_DIR}/types/rocmfpx/rocmfp2_reference.c)
+    target_link_libraries(test-rocmfp2-reference PRIVATE ggml $<$<NOT:$<C_COMPILER_ID:MSVC>>:m>) # the codecs use libm
+    target_include_directories(test-rocmfp2-reference PRIVATE ${GGML_HOOKS_DIR}/types/rocmfpx)
+    if (NOT MSVC)
+        target_compile_options(test-rocmfp2-reference PRIVATE -ffp-contract=off)
+    endif()
+    add_test(NAME test-rocmfp2-reference COMMAND test-rocmfp2-reference WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+    set_tests_properties(test-rocmfp2-reference PROPERTIES LABELS main)
+    if (GGML_EXL3 AND TARGET vendor::hash)
+        add_executable(test-exl3 ${GGML_HOOKS_DIR}/exl3/test_exl3.c)
+        target_link_libraries(test-exl3 PRIVATE ggml vendor::hash)
+        target_include_directories(test-exl3 PRIVATE ${GGML_HOOKS_DIR}/exl3 ${CMAKE_SOURCE_DIR}/vendor)
+        add_test(NAME test-exl3 COMMAND test-exl3 WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+        set_tests_properties(test-exl3 PROPERTIES LABELS main)
+    endif()
 endif()
 
 # HIP: the fork ggml-cuda sources (hooks/ggml/fork-cuda, namespace ggml_fork) in the upstream backend, the same list as

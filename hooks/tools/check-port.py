@@ -8,7 +8,9 @@
 #   code there). Short or common lines (braces, "return true;", ...) are not checked.
 # - every hunk where the fork removed upstream lines must be listed in hooks/PORT.txt: the port keeps upstream code,
 #   the entry says what happened to the fork version.
-# Lines and hunks listed in hooks/PORT.txt as "dropped" are not checked; each entry gives the reason.
+# Lines and hunks listed in hooks/PORT.txt as "dropped" are not checked; each entry gives the reason. The lines of the
+# "adapted" and "restored" hunks are rewritten, so they do not fail the check, but the ones not found as they are get
+# counted and listed (--missing, marked ADAPTED): read them, an adapted hunk can lose a part (a ctest rule did).
 #
 # hooks/PORT.txt, one entry per line:
 #   <status> <path>[:<upstream line of the hunk>] <reason>
@@ -83,6 +85,8 @@ diff = git('diff', '-U0', '--no-renames', base, fork)
 
 stats = collections.OrderedDict()
 missing = []
+adapted_missing = []  # lines of adapted/restored hunks not found as they are
+adapted_total = 0
 removals = []  # (path, line, n)
 cur = None
 hunk_line = None
@@ -118,10 +122,15 @@ for line in diff.splitlines():
         if not checked(text):
             continue
         e = entry(cur, hunk_line)
-        if e and e[0] in ('dropped', 'adapted', 'restored'):
+        if e and e[0] == 'dropped':
+            continue
+        n = norm(text)
+        if e and e[0] in ('adapted', 'restored'):
+            adapted_total += 1
+            if n not in lines_by_path.get(cur, ()) and n not in hooks_lines:
+                adapted_missing.append((cur, hunk_line, text))
             continue
         stats[cur][0] += 1
-        n = norm(text)
         if n in lines_by_path.get(cur, ()) or n in hooks_lines:
             stats[cur][1] += 1
         else:
@@ -146,10 +155,14 @@ if missing_path:
             out.write(f'{path}:{l}: {text}\n')
         for path, l, n in unlisted:
             out.write(f'UNLISTED {path}:{l} ({n} upstream lines removed)\n')
+        for path, l, text in adapted_missing:
+            out.write(f'ADAPTED {path}:{l}: {text}\n')
 
 print(f'fork {git("rev-parse", "--short=9", fork).strip()} vs upstream {git("rev-parse", "--short=9", base).strip()}: {len(stats)} files')
 print(f'added lines kept: {found}/{total} ({100.0 * found / max(total, 1):.1f} %), files complete: {files_done}/{len(stats)}')
 print(f'hunks that remove upstream lines: {len(removals)}, not in hooks/PORT.txt: {len(unlisted)}')
+print(f'lines of adapted/restored hunks found as they are: {adapted_total - len(adapted_missing)}/{adapted_total} '
+      f'(the others are rewritten: --missing lists them, marked ADAPTED)')
 by_status = collections.Counter(s for s, _ in ledger.values())
 print('hooks/PORT.txt: ' + ', '.join(f'{k} {v}' for k, v in sorted(by_status.items())))
 sys.exit(0 if not missing and not unlisted else 1)

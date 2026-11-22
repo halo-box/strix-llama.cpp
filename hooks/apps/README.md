@@ -21,8 +21,13 @@ The fork tests pass with the fork switches (`GGML_HOOKS=+fork_sched,+fork_llama,
 `test-mtp-draft-vocab` needs a qwen35 model with an MTP head (`-m`, for example Qwen3.5-0.8B-MTP Q8_0). Adapted:
 `test_reallocation` of `test-alloc` expects 44 bytes, since the fork allocator keeps each chunk at least its current
 size on a re-reserve (its cached plans hold offsets into the chunks); the fork test still expects the upstream 40.
-Run `test-chat-fork` from the repository root: it reads the chat templates under `models/templates`, as the fork
-test does with `WORKING_DIRECTORY` set to the source directory.
+With the tests on (`LLAMA_BUILD_TESTS`), the fork tests are built and registered in ctest as the fork registers them:
+the tests new in the fork under their fork names (`test-qsa-fast`, `test-qwen4exp-mtp-cache-only`, ...), the fork
+versions of upstream tests as `<name>-fork` next to the upstream ones, with the fork labels (`ctest -L main`,
+`ctest -L behavior`), arguments and working directories. They run with the fork switches of the backends of the build
+(`GGML_HOOKS=+fork_sched,+fork_llama`, plus `+fork_cuda_graph` or `+fork_vk_graph`). `hooks/tools/check-ctest.py
+<fork build> <build>` checks that every ctest test of a fork build is registered here with the same labels.
+Run `test-chat-fork` by hand from the repository root: it reads the chat templates under `models/templates`.
 
 With `fork_cuda_graph`, the upstream `test-backend-ops` fails 6 `GATED_DELTA_NET` cases (S_v = 128, 256 tokens or
 more), at an NMSE of about 2e-7 against the upstream bound of 1e-7. Those cases use the fork chunked prefill on fp16

@@ -175,6 +175,8 @@ running `llama_process`.
 
 ## Checks
 
+- `hooks/tools/check-ctest.py <fork build> <build>`: every ctest test of a fork build is registered here, with the same
+  labels.
 - `hooks/tools/check-hooks.sh <upstream base>`: every changed line outside `hooks/` belongs to a hook point of `HOOKS.txt`,
   except in the repository files that are the fork ones (`ACTIVE_FORK_PATHS` of `import-fork-files.py`).
 - `hooks/tools/check-port.py <upstream base> <fork>`: every line the fork added is in this branch, and every
