@@ -68,7 +68,10 @@ lines_by_path = {}
 hooks_lines = set()
 for f in tree_files:
     try:
-        content = open(f, encoding='utf-8', errors='replace').read().splitlines()
+        if os.path.islink(f):
+            content = [os.readlink(f)]  # git stores a symlink as its target
+        else:
+            content = open(f, encoding='utf-8', errors='replace').read().splitlines()
     except (IsADirectoryError, FileNotFoundError):
         continue
     s = set(norm(l) for l in content)

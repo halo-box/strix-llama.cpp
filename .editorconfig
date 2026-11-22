@@ -33,6 +33,11 @@ indent_style = tab
 trim_trailing_whitespace = unset
 insert_final_newline = unset
 
+# test texts kept byte for byte as their sources publish them (tabs in code and data included)
+[tests/corpus/*.txt]
+indent_style = unset
+trim_trailing_whitespace = unset
+
 [models/templates/*.jinja]
 indent_style = unset
 indent_size = unset

@@ -4,7 +4,8 @@
 #   python3 hooks/python/convert_hf_to_gguf.py runs the fork converter (it puts its own gguf-py on sys.path);
 # - hooks/fork-files/<path>: the fork version of every other changed file (docs, CI workflows, the UI sources,
 #   scripts, repository files), as it is. They are not active: copy one over the upstream file to use it.
-# - README.md: the fork README, at the root (ACTIVE_FORK_FILES): it describes this repository.
+# - the repository files (README, contributing and agent guides, docs, CI workflows and templates): the fork version at
+#   their path (ACTIVE_FORK_PATHS), since they describe and test this repository. No build input.
 # Run from the repository root:
 #   hooks/tools/import-fork-files.py [fork ref] [upstream base]
 import os
@@ -25,7 +26,8 @@ def git(*a):
 
 
 def put(dst, f):
-    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    if os.path.dirname(dst):
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
     open(dst, 'wb').write(git_bytes('show', f'{REF}:{f}'))
 
 
@@ -44,16 +46,29 @@ open('hooks/python/README.md', 'w').write(
 # everything else that the fork changed and that no other part of the port carries
 handled = ('ggml/', 'src/', 'include/', 'common/', 'tools/server/', 'tools/mtmd/', 'tools/llama-bench/', 'tools/quantize/',
            'examples/speculative-prefill/', 'tests/', 'conversion/', 'gguf-py/', 'convert_hf_to_gguf.py', 'hooks/')
-ACTIVE_FORK_FILES = ('README.md',)  # the fork version at its path; also listed in hooks/tools/check-hooks.sh
-for f in ACTIVE_FORK_FILES:
-    open(f, 'wb').write(git_bytes('show', f'{REF}:{f}'))
+# the fork version at its path, whole directories included (the fork deletes and renames files there); also listed in
+# hooks/tools/check-hooks.sh
+ACTIVE_FORK_PATHS = ('README.md', 'AGENTS.md', 'CONTRIBUTING.md', '.editorconfig', '.github/', '.agents/', '.claude/', 'docs/')
+
+
+def active(f):
+    return any(f == a or (a.endswith('/') and f.startswith(a)) for a in ACTIVE_FORK_PATHS)
+
+
+for a in ACTIVE_FORK_PATHS:
+    if a.endswith('/'):
+        shutil.rmtree(a, ignore_errors=True)
+# git archive keeps the modes and the symlinks (the agent skills)
+archive = subprocess.run(['git', 'archive', REF, '--', *[a.rstrip('/') for a in ACTIVE_FORK_PATHS]],
+                         capture_output=True, check=True).stdout
+subprocess.run(['tar', '-x', '-f', '-'], input=archive, check=True)
 shutil.rmtree('hooks/fork-files', ignore_errors=True)
 n = 0
 for line in git('diff', '--name-status', BASE, REF).split('\n'):
     if not line:
         continue
     status, f = line.split('\t')[0], line.split('\t')[-1]
-    if status.startswith('D') or f.startswith(handled) or f in ACTIVE_FORK_FILES:
+    if status.startswith('D') or f.startswith(handled) or active(f):
         continue
     if status.startswith('A') and os.path.isfile(f) and not os.path.islink(f) and open(f, 'rb').read() == git_bytes('show', f'{REF}:{f}'):
         continue  # a new file of the fork, already at its path
@@ -64,7 +79,7 @@ print(n, 'files in hooks/fork-files')
 
 # the PR template of the fork asks to send general llama.cpp improvements to halo-box/llama.cpp: that repository is
 # archived (SYNC.md of the fork), the requirement is not kept
-p = 'hooks/fork-files/.github/pull_request_template.md'
+p = '.github/pull_request_template.md'
 t = open(p).read()
 rule = ('- This change is Strix Halo specific, or justified by measurements on Strix Halo. General llama.cpp improvements\n  belong in [halo-box/llama.cpp](https://github.com/halo-box/llama.cpp) instead\n')
 assert t.count(rule) == 1

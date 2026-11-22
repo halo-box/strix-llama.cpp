@@ -33,7 +33,7 @@ llama/fork-src, fork-include  the fork libllama (fork_llama)
 apps/                       the fork common, tools, example and tests (fork_tools)
 python/                     the fork converter
 ui/                         the fork check of the UI assets (HOOK(ui-assets))
-fork-files/                 the fork version of the files that are not built here
+fork-files/                 the fork version of the UI sources, scripts, tools and examples files, not active
   src/fork-sched/           the fork scheduler, graph allocator and sanitizer (fork_sched)
 llama/                      libllama hooks (models/, passes/ globbed), common and server wiring
 common/, server/            common and server hooks (args/, handlers/ globbed)
@@ -107,10 +107,12 @@ switch selects it. Upstream stays the default.
   `scripts/ui-assets.cmake` refuses. `HOOK(ui-assets)` includes `ui/ui-assets-hooks.cmake` (the fork check) through a
   file that only hooks builds write next to the UI build.
 - Files that are not built here: `python/` is the fork converter with its `conversion/` and `gguf-py/`
-  (`python3 hooks/python/convert_hf_to_gguf.py`); `fork-files/<path>` keeps the fork version of the docs, CI
-  workflows, UI sources, scripts and repository files, not active (`hooks/tools/import-fork-files.py`).
-  The root `README.md` is the fork README: it is the one file outside `hooks/` whose fork version is active, and
-  `check-hooks.sh` skips it (documentation only).
+  (`python3 hooks/python/convert_hf_to_gguf.py`); `fork-files/<path>` keeps the fork version of the UI sources,
+  scripts, tools and examples files, not active (`hooks/tools/import-fork-files.py`).
+  The repository files are the fork ones, at their path: `README.md`, `AGENTS.md`, `CONTRIBUTING.md`,
+  `.editorconfig`, `.github/` (CI workflows, issue and PR templates), `.agents/`, `.claude/` and `docs/`. They
+  describe and test this repository and are no build input; `check-hooks.sh` skips them. The PR template drops the
+  requirement to send general improvements to halo-box/llama.cpp, which is archived.
 - Upstream files that the hooks must reach inside are compiled through a hooks file that includes them
   (`ggml/src/ggml-backend-upstream.cpp`, `ggml/src/ggml-cuda-upstream.cu`); the original is marked as a header.
 
@@ -172,7 +174,7 @@ running `llama_process`.
 ## Checks
 
 - `hooks/tools/check-hooks.sh <upstream base>`: every changed line outside `hooks/` belongs to a hook point of `HOOKS.txt`,
-  except in the root `README.md` (the fork README).
+  except in the repository files that are the fork ones (`ACTIVE_FORK_PATHS` of `import-fork-files.py`).
 - `hooks/tools/check-port.py <upstream base> <fork>`: every line the fork added is in this branch, and every
   fork change that is not kept as it is has an entry in `hooks/PORT.txt` (adapted, restored, variant, dropped,
   pending) with its reason. `--files` gives the state of each file.
