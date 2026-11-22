@@ -32,11 +32,22 @@ Disabled 2026-11-11:
 `models-check.yml` keeps only its in-scope jobs: `rocm`, `vulkan-nvidia` and `vulkan-amd`. Its `cuda`,
 `metal` and `webgpu-nvidia` jobs are removed.
 
-Kept: build-cpu, ci-self-hosted-cpu, build-vulkan, ci-self-hosted-vulkan, build-llamacpp-rocm,
-test-llamacpp-rocm, hip-quality-check, models-check, bench-gfx1151 (three lanes), server,
-server-sanitize, build-sanitize, build-cmake-pkg, docker, ui (five lanes), and the
+Disabled 2026-11-22, because no runner has their labels, so their jobs queue until GitHub cancels them:
+
+| file | runner labels |
+| --- | --- |
+| models-check.yml | `[self-hosted, Linux, gfx1201, 1accel]`, `hf-jobs-t4-small` |
+| server-sanitize.yml | `hf-jobs-cpu-performance` |
+| server-speculative.yml | `[self-hosted, Linux, gb10, perf]` |
+| ui-self-hosted.yml, ui-build-self-hosted.yml | `[self-hosted, PLAYWRIGHT]`, `[self-hosted, fast]` |
+| ci-self-hosted-vulkan.yml | `[self-hosted, Linux, NVIDIA]`, Intel and macOS ARM64 runners |
+| ai-issues.yml | `[self-hosted, opencode]` |
+
+Kept: build-cpu, ci-self-hosted-cpu, build-vulkan, build-llamacpp-rocm,
+test-llamacpp-rocm, hip-quality-check, bench-gfx1151 (three lanes), server,
+build-sanitize, build-cmake-pkg, docker, ui (three lanes), and the
 platform-neutral checks (code-style, editorconfig, python-*, update-ops-docs, pre-tokenizer-hashes,
-check-vendor, labeler, pr-draft-label, close-issue, ai-issues, copilot-setup-steps, make-release,
+check-vendor, labeler, pr-draft-label, close-issue, copilot-setup-steps, make-release,
 gguf-publish, nightly-failure-alert, upstream-sync-report). `bench.yml.disabled` was already disabled
 before this change.
 
