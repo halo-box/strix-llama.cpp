@@ -118,7 +118,6 @@ def without_fork_namespace(name):
     return '_ZL' + s[:i] + ''.join(out)
 
 
-
 def read_assembly(directory, architecture):
     kernels = {}
     units = {}
