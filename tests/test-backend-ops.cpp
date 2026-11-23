@@ -11630,16 +11630,18 @@ struct test_moe_reduce : public test_case {
     const bool unaligned_experts;
     const bool with_expert_scale;
     const bool interleaved_views_adds;
+    const bool residual; // the residual ADD after the reduction (fused into it on CUDA)
 
     test_moe_reduce(
             int64_t n_embd, int64_t n_expert_used, int64_t n_tokens,
-            bool unaligned_experts = false, bool with_expert_scale = false, bool interleaved_views_adds = false) :
+            bool unaligned_experts = false, bool with_expert_scale = false, bool interleaved_views_adds = false,
+            bool residual = false) :
         n_embd(n_embd), n_expert_used(n_expert_used), n_tokens(n_tokens),
         unaligned_experts(unaligned_experts), with_expert_scale(with_expert_scale),
-        interleaved_views_adds(interleaved_views_adds) {}
+        interleaved_views_adds(interleaved_views_adds), residual(residual) {}
 
     std::string vars() override {
-        return VARS_TO_STR6(n_embd, n_expert_used, n_tokens, unaligned_experts, with_expert_scale, interleaved_views_adds);
+        return VARS_TO_STR7(n_embd, n_expert_used, n_tokens, unaligned_experts, with_expert_scale, interleaved_views_adds, residual);
     }
 
     std::string op_desc(ggml_tensor * t) override {
@@ -11692,6 +11694,12 @@ struct test_moe_reduce : public test_case {
             }
         }
         ggml_set_name(out, "moe_reduce");
+        if (residual) {
+            ggml_tensor * res = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+            ggml_set_name(res, "residual");
+            out = ggml_add(ctx, out, res);
+            ggml_set_name(out, "moe_reduce_residual");
+        }
         return out;
     }
 };
@@ -19224,6 +19232,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_moe_reduce(63,   12, 33, true,  true, true));
     test_cases.emplace_back(new test_moe_reduce(2048, 15, 40, false, true));
     test_cases.emplace_back(new test_moe_reduce(2048, 16, 32, false, true));
+    test_cases.emplace_back(new test_moe_reduce(2048, 8, 1,   false, false, false, true));
+    test_cases.emplace_back(new test_moe_reduce(2048, 8, 128, false, true,  false, true));
+    test_cases.emplace_back(new test_moe_reduce(63,   2, 17,  false, false, false, true));
 
     // reduction + sigmoid-gated shared-expert merge: adjacent (fusion only) and with the shared-expert GEMMs in between
     // (graph_optimize reorder at >= 512 tokens); n_embd 2560 / 2048 / 4608 cover 640, 512 and the 256-thread fallback

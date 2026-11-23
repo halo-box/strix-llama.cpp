@@ -6150,6 +6150,29 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                     }
                 }
             }
+            // residual ADD of the F32 reduction (views in between), the reduction used only there: the ADD reads the
+            // residual once per element before writing, so the residual may be the ADD's own (in-place) buffer
+            if (!merge && !ggml_cuda_mmb_is_bf16_only(*cuda_ctx, match.dst) && ggml_node_has_n_uses(cgraph, i + match.node_count - 1, 1)) {
+                int nadd = i + match.node_count;
+                while (nadd < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[nadd])) {
+                    nadd++;
+                }
+                ggml_tensor * add = nadd < cgraph->n_nodes ? cgraph->nodes[nadd] : nullptr;
+                if (add && add->op == GGML_OP_ADD && add->type == GGML_TYPE_F32 && ggml_is_contiguous(add) &&
+                        ggml_are_same_shape(add, match.dst) && !ggml_cuda_mmb_is_bf16_only(*cuda_ctx, add)) {
+                    const ggml_tensor * o = add->src[0] == match.dst ? add->src[1] : (add->src[1] == match.dst ? add->src[0] : nullptr);
+                    if (o && o != match.dst && o->type == GGML_TYPE_F32 && ggml_is_contiguous(o) && ggml_are_same_shape(o, match.dst) &&
+                            ggml_cuda_check_fusion_memory_ranges(cgraph, i, match.node_count, &nadd, 1)) {
+                        const char * a0 = (const char *) add->data, * a1 = a0 + ggml_nbytes(add);
+                        const char * o0 = (const char *) o->data,   * o1 = o0 + ggml_nbytes(o);
+                        if (o0 == a0 || o1 <= a0 || a1 <= o0) {
+                            ggml_cuda_op_moe_weighted_reduction(
+                                *cuda_ctx, match.experts, match.expert_scale, match.weights, add, o);
+                            return nadd - i;
+                        }
+                    }
+                }
+            }
             const int output_idx = i + count - 1;
             if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, count, &output_idx, 1)) {
                 ggml_cuda_op_moe_weighted_reduction(
