@@ -1531,6 +1531,8 @@ struct ggml_backend_cuda_context {
     uint32_t ovl_slot_mask = 0;       // MMB slots of the main workspace read by side-stream ops of the open region
     cudaEvent_t ovl_ev[2]  = { nullptr, nullptr };
 
+    unsigned int * topk_counter = nullptr;   // arrival counter of the fused router + top-k kernel, allocated on first use
+
     ggml_cuda_mmb_context * mmb = nullptr;
     bool mmb_opt_in = false; // set by ggml_backend_cuda_set_mmb_enabled, before the first graph
     bool mmb_small_batch = false; // set by ggml_backend_cuda_set_mmb_small_batch, before the first graph

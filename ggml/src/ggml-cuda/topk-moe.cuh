@@ -31,3 +31,15 @@ bool ggml_cuda_should_use_topk_moe(const ggml_tensor * gating_op,
                                    const ggml_tensor * weights,
                                    const ggml_tensor * logits,
                                    const ggml_tensor * ids);
+
+#if defined(GGML_USE_HIP)
+// RDNA3.5 decode: router MUL_MAT (F32 weights, one token) + topk_moe in one launch
+bool ggml_cuda_topk_moe_router_ready(ggml_backend_cuda_context & ctx);
+
+bool ggml_cuda_topk_moe_router_ok(const ggml_tensor * router, const ggml_tensor * weights, const ggml_tensor * ids,
+                                  const ggml_cuda_topk_moe_args & args);
+
+void ggml_cuda_op_topk_moe_router(ggml_backend_cuda_context & ctx, ggml_tensor * router, ggml_tensor * weights,
+                                  ggml_tensor * ids, const ggml_tensor * clamp, const ggml_tensor * scale,
+                                  const ggml_tensor * bias, const ggml_cuda_topk_moe_args & args);
+#endif // defined(GGML_USE_HIP)
