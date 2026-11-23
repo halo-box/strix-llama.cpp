@@ -6282,6 +6282,22 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             return m.n_ops;
         }
     }
+    // the FFN norm in front of it (RMS_NORM -> MUL; the MUL also feeds the expert matvecs) is computed by that kernel
+    if (node->op == GGML_OP_RMS_NORM && i + 3 < cgraph->n_nodes && ggml_node_has_n_uses(cgraph, i, 1)) {
+        ggml_tensor * mul    = cgraph->nodes[i + 1];
+        ggml_tensor * router = cgraph->nodes[i + 2];
+        ggml_cuda_topk_moe_match m;
+        const int out_mul = i + 1;
+        if (router->op == GGML_OP_MUL_MAT && ggml_cuda_topk_moe_router_rms_norm_ok(node, mul, router) &&
+                ggml_cuda_match_topk_moe(cgraph, i + 3, m) && m.logits == router &&
+                ggml_cuda_topk_moe_router_ok(router, m.weights, m.ids, m.args) &&
+                ggml_cuda_check_fusion_memory_ranges(cgraph, i + 3, m.n_ops, m.out_nodes, 2, /*is_topk_moe=*/true) &&
+                ggml_cuda_check_fusion_memory_ranges(cgraph, i, 3, &out_mul, 1) &&
+                ggml_cuda_topk_moe_router_ready(*cuda_ctx)) {
+            ggml_cuda_op_topk_moe_router(*cuda_ctx, router, m.weights, m.ids, m.clamp, m.scale, m.bias, m.args, node);
+            return m.n_ops + 2;
+        }
+    }
 #endif // defined(GGML_USE_HIP)
 
     // RDNA3.5 decode: consecutive single-column K-quant MUL_MATs that read the same activation vector (attention
