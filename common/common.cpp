@@ -1545,10 +1545,17 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
         }
         if (llama_model_has_decoder(model)) {
             tmp.resize(std::min(tmp.size(), (size_t) params.n_batch));
-            common_batch batch = common_batch_get_one(lctx, tmp);
             std::vector<float> zeros;
-            common_batch_set_zero_state(batch, model, zeros);
-            llama_process(lctx, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+            {
+                common_batch batch = common_batch_get_one(lctx, tmp);
+                common_batch_set_zero_state(batch, model, zeros);
+                llama_process(lctx, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+            }
+            if (tmp.size() > 1) {
+                common_batch batch = common_batch_get_one(lctx, &tmp.back(), 1);
+                common_batch_set_zero_state(batch, model, zeros);
+                llama_process(lctx, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+            }
         }
         llama_memory_clear(llama_get_memory(lctx), true);
         llama_synchronize(lctx);
