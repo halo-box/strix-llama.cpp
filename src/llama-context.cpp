@@ -2207,6 +2207,20 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
         t_alloc = ggml_time_us() - t_alloc_us;
 
+        // a fully offloaded model leaves the CPU backend only the token embedding lookup: more threads gain nothing
+        // there, and their polling after every graph takes power from an integrated GPU
+        cpu_light = false;
+        if (backend_cpu != nullptr) {
+            cpu_light = true;
+            for (int i = 0; i < ggml_graph_n_nodes(gf) && cpu_light; ++i) {
+                ggml_tensor * node = ggml_graph_node(gf, i);
+                if (ggml_backend_sched_get_tensor_backend(sched.get(), node) == backend_cpu) {
+                    cpu_light = node->op == GGML_OP_GET_ROWS || node->op == GGML_OP_NONE || node->op == GGML_OP_VIEW ||
+                        node->op == GGML_OP_RESHAPE || node->op == GGML_OP_PERMUTE || node->op == GGML_OP_TRANSPOSE;
+                }
+            }
+        }
+
         gf_res_prev_active = res;
     }
 
@@ -2230,7 +2244,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
     }
 
-    const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1, cpu_light);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
@@ -3868,7 +3882,8 @@ void llama_context::sched_graph_realloc(ggml_backend_sched_t sched, ggml_cgraph 
 
 ggml_status llama_context::graph_compute(
             ggml_cgraph * gf,
-                   bool   batched) {
+                   bool   batched,
+                   bool   cpu_light) {
     int n_threads        = batched ? cparams.n_threads_batch : cparams.n_threads;
     ggml_threadpool_t tp = batched ? threadpool_batch        : threadpool;
 
@@ -3882,7 +3897,7 @@ ggml_status llama_context::graph_compute(
 
     // set the number of threads for all the backends
     for (const auto & set_n_threads_fn : set_n_threads_fns) {
-        set_n_threads_fn.second(set_n_threads_fn.first, n_threads);
+        set_n_threads_fn.second(set_n_threads_fn.first, cpu_light && set_n_threads_fn.first == backend_cpu ? 1 : n_threads);
     }
 
     copy_experts.reset();
