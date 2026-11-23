@@ -11519,6 +11519,7 @@ struct test_topk_moe : public test_case {
     ggml_tensor * logits {};
     ggml_tensor * exp_probs_b {};
     const bool norm_bias;
+    const int64_t router_k; // > 0: the logits are a MUL_MAT of an F32 [router_k, n_expert] router and the input
     ggml_tensor * weights {};
     ggml_tensor * selected_experts {};
 
@@ -11529,7 +11530,8 @@ struct test_topk_moe : public test_case {
                   MoeGatingFunc          gating_func     = GATING_FUNC_SOFTMAX,
                   float                  scale_w         = 0.0f,
                   int                    n_expert_groups = 1,
-                  bool                   norm_bias       = false) :
+                  bool                   norm_bias       = false,
+                  int64_t                router_k        = 0) :
         ne(ne),
         n_expert_used(n_expert_used),
         with_norm(with_norm),
@@ -11537,14 +11539,18 @@ struct test_topk_moe : public test_case {
         gating_func(gating_func),
         scale_w(scale_w),
         n_expert_groups(n_expert_groups),
-        norm_bias(norm_bias) {
+        norm_bias(norm_bias),
+        router_k(router_k) {
         GGML_ASSERT(n_expert_used <= ne[0]);
         GGML_ASSERT(ne[0] % n_expert_groups == 0);
         GGML_ASSERT(n_expert_used <= ne[0] / n_expert_groups);
         GGML_ASSERT(!norm_bias || with_norm);
     }
 
-    std::string vars() override { return VARS_TO_STR8(ne, n_expert_used, with_norm, norm_bias, bias_probs, gating_func, scale_w, n_expert_groups); }
+    std::string vars() override {
+        std::string v = VARS_TO_STR8(ne, n_expert_used, with_norm, norm_bias, bias_probs, gating_func, scale_w, n_expert_groups);
+        return router_k > 0 ? v + "," + VAR_TO_STR(router_k) : v;
+    }
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -11559,7 +11565,14 @@ struct test_topk_moe : public test_case {
         const int n_exp_per_group = n_expert / n_expert_groups;
         const int n_group_used = n_expert_groups / 2;
 
-        logits      = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        if (router_k > 0) {
+            ggml_tensor * router = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, router_k, n_expert);
+            ggml_tensor * input  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, router_k, n_tokens);
+            logits = ggml_mul_mat(ctx, router, input);
+            ggml_set_name(logits, "logits");
+        } else {
+            logits = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        }
         exp_probs_b = nullptr;
         ggml_tensor * probs            =
             (gating_func == GATING_FUNC_SOFTMAX) ? ggml_soft_max(ctx, logits) :
@@ -11633,6 +11646,13 @@ struct test_topk_moe : public test_case {
     // the n_group_used best groups move up by half a step, so every expert and group decision is one step
     // apart; the logits are the inverse of the gating function at these scores
     void initialize_tensors(ggml_context * ctx) override {
+        if (router_k > 0) {
+            // logits of a few units: distinct top-k scores that the gating functions do not saturate
+            for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+                init_tensor_uniform(t, -0.1f, 0.1f);
+            }
+            return;
+        }
         const int  n_expert        = ne[0];
         const int  n_exp_per_group = n_expert / n_expert_groups;
         const int  n_group_used    = n_expert_groups / 2;
@@ -19316,6 +19336,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                     test_cases.emplace_back(new test_topk_moe({40, 22, 1, 1}, 8, with_norm, bias_probs, gate, scale_w));
                     test_cases.emplace_back(new test_topk_moe({71, 22, 1, 1}, 8, with_norm, bias_probs, gate, scale_w));
                     test_cases.emplace_back(new test_topk_moe({128, 1, 1, 1}, 128, with_norm, bias_probs, gate, scale_w));
+                    // decode router MUL_MAT + top-k (one launch on RDNA3.5)
+                    test_cases.emplace_back(new test_topk_moe({128, 1, 1, 1}, 8, with_norm, bias_probs, gate, scale_w, 1, false, 2048));
+                    test_cases.emplace_back(new test_topk_moe({256, 1, 1, 1}, 8, with_norm, bias_probs, gate, scale_w, 1, false, 1536));
                     test_cases.emplace_back(new test_topk_moe({129, 1, 1, 1}, 128, with_norm, bias_probs, gate, scale_w));
                     test_cases.emplace_back(new test_topk_moe({160, 4, 1, 1}, 160, with_norm, bias_probs, gate, scale_w));
                     test_cases.emplace_back(new test_topk_moe({256, 22, 1, 1}, 6, with_norm, bias_probs, gate, scale_w)); // Used by DeepSeek-V4
