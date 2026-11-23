@@ -39,7 +39,11 @@ bool ggml_cuda_topk_moe_router_ready(ggml_backend_cuda_context & ctx);
 bool ggml_cuda_topk_moe_router_ok(const ggml_tensor * router, const ggml_tensor * weights, const ggml_tensor * ids,
                                   const ggml_cuda_topk_moe_args & args);
 
+// rms_norm != nullptr: the router input is RMS_NORM -> MUL (router->src[1]); the kernel computes and stores it
+bool ggml_cuda_topk_moe_router_rms_norm_ok(const ggml_tensor * rms_norm, const ggml_tensor * mul, const ggml_tensor * router);
+
 void ggml_cuda_op_topk_moe_router(ggml_backend_cuda_context & ctx, ggml_tensor * router, ggml_tensor * weights,
                                   ggml_tensor * ids, const ggml_tensor * clamp, const ggml_tensor * scale,
-                                  const ggml_tensor * bias, const ggml_cuda_topk_moe_args & args);
+                                  const ggml_tensor * bias, const ggml_cuda_topk_moe_args & args,
+                                  const ggml_tensor * rms_norm = nullptr);
 #endif // defined(GGML_USE_HIP)

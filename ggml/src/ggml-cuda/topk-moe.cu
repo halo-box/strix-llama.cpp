@@ -526,13 +526,59 @@ __global__ void topk_moe_cuda(const float *         logits,
 }
 
 #if defined(GGML_USE_HIP)
+// y = rms_norm(norm_x) * norm_w of one row in shared memory, with the arithmetic of rms_norm_f32<float, 512, 1, true,
+// true>: thread t of the 256-thread block runs threads t and t + 256 of that 512-thread block.
+static __device__ __forceinline__ void topk_moe_router_rms_norm(
+        float * yn, const float * norm_x, const float * norm_w, const int ncols, const float eps, float * s_sum) {
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    const int tid    = threadIdx.x;
+    const int ncols4 = ncols / 4;
+    float4 xs[2] = { make_float4(0.0f, 0.0f, 0.0f, 0.0f), make_float4(0.0f, 0.0f, 0.0f, 0.0f) };
+    float  tmp[2] = { 0.0f, 0.0f };
+#pragma unroll
+    for (int k = 0; k < 2; ++k) {
+        const int v = tid + k*256;
+        if (v < ncols4) {
+            xs[k] = ((const float4 *) norm_x)[v];
+            tmp[k] += xs[k].x*xs[k].x + xs[k].y*xs[k].y + xs[k].z*xs[k].z + xs[k].w*xs[k].w;
+        }
+        tmp[k] = warp_reduce_sum<warp_size>(tmp[k]);
+        if (tid % warp_size == 0) {
+            s_sum[v / warp_size] = tmp[k];
+        }
+    }
+    __syncthreads();
+    float sum = 0.0f;
+    if (tid % warp_size < 512/warp_size) {
+        sum = s_sum[tid % warp_size];
+    }
+    sum = warp_reduce_sum<warp_size>(sum);
+    const float scale = rsqrtf(sum / ncols + eps);
+#pragma unroll
+    for (int k = 0; k < 2; ++k) {
+        const int v = tid + k*256;
+        if (v < ncols4) {
+            float4 r = make_float4(scale*xs[k].x, scale*xs[k].y, scale*xs[k].z, scale*xs[k].w);
+            const float4 m = ((const float4 *) norm_w)[v];
+            r.x *= m.x;
+            r.y *= m.y;
+            r.z *= m.z;
+            r.w *= m.w;
+            ((float4 *) yn)[v] = r;
+        }
+    }
+    __syncthreads();
+}
+
 // RDNA3.5 decode: the F32 router matvec of one token and topk_moe in one launch. Block b computes logit b with the
 // arithmetic of mul_mat_vec_f<float, float, 1, 256> (same loads, fma order and block reduction, so the logits are
 // bit-identical); the last block to store its logit then runs the selection of topk_moe_cuda on all logits.
+// norm_x != nullptr: the router input y is rms_norm(norm_x) * norm_w, computed by every block; block 0 stores it to y
+// for its other readers.
 template <int n_experts, bool has_bias>
 __launch_bounds__(256, 1)
 __global__ void topk_moe_router_cuda(const float *         x,
-                                     const float *         y,
+                                     float *               y,
                                      const int             stride_row,
                                      const int             ncols2,
                                      float *               logits,
@@ -543,7 +589,10 @@ __global__ void topk_moe_router_cuda(const float *         x,
                                      const int             n_expert_used,
                                      const float           clamp_val,
                                      const float           scale_val,
-                                     const topk_moe_config config) {
+                                     const topk_moe_config config,
+                                     const float *         norm_x,
+                                     const float *         norm_w,
+                                     const float           norm_eps) {
     constexpr int block_size = 256;
     constexpr int warp_size  = ggml_cuda_get_physical_warp_size();
     const int row = blockIdx.x;
@@ -553,6 +602,18 @@ __global__ void topk_moe_router_cuda(const float *         x,
     __shared__ bool  is_last;
     if (tid < warp_size) {
         buf_iw[tid] = 0.0f;
+    }
+    if (norm_x) {
+        extern __shared__ float topk_moe_router_y[];
+        __shared__ float s_sum[512/warp_size];
+        const int ncols = 2*ncols2;
+        topk_moe_router_rms_norm(topk_moe_router_y, norm_x, norm_w, ncols, norm_eps, s_sum);
+        if (row == 0) {
+            for (int i = tid; i < ncols/4; i += block_size) {
+                ((float4 *) y)[i] = ((const float4 *) topk_moe_router_y)[i];
+            }
+        }
+        y = topk_moe_router_y;
     }
     __syncthreads();
 
@@ -853,9 +914,22 @@ bool ggml_cuda_topk_moe_router_ok(const ggml_tensor * router, const ggml_tensor 
         !args.delayed_softmax && args.n_groups == 0 && ids->nb[1] / ggml_type_size(ids->type) == (size_t) n_experts;
 }
 
+bool ggml_cuda_topk_moe_router_rms_norm_ok(const ggml_tensor * rms_norm, const ggml_tensor * mul, const ggml_tensor * router) {
+    const ggml_tensor * x = rms_norm->src[0];
+    const ggml_tensor * w = mul->src[0] == rms_norm ? mul->src[1] : mul->src[0];
+    const int64_t ncols = x->ne[0];
+    // the launches of rms_norm_f32_dispatch that use a 512-thread block, one float4 per thread
+    return rms_norm->op == GGML_OP_RMS_NORM && mul->op == GGML_OP_MUL && router->src[1] == mul &&
+        (mul->src[0] == rms_norm || mul->src[1] == rms_norm) && x->type == GGML_TYPE_F32 && w->type == GGML_TYPE_F32 &&
+        mul->type == GGML_TYPE_F32 && ggml_is_contiguous(x) && ggml_nrows(x) == 1 && ggml_is_contiguous(w) &&
+        ggml_nelements(w) == ncols && ggml_are_same_shape(mul, x) && ggml_is_contiguous(mul) &&
+        ncols % 4 == 0 && ncols/4 > 256 && ncols/4 <= 512 &&
+        (uintptr_t) x->data % 16 == 0 && (uintptr_t) w->data % 16 == 0 && (uintptr_t) mul->data % 16 == 0;
+}
+
 void ggml_cuda_op_topk_moe_router(ggml_backend_cuda_context & ctx, ggml_tensor * router, ggml_tensor * weights,
                                   ggml_tensor * ids, const ggml_tensor * clamp, const ggml_tensor * scale,
-                                  const ggml_tensor * bias, const ggml_cuda_topk_moe_args & args) {
+                                  const ggml_tensor * bias, const ggml_cuda_topk_moe_args & args, const ggml_tensor * rms_norm) {
     const ggml_tensor * x = router->src[0];
     const ggml_tensor * y = router->src[1];
     const int n_experts     = (int) router->ne[0];
@@ -871,13 +945,25 @@ void ggml_cuda_op_topk_moe_router(ggml_backend_cuda_context & ctx, ggml_tensor *
     const float clamp_val = clamp ? ggml_get_op_params_f32(clamp, 0) : -INFINITY;
     const float scale_val = scale ? ggml_get_op_params_f32(scale, 0) : 1.0f;
 
+    const float * norm_x = nullptr;
+    const float * norm_w = nullptr;
+    float norm_eps = 0.0f;
+    if (rms_norm) {
+        GGML_ASSERT(ggml_cuda_topk_moe_router_rms_norm_ok(rms_norm, y, router));
+        norm_x = (const float *) rms_norm->src[0]->data;
+        norm_w = (const float *) (y->src[0] == rms_norm ? y->src[1] : y->src[0])->data;
+        memcpy(&norm_eps, rms_norm->op_params, sizeof(float));
+    }
+
     unsigned int * counter = ggml_cuda_topk_moe_counter(ctx);
-    const ggml_cuda_kernel_launch_params params(dim3(n_experts, 1, 1), dim3(256, 1, 1), 0, ctx.stream());
+    const size_t nbytes_shared = rms_norm ? x->ne[0] * sizeof(float) : 0;
+    const ggml_cuda_kernel_launch_params params(dim3(n_experts, 1, 1), dim3(256, 1, 1), nbytes_shared, ctx.stream());
     auto launch = [&](auto kernel) {
         ggml_cuda_kernel_launch(kernel, params,
-            (const float *) x->data, (const float *) y->data, (int) (x->nb[1] / sizeof(float)), (int) (x->ne[0] / 2),
+            (const float *) x->data, (float *) y->data, (int) (x->nb[1] / sizeof(float)), (int) (x->ne[0] / 2),
             (float *) router->data, (float *) weights->data, (int32_t *) ids->data,
-            bias ? (const float *) bias->data : nullptr, counter, n_expert_used, clamp_val, scale_val, config);
+            bias ? (const float *) bias->data : nullptr, counter, n_expert_used, clamp_val, scale_val, config,
+            norm_x, norm_w, norm_eps);
     };
     switch (n_experts) {
         case 64:  bias ? launch(topk_moe_router_cuda<64,  true>) : launch(topk_moe_router_cuda<64,  false>); break;
