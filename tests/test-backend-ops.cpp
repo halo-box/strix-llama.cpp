@@ -9187,6 +9187,78 @@ struct test_mmv_group : public test_case {
     }
 };
 
+// GGML_OP_MUL_MAT group: attention Q/K/V projections of one decode token, each followed by its own norm. Through the
+// scheduler, so graph_optimize moves the K-quant matmuls together (RDNA3.5 CUDA runs them as one grouped matvec).
+struct test_mmv_kq_group : public test_case {
+    const ggml_type type_q;
+    const ggml_type type_k;
+    const ggml_type type_v;
+    const int64_t k;
+    const int64_t m_q;
+    const int64_t m_kv;
+    const bool v_cache;
+
+    std::string vars() override { return VARS_TO_STR7(type_q, type_k, type_v, k, m_q, m_kv, v_cache); }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MMV_KQ_GROUP";
+    }
+
+    bool run_whole_graph() override { return true; }
+    bool use_scheduler_allocation() override { return true; }
+    bool use_weight_context() override { return true; }
+
+    double max_nmse_err() override { return 5e-4; }
+
+    test_mmv_kq_group(ggml_type type_q, ggml_type type_k, ggml_type type_v, int64_t k, int64_t m_q, int64_t m_kv, bool v_cache = false)
+        : type_q(type_q), type_k(type_k), type_v(type_v), k(k), m_q(m_q), m_kv(m_kv), v_cache(v_cache) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        return build_graph(ctx, ctx);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_weights) override {
+        ggml_tensor * y = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, 1);
+        ggml_set_name(y, "y");
+
+        ggml_tensor * v_mm = nullptr;
+        auto proj = [&](ggml_type type, int64_t m, const char * name) {
+            ggml_tensor * w = ggml_new_tensor_2d(ctx_weights, type, k, m);
+            ggml_set_name(w, name);
+            ggml_tensor * mm = ggml_mul_mat(ctx, w, y);
+            v_mm = mm;
+            ggml_tensor * h = ggml_reshape_2d(ctx, mm, 128, m/128);
+            return ggml_reshape_1d(ctx, ggml_rms_norm(ctx, h, 1e-6f), m);
+        };
+        ggml_tensor * out = ggml_concat(ctx, proj(type_q, m_q, "wq"), proj(type_k, m_kv, "wk"), 0);
+        out = ggml_concat(ctx, out, proj(type_v, m_kv, "wv"), 0);
+        if (v_cache) {
+            // V also stored as an F16 cache row (fused into the grouped matvec on RDNA3.5)
+            ggml_tensor * v     = v_mm;
+            ggml_tensor * cache = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, m_kv, 4);
+            ggml_tensor * idx   = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, 1);
+            ggml_set_name(cache, "cache");
+            ggml_set_name(idx, "idx");
+            ggml_tensor * st = ggml_set_rows(ctx, cache, ggml_view_2d(ctx, v, m_kv, 1, v->nb[1], 0), idx);
+            out = ggml_concat(ctx, out, ggml_reshape_1d(ctx, ggml_cast(ctx, st, GGML_TYPE_F32), 4*m_kv), 0);
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_I64) {
+                const int64_t row = 2;
+                ggml_backend_tensor_set(t, &row, 0, sizeof(row));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // qwen4exp hyper-connection up projection + stream mix chain (decode):
 //   silu(scale(lo)) -> mul_mat(W_up) -> sigmoid -> mul(xn) -> reshape -> view/cont -> adds -> scale
 struct test_hc_up_mix : public test_case {
@@ -16993,6 +17065,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // hyper-connection down + inject, shared-expert gate/up + router)
     test_cases.emplace_back(new test_mmv_group(2560, 10240, 6144));
     test_cases.emplace_back(new test_mmv_group(2560, 1024, 6144));
+    // attention Q/K/V of one decode token with K-quant weights (Q4_K_M / Q5_K_M mixes)
+    test_cases.emplace_back(new test_mmv_kq_group(GGML_TYPE_Q4_K, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, 2048, 4096, 512));
+    test_cases.emplace_back(new test_mmv_kq_group(GGML_TYPE_Q4_K, GGML_TYPE_Q4_K, GGML_TYPE_Q4_K, 2048, 4096, 512));
+    test_cases.emplace_back(new test_mmv_kq_group(GGML_TYPE_Q4_K, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, 2048, 4096, 512, true));
+    test_cases.emplace_back(new test_mmv_kq_group(GGML_TYPE_Q5_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, 4096, 4096, 1024));
+    test_cases.emplace_back(new test_mmv_kq_group(GGML_TYPE_Q6_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, 1024, 2048, 256));
 
     // 256-expert MoE with 4/16/32/128 rows per expert, exercises the RDNA3.5 mul_mat_id tile selection
     // Qwen3.8-Flash-Next (qwen4exp) UD-IQ4_XS experts: 512 experts, 10 active, gate/up IQ3_S [2560 -> 640], down IQ4_NL [640 -> 2560]

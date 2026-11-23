@@ -2,6 +2,7 @@
 #include "mmb.cuh"
 #include "ggml-backend-impl.h"
 #include "quantize.cuh"
+#include "convert.cuh"
 #include "unary.cuh"
 #include "vecdotq.cuh"
 #ifdef GGML_USE_TRELLIS
@@ -2298,6 +2299,139 @@ void ggml_cuda_mmv_group(ggml_backend_cuda_context & ctx, const ggml_tensor * y,
         default:
             GGML_ABORT("fatal error");
     }
+}
+
+// RDNA3.5 grouped single-column matvec for K-quant weights: the activation vector is quantized once and one launch
+// runs every segment. One wave per output row with the K loop of mul_mat_vec_q<type, 1> (nwarps 1, one row per
+// block on RDNA3.5), so each row is bit-identical to the separate quantize + matvec launches.
+
+struct mmvq_kq_group_seg_dev {
+    const void * vx;
+    float      * dst;
+    int          stride_row;   // in weight blocks
+    int          blocks_begin;
+    int          type;
+    half       * dst16;        // optional F16 cache row written as well (fused SET_ROWS), row index idx[0]
+    const void * idx;
+    int          idx64;
+    int64_t      stride16;     // cache row stride in halfs
+};
+
+struct mmvq_kq_group_args_dev {
+    mmvq_kq_group_seg_dev seg[MMVQ_GROUP_MAX];
+    int nseg;
+};
+
+template <ggml_type type>
+static __device__ __forceinline__ float mmvq_kq_group_row(
+        const void * GGML_CUDA_RESTRICT vx, const block_q8_1 * GGML_CUDA_RESTRICT y, const int kbx_offset, const int ncols_x) {
+    constexpr int qk  = ggml_cuda_type_traits<type>::qk;
+    constexpr int qi  = ggml_cuda_type_traits<type>::qi;
+    constexpr int vdr = get_vdr_mmvq(type);
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int blocks_per_iter = vdr * warp_size / qi;
+    constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
+
+    const int tid = threadIdx.x;
+    const int blocks_per_row_x = ncols_x / qk;
+    float tmp = 0.0f;
+    for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+        const int kby = kbx * (qk/QK8_1);
+        const int kqs = vdr * (tid % (qi/vdr));
+        tmp += vec_dot_q_cuda(vx, &y[kby], kbx_offset + kbx, kqs);
+    }
+    return warp_reduce_sum<warp_size>(tmp);
+}
+
+__launch_bounds__(ggml_cuda_get_physical_warp_size(), 1)
+static __global__ void mul_mat_vec_q_kq_group(
+        const mmvq_kq_group_args_dev args, const block_q8_1 * GGML_CUDA_RESTRICT y, const int ncols_x) {
+    int s = 0;
+#pragma unroll
+    for (int k = 1; k < MMVQ_GROUP_MAX; ++k) {
+        if (k < args.nseg && (int) blockIdx.x >= args.seg[k].blocks_begin) {
+            s = k;
+        }
+    }
+    const mmvq_kq_group_seg_dev seg = args.seg[s];
+    const int row = (int) blockIdx.x - seg.blocks_begin;
+    const int kbx_offset = row*seg.stride_row;
+
+    float result;
+    switch (seg.type) {
+        case GGML_TYPE_Q4_K: result = mmvq_kq_group_row<GGML_TYPE_Q4_K>(seg.vx, y, kbx_offset, ncols_x); break;
+        case GGML_TYPE_Q5_K: result = mmvq_kq_group_row<GGML_TYPE_Q5_K>(seg.vx, y, kbx_offset, ncols_x); break;
+        default:             result = mmvq_kq_group_row<GGML_TYPE_Q6_K>(seg.vx, y, kbx_offset, ncols_x); break;
+    }
+    if (threadIdx.x == 0) {
+        seg.dst[row] = result;
+        if (seg.dst16) {
+            const int64_t r = seg.idx64 ? *(const int64_t *) seg.idx : (int64_t) *(const int32_t *) seg.idx;
+            seg.dst16[r*seg.stride16 + row] = ggml_cuda_cast<half>(result);
+        }
+    }
+}
+
+bool ggml_cuda_mmvq_kq_group_seg_ok(const ggml_tensor * w, const ggml_tensor * y) {
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    if (!GGML_CUDA_CC_IS_RDNA3_5(cc) || !ggml_cuda_mmvq_kq_group_type_ok(w->type)) {
+        return false;
+    }
+    if (y->type != GGML_TYPE_F32 || y->ne[1] != 1 || y->ne[2] != 1 || y->ne[3] != 1 || !ggml_is_contiguous(y) ||
+            y->ne[0] != w->ne[0] || w->ne[0] % QK_K != 0) {
+        return false;
+    }
+    return w->ne[2] == 1 && w->ne[3] == 1 && w->nb[0] == ggml_type_size(w->type) && w->ne[1] <= INT32_MAX &&
+        w->nb[1] % ggml_type_size(w->type) == 0 && !ggml_cuda_mmb_dq_packed(w) &&
+        !(w->buffer && ggml_backend_buffer_get_usage(w->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE);
+}
+
+bool ggml_cuda_mmvq_kq_group_set_rows_ok(const ggml_tensor * set_rows, const ggml_tensor * dst) {
+    const ggml_tensor * src = set_rows->src[0];
+    const ggml_tensor * idx = set_rows->src[1];
+    return set_rows->op == GGML_OP_SET_ROWS && set_rows->type == GGML_TYPE_F16 && set_rows->nb[0] == sizeof(half) &&
+        set_rows->nb[1] % sizeof(half) == 0 && set_rows->ne[0] == ggml_nelements(dst) && set_rows->ne[2] == 1 && set_rows->ne[3] == 1 &&
+        src->type == GGML_TYPE_F32 && (src == dst || src->view_src == dst) && src->data == dst->data && ggml_is_contiguous(src) &&
+        ggml_nrows(src) == 1 && src->ne[0] == set_rows->ne[0] &&
+        (idx->type == GGML_TYPE_I64 || idx->type == GGML_TYPE_I32) && ggml_nelements(idx) == 1;
+}
+
+void ggml_cuda_mmvq_kq_group(ggml_backend_cuda_context & ctx, const ggml_tensor * y, const ggml_cuda_mmv_group_seg * segs, const int nseg) {
+    GGML_ASSERT(nseg >= 1 && nseg <= MMVQ_GROUP_MAX);
+    const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
+    GGML_ASSERT(warp_size == 32);
+    cudaStream_t stream = ctx.stream();
+
+    const int64_t ncols = y->ne[0];
+    mmvq_kq_group_args_dev args{};
+    args.nseg = nseg;
+    int nblocks = 0;
+    for (int i = 0; i < nseg; ++i) {
+        const ggml_tensor * w = segs[i].w;
+        GGML_ASSERT(!segs[i].gate && ggml_cuda_mmvq_kq_group_seg_ok(w, y));
+        GGML_ASSERT(segs[i].dst->type == GGML_TYPE_F32 && ggml_is_contiguous(segs[i].dst) && ggml_nelements(segs[i].dst) == w->ne[1]);
+        mmvq_kq_group_seg_dev & d = args.seg[i];
+        d.vx           = w->data;
+        d.dst          = (float *) segs[i].dst->data;
+        d.stride_row   = (int) (w->nb[1] / ggml_type_size(w->type));
+        d.blocks_begin = nblocks;
+        d.type         = (int) w->type;
+        if (segs[i].set_rows) {
+            GGML_ASSERT(ggml_cuda_mmvq_kq_group_set_rows_ok(segs[i].set_rows, segs[i].dst));
+            d.dst16    = (half *) segs[i].set_rows->data;
+            d.idx      = segs[i].set_rows->src[1]->data;
+            d.idx64    = segs[i].set_rows->src[1]->type == GGML_TYPE_I64;
+            d.stride16 = (int64_t) (segs[i].set_rows->nb[1] / sizeof(half));
+        }
+        nblocks += (int) w->ne[1];
+    }
+
+    const int64_t ncols_padded = GGML_PAD(ncols, MATRIX_ROW_PADDING);
+    ggml_cuda_pool_alloc<char> y_q8(ctx.pool(), ncols_padded * sizeof(block_q8_1) / QK8_1);
+    quantize_row_q8_1_cuda((const float *) y->data, y_q8.get(), ncols, ncols, ncols, ncols, ncols_padded, 1, 1, 1, stream);
+
+    const ggml_cuda_kernel_launch_params params(dim3(nblocks, 1, 1), dim3(warp_size, 1, 1), 0, stream);
+    ggml_cuda_kernel_launch(mul_mat_vec_q_kq_group, params, args, (const block_q8_1 *) y_q8.get(), (int) ncols);
 }
 
 // Dedicated MoE multi-token kernel.
