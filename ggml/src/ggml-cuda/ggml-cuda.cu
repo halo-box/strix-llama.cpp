@@ -7459,6 +7459,35 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return 2;
     }
 
+    // attention Q norm + rope directly followed (views aside) by the K norm + rope (+ cache store): one launch
+    if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE }, {})) {
+        int k = i + 3;
+        while (k < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[k])) {
+            k++;
+        }
+        int nb = 0;
+        if (k < cgraph->n_nodes && ggml_cuda_can_fuse(cgraph, k, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS }, {})) {
+            nb = 5;
+        } else if (k < cgraph->n_nodes && ggml_cuda_can_fuse(cgraph, k, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE }, {})) {
+            nb = 3;
+        }
+        if (nb > 0) {
+            ggml_tensor * rope_a = cgraph->nodes[i + 2];
+            ggml_tensor * rms_b  = cgraph->nodes[k];
+            ggml_tensor * rope_b = cgraph->nodes[k + 2];
+            ggml_tensor * set_b  = nb == 5 ? cgraph->nodes[k + 4] : nullptr;
+            const ggml_tensor * xb = rms_b->src[0];
+            const bool b_reads_a = xb == rope_a || xb->view_src == rope_a || xb == cgraph->nodes[i] || xb == cgraph->nodes[i + 1];
+            const int outs[] = { i + 2, k + nb - 1 };
+            if (!b_reads_a && ggml_cuda_rms_norm_mul_rope_pair_ok(node, rope_a, rms_b, rope_b, set_b) &&
+                    ggml_cuda_check_fusion_memory_ranges(cgraph, i, k + nb - i, outs, 2)) {
+                ggml_cuda_op_rms_norm_mul_rope_pair(*cuda_ctx, node, cgraph->nodes[i + 1], rope_a,
+                    rms_b, cgraph->nodes[k + 1], rope_b, set_b);
+                return k + nb - 1 - i;
+            }
+        }
+    }
+
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS }, {})) {
         ggml_cuda_op_rms_norm_mul_rope_fused(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2], cgraph->nodes[i + 4]);
         return 4;

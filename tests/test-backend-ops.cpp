@@ -9187,6 +9187,63 @@ struct test_mmv_group : public test_case {
     }
 };
 
+// attention Q and K: RMS_NORM -> MUL(w) -> ROPE each, K stored into a cache by SET_ROWS (CUDA runs both chains as one launch)
+struct test_rms_norm_mul_rope_pair : public test_case {
+    const int64_t head_dim;
+    const int64_t n_head;
+    const int64_t n_head_kv;
+    const int64_t n_tokens;
+    const int mode;
+    const ggml_type cache_type;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "RMS_NORM_MUL_ROPE_PAIR";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override { return VARS_TO_STR6(head_dim, n_head, n_head_kv, n_tokens, mode, cache_type); }
+
+    test_rms_norm_mul_rope_pair(int64_t head_dim, int64_t n_head, int64_t n_head_kv, int64_t n_tokens, int mode, ggml_type cache_type)
+        : head_dim(head_dim), n_head(n_head), n_head_kv(n_head_kv), n_tokens(n_tokens), mode(mode), cache_type(cache_type) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_tokens);
+        auto chain = [&](int64_t nh) {
+            ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, head_dim, nh, n_tokens);
+            ggml_tensor * w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, head_dim);
+            return ggml_rope_ext(ctx, ggml_mul(ctx, ggml_rms_norm(ctx, x, 1e-6f), w), pos, nullptr, head_dim, mode, 0,
+                1000000.0f, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
+        };
+        ggml_tensor * q = chain(n_head);
+        ggml_tensor * k = chain(n_head_kv);
+        ggml_tensor * cache = ggml_new_tensor_2d(ctx, cache_type, head_dim*n_head_kv, 2*n_tokens);
+        ggml_tensor * idx   = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, n_tokens);
+        ggml_tensor * st    = ggml_set_rows(ctx, cache, ggml_view_2d(ctx, k, head_dim*n_head_kv, n_tokens, k->nb[2], 0), idx);
+        ggml_tensor * out = ggml_concat(ctx, ggml_reshape_1d(ctx, q, ggml_nelements(q)),
+            ggml_reshape_1d(ctx, ggml_cast(ctx, st, GGML_TYPE_F32), ggml_nelements(st)), 0);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_I64) {
+                init_set_rows_row_ids(t, 2*n_tokens);
+            } else if (t->type == GGML_TYPE_I32) {
+                std::vector<int32_t> data(ggml_nelements(t));
+                for (size_t i = 0; i < data.size(); i++) {
+                    data[i] = rand() % 4096;
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_MUL_MAT group: attention Q/K/V projections of one decode token, each followed by its own norm. Through the
 // scheduler, so graph_optimize moves the K-quant matmuls together (RDNA3.5 CUDA runs them as one grouped matvec).
 struct test_mmv_kq_group : public test_case {
@@ -17073,6 +17130,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // hyper-connection down + inject, shared-expert gate/up + router)
     test_cases.emplace_back(new test_mmv_group(2560, 10240, 6144));
     test_cases.emplace_back(new test_mmv_group(2560, 1024, 6144));
+    for (ggml_type t : { GGML_TYPE_F16, GGML_TYPE_F32 }) {
+        for (int64_t n_tokens : { 1, 7 }) {
+            test_cases.emplace_back(new test_rms_norm_mul_rope_pair(128, 32, 4, n_tokens, GGML_ROPE_TYPE_NEOX, t));
+            test_cases.emplace_back(new test_rms_norm_mul_rope_pair(64, 16, 8, n_tokens, GGML_ROPE_TYPE_NORMAL, t));
+        }
+    }
     // attention Q/K/V of one decode token with K-quant weights (Q4_K_M / Q5_K_M mixes)
     test_cases.emplace_back(new test_mmv_kq_group(GGML_TYPE_Q4_K, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, 2048, 4096, 512));
     test_cases.emplace_back(new test_mmv_kq_group(GGML_TYPE_Q4_K, GGML_TYPE_Q4_K, GGML_TYPE_Q4_K, 2048, 4096, 512));
