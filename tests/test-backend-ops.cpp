@@ -11527,6 +11527,7 @@ struct test_topk_moe : public test_case {
     ggml_tensor * exp_probs_b {};
     const bool norm_bias;
     const int64_t router_k; // > 0: the logits are a MUL_MAT of an F32 [router_k, n_expert] router and the input
+    const bool router_norm; // the router input is RMS_NORM * weight
     ggml_tensor * weights {};
     ggml_tensor * selected_experts {};
 
@@ -11538,7 +11539,8 @@ struct test_topk_moe : public test_case {
                   float                  scale_w         = 0.0f,
                   int                    n_expert_groups = 1,
                   bool                   norm_bias       = false,
-                  int64_t                router_k        = 0) :
+                  int64_t                router_k        = 0,
+                  bool                   router_norm     = false) :
         ne(ne),
         n_expert_used(n_expert_used),
         with_norm(with_norm),
@@ -11547,7 +11549,8 @@ struct test_topk_moe : public test_case {
         scale_w(scale_w),
         n_expert_groups(n_expert_groups),
         norm_bias(norm_bias),
-        router_k(router_k) {
+        router_k(router_k),
+        router_norm(router_norm) {
         GGML_ASSERT(n_expert_used <= ne[0]);
         GGML_ASSERT(ne[0] % n_expert_groups == 0);
         GGML_ASSERT(n_expert_used <= ne[0] / n_expert_groups);
@@ -11556,7 +11559,7 @@ struct test_topk_moe : public test_case {
 
     std::string vars() override {
         std::string v = VARS_TO_STR8(ne, n_expert_used, with_norm, norm_bias, bias_probs, gating_func, scale_w, n_expert_groups);
-        return router_k > 0 ? v + "," + VAR_TO_STR(router_k) : v;
+        return router_k > 0 ? v + "," + VARS_TO_STR2(router_k, router_norm) : v;
     }
 
     std::string op_desc(ggml_tensor * t) override {
@@ -11575,6 +11578,11 @@ struct test_topk_moe : public test_case {
         if (router_k > 0) {
             ggml_tensor * router = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, router_k, n_expert);
             ggml_tensor * input  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, router_k, n_tokens);
+            if (router_norm) {
+                ggml_tensor * w_norm = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, router_k);
+                input = ggml_mul(ctx, ggml_rms_norm(ctx, input, 1e-6f), w_norm);
+                ggml_set_name(input, "router_input");
+            }
             logits = ggml_mul_mat(ctx, router, input);
             ggml_set_name(logits, "logits");
         } else {
@@ -19348,6 +19356,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                     // decode router MUL_MAT + top-k (one launch on RDNA3.5)
                     test_cases.emplace_back(new test_topk_moe({128, 1, 1, 1}, 8, with_norm, bias_probs, gate, scale_w, 1, false, 2048));
                     test_cases.emplace_back(new test_topk_moe({256, 1, 1, 1}, 8, with_norm, bias_probs, gate, scale_w, 1, false, 1536));
+                    test_cases.emplace_back(new test_topk_moe({128, 1, 1, 1}, 8, with_norm, bias_probs, gate, scale_w, 1, false, 2048, true));
                     test_cases.emplace_back(new test_topk_moe({129, 1, 1, 1}, 128, with_norm, bias_probs, gate, scale_w));
                     test_cases.emplace_back(new test_topk_moe({160, 4, 1, 1}, 160, with_norm, bias_probs, gate, scale_w));
                     test_cases.emplace_back(new test_topk_moe({256, 22, 1, 1}, 6, with_norm, bias_probs, gate, scale_w)); // Used by DeepSeek-V4
