@@ -6285,9 +6285,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 #endif // defined(GGML_USE_HIP)
 
     // RDNA3.5 decode: consecutive single-column K-quant MUL_MATs that read the same activation vector (attention
-    // Q/K/V) share one quantization and one launch.
-    if (node->op == GGML_OP_MUL_MAT && node->src[2] == nullptr && ggml_cuda_mmvq_kq_group_seg_ok(node->src[0], node->src[1])) {
-        const ggml_tensor * y = node->src[1];
+    // Q/K/V) share one quantization and one launch. The group starts at node i0; with rms_norm the activation is the
+    // RMS_NORM -> MUL at i_first, i_first + 1, read only by the group, and the kernel computes it. Returns the index of
+    // the last fused node minus i_first, or -1.
+    auto try_kq_group = [&](const int i0, const int i_first, const ggml_tensor * rms_norm) -> int {
+        const int i = i0;
+        const ggml_tensor * y = cgraph->nodes[i]->src[1];
         ggml_cuda_mmv_group_seg segs[GGML_CUDA_MMV_GROUP_MAX];
         int out_nodes[GGML_CUDA_MMV_GROUP_MAX];
         int nseg  = 0;
@@ -6318,7 +6321,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 }
             }
         }
-        if (nseg >= 2 && ggml_cuda_check_fusion_memory_ranges(cgraph, i, j_end - i + 1, out_nodes, nseg)) {
+        if (rms_norm && !ggml_node_has_n_uses(cgraph, i_first + 1, nseg)) {
+            nseg = 0;
+        }
+        if (nseg >= 2 && ggml_cuda_check_fusion_memory_ranges(cgraph, i_first, j_end - i_first + 1, out_nodes, nseg)) {
             // an F16 SET_ROWS of a segment into a cache (V without its own fused store) a few nodes later is written by
             // the group too, when no node in between touches that cache and the row index is a graph input
             auto root = [](const ggml_tensor * t) { return t->view_src ? t->view_src : t; };
@@ -6350,13 +6356,36 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                     segs[m].set_rows = t;
                 }
             }
-            ggml_cuda_mmvq_kq_group(*cuda_ctx, y, segs, nseg);
+            ggml_cuda_mmvq_kq_group(*cuda_ctx, y, segs, nseg, rms_norm);
             for (int q = 0; q < nseg; ++q) {
                 if (stores[q]) {
                     s_precomputed[stores[q]] = 0;
                 }
             }
-            return j_end - i;
+            return j_end - i_first;
+        }
+        return -1;
+    };
+    if (node->op == GGML_OP_MUL_MAT && node->src[2] == nullptr && ggml_cuda_mmvq_kq_group_seg_ok(node->src[0], node->src[1])) {
+        const int r = try_kq_group(i, i, nullptr);
+        if (r >= 0) {
+            return r;
+        }
+    }
+    if (node->op == GGML_OP_RMS_NORM && i + 2 < cgraph->n_nodes && cgraph->nodes[i + 1]->op == GGML_OP_MUL &&
+            ggml_node_has_n_uses(cgraph, i, 1)) {
+        const ggml_tensor * mul = cgraph->nodes[i + 1];
+        int j = i + 2;
+        while (j < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[j])) {
+            j++;
+        }
+        if (j < cgraph->n_nodes && cgraph->nodes[j]->op == GGML_OP_MUL_MAT && cgraph->nodes[j]->src[1] == mul &&
+                cgraph->nodes[j]->src[2] == nullptr && ggml_cuda_mmvq_kq_group_seg_ok(cgraph->nodes[j]->src[0], mul) &&
+                ggml_cuda_mmvq_kq_group_rms_norm_ok(node, mul, mul)) {
+            const int r = try_kq_group(j, i, node);
+            if (r >= 0) {
+                return r;
+            }
         }
     }
 
