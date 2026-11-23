@@ -6159,6 +6159,82 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    // RDNA3.5 decode: consecutive single-column K-quant MUL_MATs that read the same activation vector (attention
+    // Q/K/V) share one quantization and one launch.
+    if (node->op == GGML_OP_MUL_MAT && node->src[2] == nullptr && ggml_cuda_mmvq_kq_group_seg_ok(node->src[0], node->src[1])) {
+        const ggml_tensor * y = node->src[1];
+        ggml_cuda_mmv_group_seg segs[GGML_CUDA_MMV_GROUP_MAX];
+        int out_nodes[GGML_CUDA_MMV_GROUP_MAX];
+        int nseg  = 0;
+        int j_end = i;
+        for (int j = i; j < cgraph->n_nodes && nseg < GGML_CUDA_MMV_GROUP_MAX; ++j) {
+            ggml_tensor * n = cgraph->nodes[j];
+            if (j > i && ggml_cuda_is_view_or_noop(n)) {
+                continue;
+            }
+            if (n->op != GGML_OP_MUL_MAT || n->src[2] != nullptr || n->src[1] != y || (n->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 ||
+                    n->type != GGML_TYPE_F32 || !ggml_is_contiguous(n) || !ggml_cuda_mmvq_kq_group_seg_ok(n->src[0], y)) {
+                break;
+            }
+            segs[nseg].w = n->src[0];
+            segs[nseg].dst = n;
+            out_nodes[nseg++] = j;
+            j_end = j;
+        }
+        // a direct reader right after the group (bias ADD, GLU of a gate/up pair) has its own fused matvec
+        int j_next = j_end + 1;
+        while (j_next < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[j_next])) {
+            j_next++;
+        }
+        for (int k = 0; j_next < cgraph->n_nodes && k < GGML_MAX_SRC; ++k) {
+            for (int m = 0; m < nseg; ++m) {
+                if (cgraph->nodes[j_next]->src[k] == segs[m].dst) {
+                    nseg = 0;
+                }
+            }
+        }
+        if (nseg >= 2 && ggml_cuda_check_fusion_memory_ranges(cgraph, i, j_end - i + 1, out_nodes, nseg)) {
+            // an F16 SET_ROWS of a segment into a cache (V without its own fused store) a few nodes later is written by
+            // the group too, when no node in between touches that cache and the row index is a graph input
+            auto root = [](const ggml_tensor * t) { return t->view_src ? t->view_src : t; };
+            ggml_tensor * stores[GGML_CUDA_MMV_GROUP_MAX] = {};
+            for (int k = j_end + 1; k < cgraph->n_nodes && k <= j_end + 32; ++k) {
+                ggml_tensor * t = cgraph->nodes[k];
+                if (t->op != GGML_OP_SET_ROWS) {
+                    continue;
+                }
+                int m = -1;
+                for (int q = 0; q < nseg; ++q) {
+                    if (root(t->src[0]) == segs[q].dst && !segs[q].set_rows && !stores[q]) {
+                        m = q;
+                    }
+                }
+                if (m < 0 || !ggml_cuda_mmvq_kq_group_set_rows_ok(t, segs[m].dst) || root(t->src[1])->op != GGML_OP_NONE) {
+                    continue;
+                }
+                bool ok = true;
+                for (int u = j_end + 1; u < k && ok; ++u) {
+                    const ggml_tensor * n = cgraph->nodes[u];
+                    ok = root(n) != root(t);
+                    for (int q = 0; q < GGML_MAX_SRC && n->src[q] && ok; ++q) {
+                        ok = root(n->src[q]) != root(t);
+                    }
+                }
+                if (ok) {
+                    stores[m] = t;
+                    segs[m].set_rows = t;
+                }
+            }
+            ggml_cuda_mmvq_kq_group(*cuda_ctx, y, segs, nseg);
+            for (int q = 0; q < nseg; ++q) {
+                if (stores[q]) {
+                    s_precomputed[stores[q]] = 0;
+                }
+            }
+            return j_end - i;
+        }
+    }
+
     // RDNA3.5 decode: consecutive single-column MUL_MATs that read the same activation vector (plain Q8_0/F32
     // matvecs, or a [mul_mat, mul_mat, glu] gate/up pair) are launched as one grouped kernel. The segments are
     // mutually independent, so the launch position of the first one is valid for all of them.
@@ -8584,6 +8660,48 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
             if (!indep) continue;
             std::rotate(cgraph->nodes + i, cgraph->nodes + i + cnt, cgraph->nodes + k);   // [between][reduction] SIGMOID MUL ADD
             i = k + 2;
+        }
+    }
+    // K-quant matmuls of the same activation (attention Q/K/V) are moved next to the first one, so decode runs them as one
+    // grouped matvec (ggml_cuda_mmvq_kq_group). Only matmuls whose next node does not read them directly (no bias ADD,
+    // scale or GLU fusion to lose), and only across nodes that do not write the activation; runs before allocation.
+    if (GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc) && !ggml_cuda_fusion_disabled()) {
+        auto root = [](const ggml_tensor * t) { return t->view_src ? t->view_src : t; };
+        auto next_reads = [&](const int j) {
+            int k = j + 1;
+            while (k < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[k])) {
+                k++;
+            }
+            for (int s = 0; k < cgraph->n_nodes && s < GGML_MAX_SRC; ++s) {
+                if (cgraph->nodes[k]->src[s] == cgraph->nodes[j]) {
+                    return true;
+                }
+            }
+            return false;
+        };
+        auto movable = [&](const ggml_tensor * t, const ggml_tensor * y) {
+            return t->op == GGML_OP_MUL_MAT && t->src[1] == y && t->src[2] == nullptr && t->src[0]->op == GGML_OP_NONE &&
+                t->src[0]->view_src == nullptr && ggml_cuda_mmvq_kq_group_type_ok(t->src[0]->type) && t->type == GGML_TYPE_F32;
+        };
+        for (int i = 0; i < cgraph->n_nodes; ++i) {
+            ggml_tensor * a = cgraph->nodes[i];
+            if (!movable(a, a->src[1]) || a->src[1]->type != GGML_TYPE_F32 || next_reads(i)) {
+                continue;
+            }
+            const ggml_tensor * y = a->src[1];
+            int pos = i + 1;
+            for (int j = i + 1; j < cgraph->n_nodes && j <= i + 64 && pos - i < GGML_CUDA_MMV_GROUP_MAX; ++j) {
+                ggml_tensor * t = cgraph->nodes[j];
+                if (!ggml_cuda_is_view_or_noop(t) && root(t) == root(y)) {
+                    break;
+                }
+                if (!movable(t, y) || next_reads(j)) {
+                    continue;
+                }
+                std::rotate(cgraph->nodes + pos, cgraph->nodes + j, cgraph->nodes + j + 1);
+                pos++;
+            }
+            i = pos - 1;
         }
     }
     // fused norm + multi RoPE: a ROPE (multi) whose input is RMS_NORM -> MUL further up is moved right after the MUL
