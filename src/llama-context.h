@@ -284,7 +284,8 @@ public:
     llm_graph_result * get_gf_res_reserve() const;
 
     // returns the result of ggml_backend_sched_graph_compute_async execution
-    ggml_status graph_compute(ggml_cgraph * gf, bool batched);
+    // cpu_light: the CPU backend only gathers input rows in this graph, so it runs on one thread
+    ggml_status graph_compute(ggml_cgraph * gf, bool batched, bool cpu_light = false);
 
     // reserve a graph with a dummy ubatch of the specified size
     ggml_cgraph * graph_reserve(
@@ -454,6 +455,9 @@ private:
 
     ggml_backend_t backend_cpu = nullptr;
     std::vector<ggml_backend_ptr> backends;
+
+    // whether the CPU part of the last allocated ubatch graph is only GET_ROWS (and views), see graph_compute
+    bool cpu_light = false;
 
     // training
     ggml_opt_context_t opt_ctx = nullptr;
