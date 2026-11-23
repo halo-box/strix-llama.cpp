@@ -8464,8 +8464,23 @@ static int ggml_cuda_marks_uses(const ggml_cgraph * g, const ggml_tensor * t) {
 // reference counts of one split for ggml_cuda_marks_readers_left, valid while graph_optimize runs on that split
 struct ggml_cuda_marks_index {
     const ggml_cgraph * g = nullptr;
+    bool built = false;
     std::unordered_map<const ggml_tensor *, int> found;                                // (node, src) refs to x or a view of x
     std::unordered_map<const ggml_tensor *, std::vector<const ggml_tensor *>> views;   // view nodes of x in the split
+
+    void build() {
+        built = true;
+        found.reserve((size_t) g->n_nodes * 2);
+        for (int i = 0; i < g->n_nodes; ++i) {
+            const ggml_tensor * t = g->nodes[i];
+            if (ggml_cuda_marks_is_view(t) && t->view_src && t->view_src != t) views[t->view_src].push_back(t);
+            for (int s = 0; s < GGML_MAX_SRC && t->src[s]; ++s) {
+                const ggml_tensor * src = t->src[s];
+                ++found[src];
+                if (ggml_cuda_marks_is_view(src) && src->view_src && src->view_src != src) ++found[src->view_src];
+            }
+        }
+    }
 };
 static thread_local ggml_cuda_marks_index * g_marks_index = nullptr;
 
@@ -8473,16 +8488,6 @@ struct ggml_cuda_marks_index_scope {
     ggml_cuda_marks_index idx;
     explicit ggml_cuda_marks_index_scope(const ggml_cgraph * g) {
         idx.g = g;
-        idx.found.reserve((size_t) g->n_nodes * 2);
-        for (int i = 0; i < g->n_nodes; ++i) {
-            const ggml_tensor * t = g->nodes[i];
-            if (ggml_cuda_marks_is_view(t) && t->view_src && t->view_src != t) idx.views[t->view_src].push_back(t);
-            for (int s = 0; s < GGML_MAX_SRC && t->src[s]; ++s) {
-                const ggml_tensor * src = t->src[s];
-                ++idx.found[src];
-                if (ggml_cuda_marks_is_view(src) && src->view_src && src->view_src != src) ++idx.found[src->view_src];
-            }
-        }
         g_marks_index = &idx;
     }
     ~ggml_cuda_marks_index_scope() { g_marks_index = nullptr; }
@@ -8493,6 +8498,9 @@ static int ggml_cuda_marks_readers_left(const ggml_cgraph * g, const ggml_tensor
     int expected = ggml_cuda_marks_uses(g, x), found = 0;
     if (expected < 0) return -1;
     if (g_marks_index && g_marks_index->g == g) {
+        if (!g_marks_index->built) {
+            g_marks_index->build();
+        }
         const auto iv = g_marks_index->views.find(x);
         if (iv != g_marks_index->views.end()) {
             for (const ggml_tensor * t : iv->second) {
@@ -8615,23 +8623,29 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
             // gate mix takes; any other mix falls back to hc_mix_reduce, which reads the F32 xn
             // readers of each tensor (direct, or through a view of it), ascending node index: the nodes reads() accepts
             std::unordered_map<const ggml_tensor *, std::vector<int>> rd;
-            rd.reserve((size_t) cgraph->n_nodes * 2);
-            for (int n = 0; n < cgraph->n_nodes; ++n) {
-                const ggml_tensor * t = cgraph->nodes[n];
-                for (int s = 0; s < GGML_MAX_SRC && t->src[s]; ++s) {
-                    for (const ggml_tensor * x : {t->src[s], t->src[s]->view_src}) {
-                        if (!x) continue;
-                        auto & v = rd[x];
-                        if (v.empty() || v.back() != n) v.push_back(n);
+            std::unordered_map<const ggml_tensor *, int> pos;   // node -> index (the section does not reorder)
+            bool indexed = false;
+            auto index_graph = [&]() {
+                if (indexed) return;
+                indexed = true;
+                rd.reserve((size_t) cgraph->n_nodes * 2);
+                for (int n = 0; n < cgraph->n_nodes; ++n) {
+                    const ggml_tensor * t = cgraph->nodes[n];
+                    for (int s = 0; s < GGML_MAX_SRC && t->src[s]; ++s) {
+                        for (const ggml_tensor * x : {t->src[s], t->src[s]->view_src}) {
+                            if (!x) continue;
+                            auto & v = rd[x];
+                            if (v.empty() || v.back() != n) v.push_back(n);
+                        }
                     }
                 }
-            }
+                pos.reserve((size_t) cgraph->n_nodes);
+                for (int n = 0; n < cgraph->n_nodes; ++n) pos.emplace(cgraph->nodes[n], n);
+            };
             static const std::vector<int> rd_none;
-            std::unordered_map<const ggml_tensor *, int> pos;   // node -> index (the section does not reorder)
-            pos.reserve((size_t) cgraph->n_nodes);
-            for (int n = 0; n < cgraph->n_nodes; ++n) pos.emplace(cgraph->nodes[n], n);
-            auto pos_of = [&](const ggml_tensor * x) { const auto it = pos.find(x); return it == pos.end() ? -1 : it->second; };
+            auto pos_of = [&](const ggml_tensor * x) { index_graph(); const auto it = pos.find(x); return it == pos.end() ? -1 : it->second; };
             auto readers_after = [&](const ggml_tensor * x, int from) -> std::pair<const int *, const int *> {
+                index_graph();
                 auto it = rd.find(x);
                 const std::vector<int> & v = it == rd.end() ? rd_none : it->second;
                 const int * b = std::lower_bound(v.data(), v.data() + v.size(), from);
@@ -8927,15 +8941,15 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                     ggml_cuda_moe_weighted_reduction_match match;
                     if (!ggml_cuda_match_moe_weighted_reduction(cgraph, i, match)) continue;
                     const ggml_tensor * ex = match.experts;
+                    if (ex->op != GGML_OP_MUL_MAT_ID || ex->type != GGML_TYPE_F32 || ex->ne[0] % 8 != 0 || ggml_nrows(ex) < 512) continue;
                     int xi = -1;
                     for (int k = 0; k < i; ++k) { if (cgraph->nodes[k] == ex) { xi = k; break; } }
-                    if (xi < 0 || ex->op != GGML_OP_MUL_MAT_ID || ex->type != GGML_TYPE_F32) continue;
+                    if (xi < 0) continue;
                     if (!ggml_cuda_mmb_supported_mmid(*cuda_ctx, ex->src[0], ex->src[1], ex->src[2], const_cast<ggml_tensor *>(ex))) continue;
                     if (ex->src[0]->type != GGML_TYPE_IQ4_NL) {   // IQ4_NL validated; Q5_1/Q8_0 down experts keep BF16 outputs (f16-precision path, gufo parity)
                         if (ex->src[0]->type != GGML_TYPE_Q5_1 && ex->src[0]->type != GGML_TYPE_Q8_0) continue;
                     }
                     if (!ggml_node_has_n_uses(cgraph, xi, 1)) continue;
-                    if (ex->ne[0] % 8 != 0 || ggml_nrows(ex) < 512) continue;
                     if (ggml_cuda_marks_readers_local(cgraph, ex)) ggml_cuda_mmb_mark_bf16_only(*cuda_ctx, ex);
                 }
             }
@@ -9003,17 +9017,26 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
             // skips it. The F32 store is governed by the BF16-only marks as before. MUL_MAT(_ID)s and MULs (the HC stream
             // mix finds BF16 copies through ggml_cuda_mmb_cache_lookup) count as BF16 readers.
             std::unordered_map<const ggml_tensor *, int> want;
-            std::unordered_set<const ggml_tensor *> bf16_reader;
+            std::vector<int> reader_bits(cgraph->n_nodes, 0);
             for (int i = 0; i < cgraph->n_nodes; ++i) {
                 const ggml_tensor * t = cgraph->nodes[i];
                 if (ggml_cuda_is_view_or_noop(t)) continue;
                 const int k = ggml_cuda_mmb_f16_reader(*cuda_ctx, t);
+                reader_bits[i] = k;
+                if (k && t->src[0] && t->src[1]) {
+                    const ggml_tensor * x = t->src[1]->view_src ? t->src[1]->view_src : t->src[1];
+                    want[x] |= k;
+                }
+            }
+            std::unordered_set<const ggml_tensor *> bf16_reader;
+            for (int i = 0; i < cgraph->n_nodes && !want.empty(); ++i) {
+                const ggml_tensor * t = cgraph->nodes[i];
+                if (ggml_cuda_is_view_or_noop(t)) continue;
                 const bool may_bf16 = t->op == GGML_OP_MUL_MAT_ID || t->op == GGML_OP_MUL ||
                     (t->op == GGML_OP_MUL_MAT && (!t->src[0] || t->src[0]->type != GGML_TYPE_F32));
-                for (int s = 0; s < GGML_MAX_SRC && t->src[s]; ++s) {
-                    const ggml_tensor * x = t->src[s]->view_src ? t->src[s]->view_src : t->src[s];
-                    if (s == 1 && k) { want[x] |= k; continue; }
-                    if (may_bf16) bf16_reader.insert(x);
+                for (int s = 0; s < GGML_MAX_SRC && t->src[s] && may_bf16; ++s) {
+                    if (s == 1 && reader_bits[i]) continue;
+                    bf16_reader.insert(t->src[s]->view_src ? t->src[s]->view_src : t->src[s]);
                 }
             }
             for (const auto & w : want) {
