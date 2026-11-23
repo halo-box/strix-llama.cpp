@@ -718,7 +718,7 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
     target_sources(${GGML_CPU_NAME} PRIVATE ${GGML_CPU_SOURCES})
     target_compile_options(${GGML_CPU_NAME} PRIVATE ${ARCH_FLAGS})
     target_compile_definitions(${GGML_CPU_NAME} PRIVATE ${ARCH_DEFINITIONS})
-    include(${CMAKE_CURRENT_LIST_DIR}/../../../hooks/ggml/cpu-amx.cmake OPTIONAL) # HOOK(cpu-amx)
+    include(${CMAKE_CURRENT_FUNCTION_LIST_DIR}/../../../hooks/ggml/cpu-amx.cmake OPTIONAL) # HOOK(cpu-amx)
 
     if (EMSCRIPTEN)
         set_target_properties(${GGML_CPU_NAME} PROPERTIES COMPILE_FLAGS "-msimd128")

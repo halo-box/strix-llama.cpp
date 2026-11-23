@@ -7,3 +7,5 @@ if (CMAKE_CXX_COMPILER_ID STREQUAL "Clang" AND
     CMAKE_CXX_COMPILER_VERSION VERSION_LESS 23)
     set_source_files_properties(ggml-cpu/amx/mmq.cpp PROPERTIES COMPILE_OPTIONS "$<$<BOOL:${MSVC}>:/clang:>-fno-unroll-loops")
 endif()
+
+set_property(GLOBAL PROPERTY HOOKS_CPU_AMX_INCLUDED TRUE) # checked by hooks_setup (hooks/hooks.cmake)

@@ -81,6 +81,12 @@ function(hooks_setup)
         message(WARNING "hooks: no ggml-base target, hooks disabled")
         return()
     endif()
+    # HOOK(cpu-amx) includes a file from inside a function of ggml-cpu: a wrong path would be skipped without a word (the
+    # include is OPTIONAL), and the clang 22 builds of amx/mmq.cpp would not finish
+    get_property(cpu_amx GLOBAL PROPERTY HOOKS_CPU_AMX_INCLUDED)
+    if (TARGET ggml-cpu AND NOT cpu_amx)
+        message(FATAL_ERROR "hooks: HOOK(cpu-amx) in ggml/src/ggml-cpu/CMakeLists.txt did not include hooks/ggml/cpu-amx.cmake")
+    endif()
     include(${HOOKS_DIR}/ggml/ggml-hooks.cmake)
     if (TARGET llama)
         include(${HOOKS_DIR}/llama/llama-hooks.cmake)
