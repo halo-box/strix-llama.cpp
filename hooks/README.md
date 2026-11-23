@@ -85,7 +85,10 @@ switch selects it. Upstream stays the default.
   - `cuda_node` (on): nodes that upstream refuses and the fork accepts, for example the fork types and the EXL3
     ops, run through the fork `ggml_cuda_compute_forward`.
   - `cuda_graph` (switch, off): the fork `graph_optimize`, `graph_compute`, `supports_op` and `offload_op`
-    replace the upstream ones. Hook kernels still apply: the fork computes the segments between them.
+    replace the upstream ones. Hook kernels still apply: the fork computes the segments between them. The buffers are
+    fork buffers, as in a fork build: the fork recognizes its buffers by its own functions, and repacks weights in
+    place (MMB R2) only in them. A hook kernel that reads a weight must not be enabled on a weight the fork repacks
+    (`ggml_cuda_mmb_r2_packed`).
 - Vulkan: `ggml/vulkan` is the fork `ggml/src/ggml-vulkan` with its shaders (`hooks/tools/import-vulkan.py`).
   The fork device uses the upstream instance and logical device, so both read the same buffers and share the queues.
   `vk_node` (on) works as on HIP. With `vk_graph` (switch, off) the upstream devices become the fork

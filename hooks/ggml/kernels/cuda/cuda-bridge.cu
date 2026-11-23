@@ -7,6 +7,7 @@
 // cuda_graph (off): the fork computes the graphs instead of upstream: its graph_optimize and graph_compute
 //                        (fusions, kernel selection, CUDA graphs), and the device answers (supports_op, offload_op).
 //                        Hook kernels still apply: the fork computes the segments between them, on the same stream.
+//                        The buffers are fork buffers (in-place weight repacking, allocation sizes).
 //                        GGML_HOOKS=+cuda_graph (a switch).
 
 #include "../../cuda/common.cuh"
@@ -33,6 +34,11 @@ bool ggml_hook_fork_offload_op(ggml_backend_dev_t dev, const ggml_tensor * op);
 enum ggml_status ggml_hook_fork_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph);
 void ggml_hook_fork_graph_optimize(ggml_backend_t backend, ggml_cgraph * cgraph, ggml_backend_graph_optimize_params * params);
 void ggml_hook_fork_set_mmb_enabled(ggml_backend_t backend, bool enable);
+ggml_backend_buffer_type_t ggml_hook_fork_buffer_type(int device);
+ggml_backend_buffer_type_t ggml_hook_fork_host_buffer_type();
+bool ggml_hook_fork_buft_is_cuda(ggml_backend_buffer_type_t buft);
+bool ggml_hook_fork_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft);
+const ggml_backend_i * ggml_hook_fork_backend_interface();
 void ggml_hook_fork_set_mmb_small_batch(ggml_backend_t backend, bool enable);
 
 static void bridge_sync(cudaStream_t stream) {
@@ -45,6 +51,7 @@ namespace {
 struct fork_state {
     ggml_fork::ggml_backend_cuda_context * ctx = nullptr;
     ggml_backend                           shim = {}; // the upstream backend with the fork context
+    ggml_backend_i                         orig = {}; // the backend functions before graph_backend_install
 };
 
 std::mutex fork_mutex;
@@ -68,8 +75,10 @@ fork_state & state_of(::ggml_backend_cuda_context & uctx, ggml_backend_t backend
     return *s;
 }
 
+void graph_backend_install(ggml_backend_t backend, fork_state & s);
+
 void fork_backend_init(ggml_backend_t backend) {
-    state_of(*(::ggml_backend_cuda_context *) backend->context, backend);
+    graph_backend_install(backend, state_of(*(::ggml_backend_cuda_context *) backend->context, backend));
 }
 
 void fork_backend_free(ggml_backend_t backend) {
@@ -203,6 +212,99 @@ bool graph_optimize(ggml_backend_t backend, ggml_cgraph * cgraph, ggml_backend_g
     return true;
 }
 
+// cuda_graph: the buffers are fork buffers, as in a fork build. The fork code recognizes its buffers by its own functions,
+// repacks weights in place (MMB R2) only in them, and their functions keep the record of these weights (a write or a free
+// drops it, a read of a repacked weight aborts); the allocation sizes are the ones the fork kernels need.
+ggml_backend_buffer_type_t own_buft(ggml_backend_buffer_type_t buft, ggml_backend_dev_t dev) {
+    buft->device = dev;
+    return buft;
+}
+
+ggml_backend_buffer_type_t graph_get_buffer_type(ggml_backend_dev_t dev) {
+    return own_buft(ggml_fork::ggml_hook_fork_buffer_type(dev_index_of(dev)), dev);
+}
+
+ggml_backend_buffer_type_t graph_get_host_buffer_type(ggml_backend_dev_t) {
+    return own_buft(ggml_fork::ggml_hook_fork_host_buffer_type(), cuda_dev(0));
+}
+
+void graph_device_install(ggml_backend_dev_t, ggml_backend_device_i * iface) {
+    if (graph_on()) {
+        iface->get_buffer_type      = graph_get_buffer_type;
+        iface->get_host_buffer_type = graph_get_host_buffer_type;
+    }
+}
+
+// the upstream buffers (ggml_backend_cuda_buffer_type) stay supported: no answer here
+bool graph_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft, bool * result) {
+    if (!graph_on() || !ggml_fork::ggml_hook_fork_supports_buft(dev, buft)) {
+        return false;
+    }
+    *result = true;
+    return true;
+}
+
+bool in_fork_buffer(const ggml_tensor * t) {
+    const ggml_backend_buffer_t buf = t->view_src ? t->view_src->buffer : t->buffer;
+    return buf && ggml_fork::ggml_hook_fork_buft_is_cuda(ggml_backend_buffer_get_type(buf));
+}
+
+fork_state & state_of(ggml_backend_t backend) {
+    return state_of(*(::ggml_backend_cuda_context *) backend->context, backend);
+}
+
+// the asynchronous copies: the fork functions for fork buffers (same stream), the upstream ones for upstream buffers
+void graph_set_tensor_async(ggml_backend_t backend, ggml_tensor * t, const void * data, size_t offset, size_t size) {
+    fork_state & s = state_of(backend);
+    in_fork_buffer(t) ? ggml_fork::ggml_hook_fork_backend_interface()->set_tensor_async(&s.shim, t, data, offset, size)
+                      : s.orig.set_tensor_async(backend, t, data, offset, size);
+}
+
+void graph_get_tensor_async(ggml_backend_t backend, const ggml_tensor * t, void * data, size_t offset, size_t size) {
+    fork_state & s = state_of(backend);
+    in_fork_buffer(t) ? ggml_fork::ggml_hook_fork_backend_interface()->get_tensor_async(&s.shim, t, data, offset, size)
+                      : s.orig.get_tensor_async(backend, t, data, offset, size);
+}
+
+void graph_set_tensor_2d_async(ggml_backend_t backend, ggml_tensor * t, const void * data, size_t offset, size_t size,
+                               size_t n_copies, size_t stride_tensor, size_t stride_data) {
+    fork_state & s = state_of(backend);
+    in_fork_buffer(t) ? ggml_fork::ggml_hook_fork_backend_interface()->set_tensor_2d_async(&s.shim, t, data, offset, size, n_copies, stride_tensor, stride_data)
+                      : s.orig.set_tensor_2d_async(backend, t, data, offset, size, n_copies, stride_tensor, stride_data);
+}
+
+void graph_get_tensor_2d_async(ggml_backend_t backend, const ggml_tensor * t, void * data, size_t offset, size_t size,
+                               size_t n_copies, size_t stride_tensor, size_t stride_data) {
+    fork_state & s = state_of(backend);
+    in_fork_buffer(t) ? ggml_fork::ggml_hook_fork_backend_interface()->get_tensor_2d_async(&s.shim, t, data, offset, size, n_copies, stride_tensor, stride_data)
+                      : s.orig.get_tensor_2d_async(backend, t, data, offset, size, n_copies, stride_tensor, stride_data);
+}
+
+bool graph_cpy_tensor_async(ggml_backend_t src_backend, ggml_backend_t dst_backend, const ggml_tensor * src, ggml_tensor * dst) {
+    if (!ggml_backend_is_cuda(src_backend) || !ggml_backend_is_cuda(dst_backend)) {
+        return false;
+    }
+    const bool src_fork = in_fork_buffer(src);
+    if (src_fork != in_fork_buffer(dst)) {
+        return false; // the scheduler copies synchronously
+    }
+    fork_state & d = state_of(dst_backend);
+    return src_fork ? ggml_fork::ggml_hook_fork_backend_interface()->cpy_tensor_async(&state_of(src_backend).shim, &d.shim, src, dst)
+                    : d.orig.cpy_tensor_async(src_backend, dst_backend, src, dst);
+}
+
+void graph_backend_install(ggml_backend_t backend, fork_state & s) {
+    if (!graph_on()) {
+        return;
+    }
+    s.orig = backend->iface;
+    backend->iface.set_tensor_async    = graph_set_tensor_async;
+    backend->iface.get_tensor_async    = graph_get_tensor_async;
+    backend->iface.set_tensor_2d_async = graph_set_tensor_2d_async;
+    backend->iface.get_tensor_2d_async = graph_get_tensor_2d_async;
+    backend->iface.cpy_tensor_async    = graph_cpy_tensor_async;
+}
+
 // the registry procs of the fork that libllama asks for: on the fork context of the upstream backend
 void set_mmb_enabled(ggml_backend_t backend, bool enable) {
     ggml_fork::ggml_hook_fork_set_mmb_enabled(&state_of(*(::ggml_backend_cuda_context *) backend->context, backend).shim, enable);
@@ -234,6 +336,8 @@ GGML_HOOK_REGISTER_BACKEND_EXT([] {
     e.backend_free   = fork_backend_free;
     e.offload_op             = node_offload;
     e.supports_op            = graph_supports;
+    e.supports_buft          = graph_supports_buft;
+    e.device_install         = graph_device_install;
     e.replace_graph_compute  = graph_compute;
     e.replace_graph_optimize = graph_optimize;
     e.proc_address   = proc_address;
