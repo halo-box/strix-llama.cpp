@@ -2570,9 +2570,48 @@ struct mmvq_kq_group_args_dev {
     int nseg;
 };
 
+// y = rms_norm(x) * w of one row in shared memory, with the arithmetic of rms_norm_f32<float, 512, 1, true, true>
+// (one float4 per thread, the block_reduce of a 512-thread block)
+static __device__ __forceinline__ void mmvq_kq_group_rms_norm(
+        float * yn, const float * GGML_CUDA_RESTRICT x, const float * GGML_CUDA_RESTRICT w, const int ncols, const float eps,
+        float * s_sum) {
+    static_assert(MMVQ_KQW_NWARPS*32 == 512);
+    const int tid    = threadIdx.y*32 + threadIdx.x;
+    const int ncols4 = ncols / 4;
+    float4 xs = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    float tmp = 0.0f;
+    if (tid < ncols4) {
+        xs = ((const float4 *) x)[tid];
+        tmp += xs.x*xs.x + xs.y*xs.y + xs.z*xs.z + xs.w*xs.w;
+    }
+    tmp = warp_reduce_sum(tmp);
+    if (threadIdx.x == 0) {
+        s_sum[threadIdx.y] = tmp;
+    }
+    __syncthreads();
+    tmp = 0.0f;
+    if (threadIdx.x < MMVQ_KQW_NWARPS) {
+        tmp = s_sum[threadIdx.x];
+    }
+    tmp = warp_reduce_sum(tmp);
+    const float scale = rsqrtf(tmp / ncols + eps);
+    if (tid < ncols4) {
+        float4 r = make_float4(scale*xs.x, scale*xs.y, scale*xs.z, scale*xs.w);
+        const float4 m = ((const float4 *) w)[tid];
+        r.x *= m.x;
+        r.y *= m.y;
+        r.z *= m.z;
+        r.w *= m.w;
+        ((float4 *) yn)[tid] = r;
+    }
+    __syncthreads();
+}
+
+// norm_x != nullptr: y is not read, the kernel computes it as rms_norm(norm_x) * norm_w first
 __launch_bounds__(MMVQ_KQW_NWARPS*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q_kq_group(
-        const mmvq_kq_group_args_dev args, const float * GGML_CUDA_RESTRICT y, const int ncols_x) {
+        const mmvq_kq_group_args_dev args, const float * GGML_CUDA_RESTRICT y, const int ncols_x,
+        const float * GGML_CUDA_RESTRICT norm_x, const float * GGML_CUDA_RESTRICT norm_w, const float norm_eps) {
     constexpr int V = MMVQ_KQW_V;
     int s = 0;
 #pragma unroll
@@ -2589,6 +2628,12 @@ static __global__ void mul_mat_vec_q_kq_group(
 
     extern __shared__ char mmvq_fq_smem[];
     block_q8_1 * y_q8 = (block_q8_1 *) mmvq_fq_smem;
+    if (norm_x) {
+        __shared__ float s_sum[MMVQ_KQW_NWARPS];
+        float * yn = (float *) (y_q8 + ncols_x/QK8_1);
+        mmvq_kq_group_rms_norm(yn, norm_x, norm_w, ncols_x, norm_eps, s_sum);
+        y = yn;
+    }
     // Q4_K: the block sums are computed as well, Q6_K ignores them
     mmvq_fq_quantize_y<GGML_TYPE_Q4_K>(y_q8, y, ncols_x, threadIdx.y*32 + threadIdx.x, MMVQ_KQW_NWARPS*32,
         ggml_cuda_mm_fusion_args_device{}, 1.0f, 0.0f, 0);
@@ -2635,7 +2680,20 @@ bool ggml_cuda_mmvq_kq_group_set_rows_ok(const ggml_tensor * set_rows, const ggm
         (idx->type == GGML_TYPE_I64 || idx->type == GGML_TYPE_I32) && ggml_nelements(idx) == 1;
 }
 
-void ggml_cuda_mmvq_kq_group(ggml_backend_cuda_context & ctx, const ggml_tensor * y, const ggml_cuda_mmv_group_seg * segs, const int nseg) {
+bool ggml_cuda_mmvq_kq_group_rms_norm_ok(const ggml_tensor * rms_norm, const ggml_tensor * mul, const ggml_tensor * y) {
+    const ggml_tensor * x = rms_norm->src[0];
+    const ggml_tensor * w = mul->src[0] == rms_norm ? mul->src[1] : mul->src[0];
+    const int64_t ncols = x->ne[0];
+    // the launches of rms_norm_f32_dispatch that use a 512-thread block, one float4 per thread
+    return rms_norm->op == GGML_OP_RMS_NORM && mul->op == GGML_OP_MUL && y == mul && (mul->src[0] == rms_norm || mul->src[1] == rms_norm) &&
+        x->type == GGML_TYPE_F32 && w->type == GGML_TYPE_F32 && ggml_is_contiguous(x) && ggml_nrows(x) == 1 &&
+        ggml_is_contiguous(w) && ggml_nelements(w) == ncols && ggml_are_same_shape(mul, x) &&
+        ncols % 128 == 0 && ncols/4 > 256 && ncols/4 <= 512 &&
+        (uintptr_t) x->data % 16 == 0 && (uintptr_t) w->data % 16 == 0 && (uintptr_t) y->data % 16 == 0;
+}
+
+void ggml_cuda_mmvq_kq_group(ggml_backend_cuda_context & ctx, const ggml_tensor * y, const ggml_cuda_mmv_group_seg * segs, const int nseg,
+        const ggml_tensor * rms_norm) {
     GGML_ASSERT(nseg >= 1 && nseg <= MMVQ_GROUP_MAX);
     const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
     GGML_ASSERT(warp_size == 32);
@@ -2667,9 +2725,18 @@ void ggml_cuda_mmvq_kq_group(ggml_backend_cuda_context & ctx, const ggml_tensor 
         nblocks += (int) ((w->ne[1] + rows_per_block - 1) / rows_per_block);
     }
 
-    const int nbytes_shared = (int) (ncols / QK8_1 * sizeof(block_q8_1));
+    const float * norm_x = nullptr;
+    const float * norm_w = nullptr;
+    float norm_eps = 0.0f;
+    if (rms_norm) {
+        GGML_ASSERT(ggml_cuda_mmvq_kq_group_rms_norm_ok(rms_norm, y, y));
+        norm_x = (const float *) rms_norm->src[0]->data;
+        norm_w = (const float *) (y->src[0] == rms_norm ? y->src[1] : y->src[0])->data;
+        memcpy(&norm_eps, rms_norm->op_params, sizeof(float));
+    }
+    const int nbytes_shared = (int) (ncols / QK8_1 * sizeof(block_q8_1) + (rms_norm ? ncols * sizeof(float) : 0));
     const ggml_cuda_kernel_launch_params params(dim3(nblocks, 1, 1), dim3(warp_size, MMVQ_KQW_NWARPS, 1), nbytes_shared, stream);
-    ggml_cuda_kernel_launch(mul_mat_vec_q_kq_group, params, args, (const float *) y->data, (int) ncols);
+    ggml_cuda_kernel_launch(mul_mat_vec_q_kq_group, params, args, (const float *) y->data, (int) ncols, norm_x, norm_w, norm_eps);
 }
 
 // Dedicated MoE multi-token kernel.
