@@ -1625,6 +1625,12 @@ struct test_case {
             ggml_graph_add_node(gf, sentinel);
         }
 
+        // weights first: graph_optimize (run by the scheduler allocation) may repack weights in place, which a later
+        // write would undo
+        if (ctx_weights) {
+            initialize_tensors(ctx_weights.get());
+        }
+
         if (use_scheduler_allocation()) {
             ggml_backend_t backends[] = {backend1, backend2};
             sched.reset(ggml_backend_sched_new(backends, nullptr, 2, GGML_DEFAULT_GRAPH_SIZE, false, true));
@@ -1642,9 +1648,6 @@ struct test_case {
 
         // randomize tensors
         initialize_tensors(ctx.get());
-        if (ctx_weights) {
-            initialize_tensors(ctx_weights.get());
-        }
 
         // TODO: [TAG_MUL_MAT_ID_SKIP] @ngxson : remove this once CUDA implements mul_mat_id with -1 = skipped
         if (backend_lacks_skipped_ids(backend1, gf)) {
@@ -8842,6 +8845,49 @@ struct test_moe_glu_f16 : public test_case {
             ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(int32_t));
         }
     }
+};
+
+// routed expert FFN with the experts in a weights buffer, through the scheduler (graph_optimize repacks eligible
+// experts in place, e.g. the gfx1151 G2 layouts): down(swiglu(gate(x), up(x)))
+struct test_moe_ffn_weights : public test_case {
+    const ggml_type type_gu, type_down;
+    const int64_t n_embd, n_ff;
+    const int n_expert, n_used;
+    const int64_t n_tokens;
+
+    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "MOE_FFN_W"; }
+    std::string vars() override { return VARS_TO_STR7(type_gu, type_down, n_embd, n_ff, n_expert, n_used, n_tokens); }
+    bool run_whole_graph() override { return true; }
+    bool use_scheduler_allocation() override { return true; }
+    bool use_weight_context() override { return true; }
+    double max_nmse_err() override { return 5e-4; }
+    uint64_t op_flops(ggml_tensor * t) override { GGML_UNUSED(t); return (uint64_t) 2 * 3 * n_embd * n_ff * n_used * n_tokens; }
+
+    test_moe_ffn_weights(ggml_type type_gu, ggml_type type_down, int64_t n_embd, int64_t n_ff, int n_expert, int n_used, int64_t n_tokens)
+        : type_gu(type_gu), type_down(type_down), n_embd(n_embd), n_ff(n_ff), n_expert(n_expert), n_used(n_used), n_tokens(n_tokens) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override { return build_graph(ctx, ctx); }
+
+    ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_weights) override {
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_expert, n_tokens);
+        ggml_set_name(ids, "ids");
+        ids = ggml_view_2d(ctx, ids, n_used, n_tokens, ids->nb[1], 0);
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, 1, n_tokens);
+        ggml_set_name(x, "x");
+        ggml_tensor * gw = ggml_new_tensor_3d(ctx_weights, type_gu, n_embd, n_ff, n_expert);
+        ggml_tensor * uw = ggml_new_tensor_3d(ctx_weights, type_gu, n_embd, n_ff, n_expert);
+        ggml_tensor * dw = ggml_new_tensor_3d(ctx_weights, type_down, n_ff, n_embd, n_expert);
+        ggml_set_name(gw, "gate_exps");
+        ggml_set_name(uw, "up_exps");
+        ggml_set_name(dw, "down_exps");
+        ggml_tensor * gate = ggml_mul_mat_id(ctx, gw, x, ids);
+        ggml_tensor * up   = ggml_mul_mat_id(ctx, uw, x, ids);
+        ggml_tensor * out  = ggml_mul_mat_id(ctx, dw, ggml_swiglu_split(ctx, gate, up), ids);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override { init_mul_mat_id_tensors(ctx, n_expert); }
 };
 
 // f16 MoE activations as build_moe_ffn emits them with fused_moe_f16. part: 0 the whole block, 1 up/gate + casts,
@@ -17795,6 +17841,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_moe_glu_f16(GGML_TYPE_Q4_K, GGML_TYPE_F16, 2560, 640, 512, 10, 2048, false, true));
     test_cases.emplace_back(new test_moe_glu_f16(GGML_TYPE_Q5_K, GGML_TYPE_F16, 2560, 640, 512, 10, 2048, false, true));
     test_cases.emplace_back(new test_moe_glu_f16(GGML_TYPE_IQ3_S, GGML_TYPE_F32, 2560, 640, 512, 10, 2048, false, true));
+    // Qwen3-30B-A3B expert FFN (K = 768 down), decode to a full ubatch
+    for (ggml_type td : {GGML_TYPE_Q4_K, GGML_TYPE_Q6_K}) {
+        for (int64_t nt : {1, 8, 32, 100, 512}) {
+            test_cases.emplace_back(new test_moe_ffn_weights(GGML_TYPE_Q4_K, td, 2048, 768, 128, 8, nt));
+        }
+    }
     test_cases.emplace_back(new test_mul_mat_pair());
     // routed MUL_MAT_ID at the production MoE shapes and quant types; run with --mmb on and off to compare BF16 WMMA vs MMQ
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 512, 10, true, 640, 512, 2560));
@@ -20767,16 +20819,17 @@ static bool run_fa_vec_slice(ggml_backend_t backend, ggml_backend_t backend_cpu,
 }
 
 // The CUDA/HIP BF16 WMMA matmul path (mmb) is off unless a context opts in (llama opts in its contexts, with the small-batch gate for qwen4exp).
-// --mmb picks which path the >=32-row MUL_MAT/MUL_MAT_ID cases test: mmb with the qwen4exp small-batch gate, or the normal dispatch without mmb.
-static void set_mmb(ggml_backend_t backend, bool enable) {
+// --mmb picks which path the >=32-row MUL_MAT/MUL_MAT_ID cases test: mmb with the qwen4exp small-batch gate, the normal dispatch without mmb,
+// or mmb without the small-batch gate (large).
+static void set_mmb(ggml_backend_t backend, int mode) {
     ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
     auto set_mmb_fn = (void (*)(ggml_backend_t, bool)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_set_mmb_enabled");
     if (set_mmb_fn) {
-        set_mmb_fn(backend, enable);
+        set_mmb_fn(backend, mode != 0);
     }
     auto set_mmb_small_fn = (void (*)(ggml_backend_t, bool)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_set_mmb_small_batch");
     if (set_mmb_small_fn) {
-        set_mmb_small_fn(backend, enable);
+        set_mmb_small_fn(backend, mode == 1);
     }
 }
 
@@ -20799,7 +20852,7 @@ static bool run_mmb_context_test(ggml_backend_dev_t dev, const char * op_names_f
         context(ggml_backend_dev_t dev, int tokens) : backend(ggml_backend_dev_init(dev, nullptr)), cpu(ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr)), test(tokens, GGML_TYPE_Q4_0) {
             tensors.reset(ggml_init({ggml_tensor_overhead()*128 + ggml_graph_overhead(), nullptr, true}));
             GGML_ASSERT(backend && cpu && tensors);
-            set_mmb(backend.get(), true); // this test is about mmb scratch, so it ignores --mmb
+            set_mmb(backend.get(), 1); // this test is about mmb scratch, so it ignores --mmb
             test.gf = ggml_new_graph(tensors.get());
             output = test.build_graph(tensors.get());
             for (ggml_tensor * t = ggml_get_first_tensor(tensors.get()); t; t = ggml_get_next_tensor(tensors.get(), t)) {
@@ -21136,7 +21189,7 @@ static bool test_case_selected(const test_mode mode, const char * op_names_filte
 }
 
 static bool test_backend(ggml_backend_t backend, ggml_backend_dev_t dev, test_mode mode, const char * op_names_filter, const char * params_filter,
-                         printer * output_printer, const char * test_file_path, int parallel_workers, const bool must_run, bool mmb) {
+                         printer * output_printer, const char * test_file_path, int parallel_workers, const bool must_run, int mmb) {
     if (mode == MODE_CENSUS) {
         return test_census(backend, dev, params_filter);
     }
@@ -21397,7 +21450,8 @@ static void usage(char ** argv) {
     printf("  --show-coverage             show test coverage\n");
     printf("  --test-file <path>          read test operators from a test file generated by test-export-graph-ops\n");
     printf("  -j <n>                      run tests using <n> parallel worker threads (default: 1, test mode only)\n");
-    printf("  --mmb <on|off>              CUDA/HIP matmuls from 32 rows use the BF16 WMMA path as in a qwen4exp context (on, default) or the normal dispatch (off)\n\n");
+    printf("  --mmb <on|off|large>        CUDA/HIP matmuls from 32 rows use the BF16 WMMA path as in a qwen4exp context (on, default), the normal dispatch (off),\n"
+           "                              or the BF16 WMMA path from 512 rows as in other llama contexts (large)\n\n");
     printf("Examples:\n");
     printf("  %s -j 8\n", argv[0]);
     printf("  %s -o ADD,MUL_MAT\n", argv[0]);
@@ -21415,7 +21469,7 @@ int main(int argc, char ** argv) {
     const char * params_filter = nullptr;
     const char * test_file_path = nullptr;
     int parallel_workers = test_parallel_workers(1);
-    bool mmb = true;
+    int mmb = 1;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "test") == 0) {
@@ -21484,8 +21538,9 @@ int main(int argc, char ** argv) {
                 return 1;
             }
         } else if (strcmp(argv[i], "--mmb") == 0) {
-            if (i + 1 < argc && (strcmp(argv[i + 1], "on") == 0 || strcmp(argv[i + 1], "off") == 0)) {
-                mmb = strcmp(argv[++i], "on") == 0;
+            if (i + 1 < argc && (strcmp(argv[i + 1], "on") == 0 || strcmp(argv[i + 1], "off") == 0 || strcmp(argv[i + 1], "large") == 0)) {
+                ++i;
+                mmb = strcmp(argv[i], "on") == 0 ? 1 : strcmp(argv[i], "large") == 0 ? 2 : 0;
             } else {
                 usage(argv);
                 return 1;

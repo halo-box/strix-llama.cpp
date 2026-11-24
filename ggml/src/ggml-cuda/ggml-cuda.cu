@@ -1082,6 +1082,9 @@ static void ggml_backend_cuda_buffer_get_tensor(ggml_backend_buffer_t buffer, co
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
     ggml_cuda_set_device(ctx->device);
+    if (ggml_cuda_mmb_g2_read(tensor, data, offset, size)) {
+        return;
+    }
     ggml_cuda_mmb_check_readable(tensor, (const char *) tensor->data + offset, size, __func__);
     CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
@@ -2736,7 +2739,9 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
 
     if (ggml_cuda_mmb_r2_packed(src0)) {   // MMB_DOWN_R2 in-place layout: R2 WMMA (MMB batches) or the R2 GEMV, never MMVQ/MMQ
-        if (ggml_cuda_mmb_g2_packed(src0)) {   // MMB_GLU_R2 gate/up outside the fused GLU path: G2 GEMV
+        if (ggml_cuda_mmb_down_g2_packed(src0) && ggml_cuda_mmb_supported_mmid(ctx, src0, src1, ids, dst)) {   // G2 down: WMMA
+            ggml_cuda_mul_mat_id_mmb(ctx, src0, src1, ids, dst);
+        } else if (ggml_cuda_mmb_g2_packed(src0)) {   // MMB_GLU_R2 gate/up outside the fused GLU path, G2 down on few rows: G2 GEMV
             ggml_cuda_mul_mat_id_g2_gemv(ctx, src0, src1, ids, dst);
         } else if (ggml_cuda_mmb_supported_mmid(ctx, src0, src1, ids, dst)) {
             ggml_cuda_mul_mat_id_mmb(ctx, src0, src1, ids, dst);
@@ -3355,6 +3360,12 @@ static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggm
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
+    if (ggml_cuda_mmb_g2_packed(tensor)) {
+        CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+        if (ggml_cuda_mmb_g2_read(tensor, data, offset, size)) {
+            return;
+        }
+    }
     ggml_cuda_mmb_check_readable(tensor, (const char *) tensor->data + offset, size, __func__);
 
     CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
@@ -9158,6 +9169,10 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                 // src1 [K, 1, T] is the broadcast gate/up input (also when a bias ADD_ID sits before the GLU); a down reads n_used rows
                 if (t->op == GGML_OP_MUL_MAT_ID && t->src[0]->type == GGML_TYPE_Q5_1 && glu_in.count(t) == 0 && t->src[1]->ne[1] != 1 &&
                         t->src[0]->buffer && ggml_backend_buffer_is_cuda(t->src[0]->buffer)) ggml_cuda_mmb_down_r2_prepare(*cuda_ctx, t->src[0]);
+                if (t->op == GGML_OP_MUL_MAT_ID && (t->src[0]->type == GGML_TYPE_Q4_K || t->src[0]->type == GGML_TYPE_Q6_K) && glu_in.count(t) == 0 && t->src[1]->ne[1] != 1 &&
+                        t->src[0]->buffer && ggml_backend_buffer_is_cuda(t->src[0]->buffer) && ggml_cuda_mmb_down_g2_wanted(*cuda_ctx, t)) {
+                    ggml_cuda_mmb_down_g2_prepare(*cuda_ctx, t->src[0]);
+                }
             }
         }
         {   // MMB_DENSE_R2: in-place tile repack of dense Q8_0 weights whose only readers in this graph are MUL_MAT src0
