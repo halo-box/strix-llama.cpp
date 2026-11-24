@@ -2136,7 +2136,7 @@ static bool mmb_act_from_fused_gateup(const ggml_tensor * act, const int n_ff, c
     return false;
 }
 
-bool ggml_cuda_mmb_supported_mmid(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, const ggml_tensor * dst) {
+static bool mmb_supported_mmid_from(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, const ggml_tensor * dst, const int64_t min_t_cap) {
     if (!mmb_enabled(ctx)) return false;
     // Fused gate_up is split into gate/up views, so the SwiGLU fusion never fires and MMB pays BF16 precision with no
     // fused-kernel payoff. gemma-4-26B-A4B / gfx1151 / ROCm 10.0: KL vs master 0.19-0.31, top-1 90-93% (split-tensor
@@ -2160,11 +2160,15 @@ bool ggml_cuda_mmb_supported_mmid(ggml_backend_cuda_context & ctx, const ggml_te
     if (dst->ne[0] != M || dst->ne[1] != n_used || dst->ne[2] != T || dst->ne[3] != 1) return false;
     if (ids->nb[0] != sizeof(int32_t) || ids->ne[2] != 1 || ids->ne[3] != 1) return false;
 #ifdef GGML_USE_TRELLIS
-    if (T < mmb_min_t_for(ctx, src0->type) || n_used > 64 || (T * n_used) >> 16 >= 1024) return false;   // tile index must fit in 16 bits per expert
+    if (T < std::min<int64_t>(mmb_min_t_for(ctx, src0->type), min_t_cap) || n_used > 64 || (T * n_used) >> 16 >= 1024) return false;   // tile index must fit in 16 bits per expert
 #else
-    if (T < mmb_min_t(ctx) || n_used > 64 || (T * n_used) >> 16 >= 1024) return false;   // tile index must fit in 16 bits per expert
+    if (T < std::min<int64_t>(mmb_min_t(ctx), min_t_cap) || n_used > 64 || (T * n_used) >> 16 >= 1024) return false;   // tile index must fit in 16 bits per expert
 #endif
     return true;
+}
+
+bool ggml_cuda_mmb_supported_mmid(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, const ggml_tensor * dst) {
+    return mmb_supported_mmid_from(ctx, src0, src1, ids, dst, INT64_MAX);
 }
 
 // geometry ggml_cuda_mul_mat_mmb picks for an F32 weight with M > 64: 5 (32x64) up to M = 1024, else 0 (128x128)
@@ -4169,7 +4173,8 @@ bool ggml_cuda_mmb_supported_glu(ggml_backend_cuda_context & ctx, const ggml_ten
     if (glu->src[0]->op != GGML_OP_MUL_MAT_ID || glu->src[1]->op != GGML_OP_MUL_MAT_ID) return false;
     if (glu->src[0]->src[0] != gw || glu->src[1]->src[0] != uw || glu->src[0]->src[1] != src1 || glu->src[1]->src[1] != src1 || glu->src[0]->src[2] != ids || glu->src[1]->src[2] != ids) return false;
     if (ggml_nelements(glu) != ggml_nelements(glu->src[0]) || glu->ne[0] != gw->ne[1]) return false;
-    return ggml_cuda_mmb_supported_mmid(ctx, gw, src1, ids, glu->src[0]) && ggml_cuda_mmb_supported_mmid(ctx, uw, src1, ids, glu->src[1]);
+    const int64_t min_t = ggml_cuda_mmb_g2_packed(gw) && ggml_cuda_mmb_g2_packed(uw) ? 32 : INT64_MAX;
+    return mmb_supported_mmid_from(ctx, gw, src1, ids, glu->src[0], min_t) && mmb_supported_mmid_from(ctx, uw, src1, ids, glu->src[1], min_t);
 }
 
 static constexpr bool mmb_gluk_type(ggml_type type) {
