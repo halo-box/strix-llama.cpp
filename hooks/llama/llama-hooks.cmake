@@ -21,7 +21,7 @@ hooks_rename(llama SOURCE ${CMAKE_SOURCE_DIR}/src/llama-context.cpp SYMBOLS
     llama_memory_clear llama_memory_seq_rm llama_memory_seq_cp llama_memory_seq_keep llama_memory_seq_add llama_memory_seq_div)
 
 # the fork libllama (hooks/llama/lib, namespace ggml_fork) beside the upstream one, and the dispatcher of the
-# public API (llama switch, off): hooks/llama/src/llama-dispatch.cpp
+# public API (llama switch, on): hooks/llama/src/llama-dispatch.cpp
 option(LLAMA_HOOKS_LIB "hooks: build the fork libllama into libllama" ON)
 if (LLAMA_HOOKS_LIB)
     include(${HOOKS_DIR}/llama/lib/symbols.cmake)

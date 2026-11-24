@@ -7,7 +7,7 @@ dispatcher.
 - Each file is the fork file inside `namespace ggml_fork`, closed around every `#include`. The ggml types it names are
   the global ones (forward declarations at the top of each file), the llama types are the fork ones. The headers of
   `lib-include` have C++ linkage, so the fork API is a separate set of symbols.
-- `llama` (`GGML_HOOKS=+llama`, off, read once): `hooks/llama/src/llama-dispatch.cpp` (generated) defines
+- `llama` (on, `GGML_HOOKS=-llama`: upstream, read once): `hooks/llama/src/llama-dispatch.cpp` (generated) defines
   every function of `llama.h`; it calls the fork one, or the upstream one renamed `*__upstream` in its file (or
   `*__hooks` for the functions that the libllama hooks define). The argument types have the same layout in both trees
   except `llama_model_params` and `llama_context_params`, converted by field; the fork-only fields keep their defaults.

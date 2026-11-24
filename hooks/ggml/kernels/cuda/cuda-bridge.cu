@@ -4,11 +4,11 @@
 //
 // cuda_node  (on):  the nodes that upstream refuses and the fork accepts (the fork types, the EXL3 ops, ...) are
 //                        computed by the fork ggml_cuda_compute_forward.
-// cuda_graph (off): the fork computes the graphs instead of upstream: its graph_optimize and graph_compute
+// cuda_graph (on): the fork computes the graphs instead of upstream: its graph_optimize and graph_compute
 //                        (fusions, kernel selection, CUDA graphs), and the device answers (supports_op, offload_op).
 //                        Hook kernels still apply: the fork computes the segments between them, on the same stream.
 //                        The buffers are fork buffers (in-place weight repacking, allocation sizes).
-//                        GGML_HOOKS=+cuda_graph (a switch).
+//                        GGML_HOOKS=-cuda_graph (a switch).
 
 #include "../../cuda/common.cuh"
 
@@ -190,7 +190,7 @@ bool node_compute(::ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 // cuda_graph
 
 bool graph_on() {
-    static const bool on = ggml_hook_switch("cuda_graph", false);
+    static const bool on = ggml_hook_switch("cuda_graph", true);
     return on;
 }
 

@@ -17,7 +17,7 @@ namespace ggml_fork {
 
 // read once: the objects of one side are never passed to the other
 bool llama_hook_fork_on() {
-    static const bool on = ggml_hook_switch("llama", false);
+    static const bool on = ggml_hook_switch("llama", true);
     return on;
 }
 

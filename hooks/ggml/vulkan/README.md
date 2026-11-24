@@ -23,7 +23,7 @@ The bridge is `hooks/ggml/kernels/vulkan/vulkan-bridge.cpp`.
   for the fork backend. The fork `vk_device_struct` has another layout than the upstream one, and the fork code reaches
   the device through the buffers (`buffer->device`): while a fork node is recorded, the upstream buffers it uses point
   at the fork device of the same index, then get their upstream device back.
-- `vk_graph` (switch, off): the upstream devices take the fork device functions (`device_install`; the device
+- `vk_graph` (switch, on): the upstream devices take the fork device functions (`device_install`; the device
   contexts have the same layout), so the buffer types, backends and events are the fork ones and point at the upstream
   device. The fork code only sees fork objects, as in a fork build. Hook kernels do not apply in this mode.
   `test-backend-ops -b Vulkan0` passes in full with the fork test program (49334 cases). The upstream test program

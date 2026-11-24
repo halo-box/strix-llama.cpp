@@ -1,4 +1,4 @@
-// The sched switch (GGML_HOOKS=+sched, off by default): the scheduler and graph allocator of the fork
+// The sched switch (on by default, GGML_HOOKS=-sched: upstream): the scheduler and graph allocator of the fork
 // (sched/backend.cpp, sched/alloc.c), the buffer allocation of a tensor list and the sanitizer
 // calls. The upstream functions are renamed *__upstream (hooks_rename); each public function here calls one side.
 // The switch is read once: the objects of one side are never passed to the other.
@@ -10,7 +10,7 @@
 #include "ggml-hooks.h"
 
 static bool fork_sched_on() {
-    static const bool on = ggml_hook_switch("sched", false);
+    static const bool on = ggml_hook_switch("sched", true);
     return on;
 }
 

@@ -4,7 +4,7 @@
 //
 // vk_node  (on):  the nodes that upstream refuses and the fork accepts (the fork types, ...) run through the fork
 //                      graph_compute, one node at a time, on a fork backend of the same device.
-// vk_graph (off): the upstream devices become the fork devices (GGML_HOOKS=+vk_graph, a switch). The fork
+// vk_graph (on): the upstream devices become the fork devices (GGML_HOOKS=-vk_graph, a switch). The fork
 //                      device functions take the upstream device (the device contexts have the same layout), and the
 //                      buffer types, backends and events they create point at the upstream device. Every buffer, backend
 //                      and event is then a fork one, as in a fork build: the fork code never reads an upstream buffer,
@@ -29,7 +29,7 @@ ggml_backend_dev_t ggml_hook_vk_upstream_dev(size_t device);
 namespace {
 
 bool graph_on() {
-    static const bool on = ggml_hook_switch("vk_graph", false);
+    static const bool on = ggml_hook_switch("vk_graph", true);
     return on;
 }
 

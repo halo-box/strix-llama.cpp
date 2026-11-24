@@ -28,6 +28,30 @@ if (GGML_HIP AND GGML_HOOKS_HIP_DEFAULT_ARCH AND NOT DEFINED CMAKE_HIP_ARCHITECT
 endif()
 include(${HOOKS_DIR}/cmake/hooks-link.cmake)
 
+# the upstream tests that read upstream internals run the upstream code (hooks/tests/upstream-switches.cpp)
+function(hooks_upstream_test target)
+    if (TARGET ${target})
+        set(defs "")
+        foreach (s ${ARGN})
+            list(APPEND defs "\"${s}\"")
+        endforeach()
+        list(JOIN defs "," defs)
+        # one copy per target: the compile definition differs
+        configure_file(${HOOKS_DIR}/tests/upstream-switches.cpp ${CMAKE_BINARY_DIR}/hooks-upstream-switches/${target}.cpp COPYONLY)
+        target_sources(${target} PRIVATE ${CMAKE_BINARY_DIR}/hooks-upstream-switches/${target}.cpp)
+        set_property(SOURCE ${CMAKE_BINARY_DIR}/hooks-upstream-switches/${target}.cpp TARGET_DIRECTORY ${target}
+                     APPEND PROPERTY COMPILE_DEFINITIONS "HOOKS_UPSTREAM_SWITCHES=${defs}")
+        target_include_directories(${target} PRIVATE ${HOOKS_DIR}/ggml/include)
+    endif()
+endfunction()
+
+function(hooks_upstream_tests)
+    hooks_upstream_test(test-alloc          sched)  # the exact buffer sizes of the upstream allocator
+    hooks_upstream_test(test-fp8            llama)  # reads struct llama_model and llama_kv_cache
+    hooks_upstream_test(test-quantize-stats llama)  # reads struct llama_model
+    hooks_upstream_test(test-ggml-hooks     cuda_graph vk_graph sched)  # the hook mechanism around the upstream backends
+endfunction()
+
 # every target of the build, in every directory
 function(hooks_all_targets dir out)
     get_property(targets DIRECTORY ${dir} PROPERTY BUILDSYSTEM_TARGETS)
@@ -91,6 +115,7 @@ function(hooks_setup)
     if (TARGET llama)
         include(${HOOKS_DIR}/llama/llama-hooks.cmake)
     endif()
+    hooks_upstream_tests()
     hooks_warning_options()
     # for hooks/tools/check-wraps.sh
     get_property(wraps GLOBAL PROPERTY HOOKS_WRAPPED_SYMBOLS)

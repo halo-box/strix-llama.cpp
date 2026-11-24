@@ -23985,7 +23985,7 @@ bool ggml_vk_intel_windows_driver_in_range(uint32_t driver_version, uint32_t low
 #endif
 }
 
-GGML_BACKEND_DL_IMPL(ggml_backend_vk_reg)
+// hooks: the module entry point is the upstream one: GGML_BACKEND_DL_IMPL(ggml_backend_vk_reg)
 
 
 // out-of-lined header method definitions

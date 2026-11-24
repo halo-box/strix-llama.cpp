@@ -1,5 +1,5 @@
 # The fork tools (hooks/apps): common, mtmd, server, llama-bench and quantize as namespaced copies (ggml_fork), and the
-# fork example speculative-prefill. The tools switch (GGML_HOOKS=+tools, off) runs the fork tools: their entry
+# fork example speculative-prefill. The tools switch (on, GGML_HOOKS=-tools: upstream) runs the fork tools: their entry
 # functions (llama_server, llama_bench, llama_quantize) are renamed *__upstream in their upstream files and
 # tools-dispatch-*.cpp calls one side. The fork tools call the fork libllama directly.
 # Included by llama-hooks.cmake, with the fork libllama.
@@ -42,6 +42,12 @@ if (TARGET llama-common)
 endif()
 
 # a fork tool: its sources in an object library linked into the upstream impl library, and its entry dispatched
+# mtmd-helper.cpp holds an implementation of stb_image and miniaudio (C symbols), as the upstream file does: local to the
+# file, for the static builds where both are in one program
+set_source_files_properties(${fa}/mtmd/mtmd-helper.cpp PROPERTIES
+    COMPILE_DEFINITIONS "STB_IMAGE_STATIC;MA_API=static;ma_atomic_global_lock=ma_atomic_global_lock_hooks"
+    COMPILE_OPTIONS "-Wno-unused-function;-Wno-unused-variable")
+
 function(hooks_fork_tool name impl upstream_src entry)
     if (NOT TARGET ${impl} OR NOT TARGET hooks-common)
         return()
@@ -104,6 +110,10 @@ if (TARGET hooks-common)
     endif()
     # not built by the fork either (its tests/CMakeLists.txt has no rule for it)
     list(FILTER fork_tests EXCLUDE REGEX "/test-save-load-state\\.cpp$")
+    if (GGML_BACKEND_DL OR NOT GGML_CPU)
+        # they call the CPU backend directly, as in tests/CMakeLists.txt of the fork
+        list(FILTER fork_tests EXCLUDE REGEX "/test-(tq2t|tqk|tqp|exl3-dir)\\.cpp$")
+    endif()
     # several files: below
     list(FILTER fork_tests EXCLUDE REGEX "/test-llama-context\\.cpp$")
     add_custom_target(hooks-tests)

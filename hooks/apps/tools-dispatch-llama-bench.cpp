@@ -1,4 +1,4 @@
-// The entry of llama-bench with the tools switch (GGML_HOOKS=+tools, off, read once): the fork tool
+// The entry of llama-bench with the tools switch (on, GGML_HOOKS=-tools: upstream, read once): the fork tool
 // (hooks/apps/llama-bench, namespace ggml_fork) or the upstream one, renamed llama_bench__upstream.
 
 #include "ggml-hooks.h"
@@ -12,7 +12,7 @@ int llama_bench(int argc, char ** argv);
 }
 
 static bool fork_tools_on() {
-    static const bool on = ggml_hook_switch("tools", false);
+    static const bool on = ggml_hook_switch("tools", true);
     return on;
 }
 

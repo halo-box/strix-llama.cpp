@@ -10750,6 +10750,6 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
     return cuda_backend;
 }
 
-GGML_BACKEND_DL_IMPL(ggml_backend_cuda_reg)
+// hooks: the module entry point is the upstream one: GGML_BACKEND_DL_IMPL(ggml_backend_cuda_reg)
 } // namespace ggml_fork
 #include "entry.inc" // hooks: the entry points of the bridge

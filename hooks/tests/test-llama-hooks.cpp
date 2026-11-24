@@ -197,6 +197,8 @@ LLAMA_HOOK_ACCESS(test_ctx_cparams, llama_context, cparams, llama_cparams);
 int main() {
     // per-model rule, read once at the first lookup
     setenv("GGML_HOOKS", "llama:-test_rule_off", 1);
+    // the model, memory and graph hooks are around the upstream libllama
+    ggml_hook_kernel_set_enabled("llama", false);
 
     common_log_set_verbosity_thold(LOG_LEVEL_ERROR);
     llama_backend_init();

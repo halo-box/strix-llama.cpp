@@ -130,6 +130,13 @@ open(os.path.join(DST, 'ggml-impl.h'), 'w').write(
     git('show', f'{REF}:ggml/src/ggml-impl.h'))
 print('adapted')
 
+# GGML_BACKEND_DL: the upstream file has the module entry point (ggml_backend_init)
+_p = 'hooks/ggml/vulkan/ggml-vulkan.cpp'
+_s = open(_p).read()
+_old = 'GGML_BACKEND_DL_IMPL(ggml_backend_vk_reg)'
+assert _s.count(_old) == 1
+open(_p, 'w').write(_s.replace(_old, '// hooks: the module entry point is the upstream one: ' + _old))
+
 # no trailing whitespace in the generated code: the fork has none (its CI checks it), a hooks: marker can leave one
 import pathlib as _pathlib  # noqa: E402
 _CODE = ('.c', '.cc', '.cpp', '.h', '.hpp', '.cu', '.cuh', '.inc', '.comp', '.glsl', '.cmake', '.py')

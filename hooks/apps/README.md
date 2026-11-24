@@ -7,7 +7,8 @@ The fork `common/`, `tools/mtmd`, `tools/server`, `tools/llama-bench`, `tools/qu
 - Each C++ file is the fork file inside `namespace ggml_fork`, closed around every `#include`; the libllama headers are
   the fork ones (`hooks/llama/lib-include`, `hooks/llama/lib`), so the fork tools call the fork libllama directly.
   The build info (`build-info.h`) and the ggml types stay global.
-- `tools` (`GGML_HOOKS=+tools`, off, read once): the entries of `llama-server`, `llama-bench` and
+- `tools` (on, `GGML_HOOKS=-tools`: upstream, read once; the server inside `llama-cli` is the upstream one, and the
+  other programs keep the upstream arguments): the entries of `llama-server`, `llama-bench` and
   `llama-quantize` are renamed `*__upstream` in their upstream files; `tools-dispatch-*.cpp` runs the fork tool or
   the upstream one. The fork mtmd is built into the fork server.
 - `llama-speculative-prefill` is the fork example, a program of its own.
