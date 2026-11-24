@@ -3,6 +3,8 @@
 
 #include "ggml-hooks.h"
 
+#include <initializer_list>
+
 [[maybe_unused]] static const int upstream_switches = [] {
     for (const char * name : { HOOKS_UPSTREAM_SWITCHES }) {
         ggml_hook_kernel_set_enabled(name, false);
