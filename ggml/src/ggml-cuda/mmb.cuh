@@ -81,6 +81,9 @@ bool ggml_cuda_mmb_g2_glu_gemv_ok(const ggml_tensor * gw, const ggml_tensor * uw
 // G2 down: routed Q4_K down experts [768, M, E] in the G2 layout (also ggml_cuda_mmb_g2_packed). MUL_MAT_IDs on them
 // take ggml_cuda_mul_mat_id_mmb (G2 WMMA) from 32 rows up, else ggml_cuda_mul_mat_id_g2_gemv. wanted: the node's shape
 // and types are ones the MMB path takes at some batch size.
+// dense Q4_K [K in {2048, 4096}, M % 256 == 0] GEMM from 64 rows on the G2 decode, weights in their own layout
+bool ggml_cuda_mmb_g2_dense_supported(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst);
+void ggml_cuda_mul_mat_g2_dense(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
 bool ggml_cuda_mmb_down_g2_wanted(ggml_backend_cuda_context & ctx, const ggml_tensor * mmid);
 void ggml_cuda_mmb_down_g2_prepare(ggml_backend_cuda_context & ctx, const ggml_tensor * w);
 bool ggml_cuda_mmb_down_g2_packed(const ggml_tensor * w);

@@ -3660,12 +3660,14 @@ __device__ __forceinline__ void g2_sb2(const uint4 hg, const uint4 hu, const uin
 // token n. TN = 4 keeps 176 VGPRs: two blocks per CU, so streaming small-expert tiles share CUs with WMMA-bound ones.
 // GLU = false (routed down, Wu == Wg): wave w owns the two 16-row tiles 2 w, 2 w + 1 of a 256-column block in place of
 // the gate/up pair; activations enter as x * 2^-4 and the f32 sums leave * 2^4, staged through LDS per token tile.
-// Q6 (down only): the G6 layout of a Q6_K down, one f16 (scale, bias) pair per 16-K piece.
-template <int K, int TN, bool GLU, bool Q6 = false, int NW = 8>
+// Q6 (down only): the G6 layout of a Q6_K down, one f16 scale per 16-K piece.
+// PL (down mode): a dense Q4_K weight [K, M] in its own layout (the G2 byte swap done in registers), activation rows
+// 0 .. T - 1 in place of routed rows, block b = (token tile b / (M / BM), column block b % (M / BM)), no descriptors.
+template <int K, int TN, bool GLU, bool Q6 = false, bool PL = false, int NW = 8>
 __global__ void __launch_bounds__(NW * 32) __attribute__((amdgpu_waves_per_eu(TN <= 4 ? 8 : 1)))
 mmb_g2_kernel(const uint8_t * __restrict__ Wg, const uint8_t * __restrict__ Wu, const size_t eb, const uint16_t * __restrict__ X,
         const int32_t * __restrict__ ids_src, const int32_t * __restrict__ ids_dst, const uint4 * __restrict__ descs,
-        uint16_t * __restrict__ Dh, float * __restrict__ D, const int M) {
+        uint16_t * __restrict__ Dh, float * __restrict__ D, const int M, const int T) {
 #if defined(__HIP_DEVICE_COMPILE__) && !defined(RDNA3)
     NO_DEVICE_CODE;
 #else
@@ -3673,22 +3675,28 @@ mmb_g2_kernel(const uint8_t * __restrict__ Wg, const uint8_t * __restrict__ Wu, 
     constexpr int NT = NW * 32, BM = NW * 16 * (GLU ? 1 : 2);   // threads, output columns per block
     constexpr int BPI = BN * KC / 8 / NT;
     constexpr int SST = BM + 8, FST = BM + 4;
-    constexpr int BSZ = BN * LSB;
+    constexpr int BSZ = BN * LSB, BSZA = GLU ? (BSZ > BN * SST / 2 ? BSZ : BN * SST / 2) : (BSZ > 16 * FST ? BSZ : 16 * FST);   // + epilogue staging
     static_assert(K % 256 == 0 && BPI >= 1 && BN * KC % (8 * NT) == 0, "");
-    static_assert(!GLU || 2 * BSZ >= BN * SST, "");
-    static_assert(GLU || 2 * BSZ * 2 >= 16 * FST * 4, "");
-    static_assert(!(GLU && Q6), "");
+    static_assert(!(GLU && Q6) && !(PL && (GLU || Q6)), "");
     constexpr int TILE = Q6 ? G6_TILE : G2_TILE;
-    __shared__ __align__(16) _Float16 Bs[2][BSZ];
-    const uint4 dsc = descs[blockIdx.x];
-    const int cnt = (int) dsc.w;
-    if (cnt == 0) return;
-    const int e = (int) dsc.x, cb = (int) dsc.y, r0 = (int) dsc.z;
+    constexpr int SB_STEP = PL ? 144 : TILE, G_STEP = PL ? 32 : 512;   // bytes per superblock / 64-K group of a lane's row
+    __shared__ __align__(16) _Float16 Bs[2][BSZA];
+    int cnt, e, cb, r0;
+    if constexpr (PL) {
+        const int n_cb = M / BM, tt = (int) blockIdx.x / n_cb;
+        e = 0; cb = (int) blockIdx.x % n_cb; r0 = tt * BN; cnt = min(BN, T - r0);
+    } else {
+        const uint4 dsc = descs[blockIdx.x];
+        cnt = (int) dsc.w;
+        e = (int) dsc.x; cb = (int) dsc.y; r0 = (int) dsc.z;
+    }
+    if (cnt <= 0) return;
     const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5, r = lane & 15, hf = lane >> 4;
     const int pc = (r & 1) ^ hf;   // the piece this lane decodes
-    const size_t hoff = (size_t) e * eb + (size_t) (cb * NW + wave) * (GLU ? 1 : 2) * NSB * TILE + r * 16;
-    const size_t uoff = GLU ? 0 : (size_t) NSB * TILE;
-    const size_t coff = hoff + (Q6 ? G6_NIB : 256) + pc * 256;
+    const size_t hoff = PL ? ((size_t) (cb * NW + wave) * 32 + r) * NSB * 144
+                           : (size_t) e * eb + (size_t) (cb * NW + wave) * (GLU ? 1 : 2) * NSB * TILE + r * 16;
+    const size_t uoff = GLU ? 0 : PL ? (size_t) 16 * NSB * 144 : (size_t) NSB * TILE;
+    const size_t coff = hoff + (PL ? 16 : Q6 ? G6_NIB : 256) + pc * (PL ? 16 : 256);
     const uint8_t * Hg = Wg + hoff, * Hu = Wu + hoff + uoff;
     const uint8_t * Cg = Wg + coff, * Cu = Wu + coff + uoff;
     const size_t qoff = hoff - r * 16 + G6_HB + pc * 128 + r * 8, doff = hoff - r * 16 + G6_D + r * 2;   // Q6
@@ -3698,7 +3706,7 @@ mmb_g2_kernel(const uint8_t * __restrict__ Wg, const uint8_t * __restrict__ Wu, 
 #pragma unroll
     for (int i = 0; i < BPI; ++i) {
         const int c = tid + i * NT, tok = c / (KC / 8), kp = c % (KC / 8);
-        const int sr = tok < cnt ? ids_src[r0 + tok] : -1;
+        const int sr = tok < cnt ? (PL ? r0 + tok : ids_src[r0 + tok]) : -1;
         bsrc[i] = sr >= 0 ? sr * K + kp * 8 : -1;
         bdst[i] = tok * LSB + kp * 8;
     }
@@ -3714,8 +3722,13 @@ mmb_g2_kernel(const uint8_t * __restrict__ Wg, const uint8_t * __restrict__ Wu, 
     uint4 ac[1][2];   // next group's codes [gate, up]
     uint2 aq[2];      // Q6: their high bits
     auto loadA = [&](uint4 (&a)[2], int gi) {
-        const size_t off = (size_t) (gi >> 2) * TILE + (gi & 3) * 512;   // 64-K group gi
+        const size_t off = (size_t) (gi >> 2) * SB_STEP + (gi & 3) * G_STEP;   // 64-K group gi
         a[0] = *(const uint4 *) (Cg + off); a[1] = *(const uint4 *) (Cu + off);
+        if constexpr (PL) {
+#pragma unroll
+            for (int t = 0; t < 2; ++t) a[t] = make_uint4(__builtin_amdgcn_perm(a[t].x, a[t].x, 0x03010200u), __builtin_amdgcn_perm(a[t].y, a[t].y, 0x03010200u),
+                                                          __builtin_amdgcn_perm(a[t].z, a[t].z, 0x03010200u), __builtin_amdgcn_perm(a[t].w, a[t].w, 0x03010200u));
+        }
         if constexpr (Q6) {
             const size_t qo = (size_t) (gi >> 2) * TILE + (gi & 3) * 256;
             aq[0] = *(const uint2 *) (Qg + qo); aq[1] = *(const uint2 *) (Qu + qo);
@@ -3741,7 +3754,7 @@ mmb_g2_kernel(const uint8_t * __restrict__ Wg, const uint8_t * __restrict__ Wu, 
         const int gg = gi & 3;
         if (gg == 0) {
             hc0 = hn0; hc1 = hn1;
-            if (gi + 4 < NG) { hn0 = *(const uint4 *) (Hg + (size_t) ((gi >> 2) + 1) * TILE); hn1 = *(const uint4 *) (Hu + (size_t) ((gi >> 2) + 1) * TILE); }
+            if (gi + 4 < NG) { hn0 = *(const uint4 *) (Hg + (size_t) ((gi >> 2) + 1) * SB_STEP); hn1 = *(const uint4 *) (Hu + (size_t) ((gi >> 2) + 1) * SB_STEP); }
             if constexpr (Q6) {
                 dc0 = dn0; dc1 = dn1;
                 if (gi + 4 < NG) { dn0 = *(const uint16_t *) (Wg + doff + (size_t) ((gi >> 2) + 1) * TILE); dn1 = *(const uint16_t *) (Wu + doff + uoff + (size_t) ((gi >> 2) + 1) * TILE); }
@@ -3801,7 +3814,7 @@ mmb_g2_kernel(const uint8_t * __restrict__ Wg, const uint8_t * __restrict__ Wu, 
             for (int idx = tid; idx < 16 * (BM / 4); idx += NT) {
                 const int tok = j * 16 + idx / (BM / 4), part = idx % (BM / 4);
                 if (tok >= cnt) break;
-                const int dr = ids_dst[r0 + tok];
+                const int dr = PL ? r0 + tok : ids_dst[r0 + tok];
                 if (dr < 0) continue;
                 const float4 v = *(const float4 *) (stg + (idx / (BM / 4)) * FST + part * 4);
                 const size_t o = (size_t) dr * M + cb * BM + part * 4;
@@ -4277,6 +4290,35 @@ void ggml_cuda_mmb_glu_r2_prepare(ggml_backend_cuda_context & ctx, const ggml_te
     mmb_g2_repack(ctx, {gw, uw});
 }
 
+// dense Q4_K GEMM on the G2 decode, weights in their own layout (no repack): [K, M] x [K, T], K in {2048, 4096}
+bool ggml_cuda_mmb_g2_dense_supported(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
+    if (!mmb_enabled(ctx) || src0->type != GGML_TYPE_Q4_K || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) return false;
+    if (src0->ne[0] != 2048 && src0->ne[0] != 4096) return false;
+    if (src0->ne[1] % G2_DOWN_BM != 0 || src0->ne[2] != 1 || src0->ne[3] != 1 || !ggml_is_contiguous(src0)) return false;
+    if (!ggml_is_contiguous(src1) || !ggml_is_contiguous(dst) || src1->ne[0] != src0->ne[0] || dst->ne[0] != src0->ne[1]) return false;
+    if (ggml_cuda_mmb_r2_packed(src0) || ggml_cuda_mmb_dq_packed(src0)) return false;
+    const int64_t T = src1->ne[1] * src1->ne[2] * src1->ne[3];
+    return T >= 64 && T <= INT32_MAX / 4096 && ggml_nrows(dst) == T && (size_t) src0->nb[1] == (size_t) (src0->ne[0] / 256) * 144;
+}
+
+void ggml_cuda_mul_mat_g2_dense(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    cudaStream_t stream = ctx.stream();
+    const int K = (int) src0->ne[0], M = (int) src0->ne[1];
+    const int T = (int) (src1->ne[1] * src1->ne[2] * src1->ne[3]);
+    const uint16_t * xhp = mmb_bf16_activation(ctx, src1, (size_t) T * K, stream);
+    uint16_t * Dh = ggml_cuda_mmb_is_bf16_only(ctx, dst) ? (uint16_t *) dst->data : nullptr;
+    float * D = Dh ? nullptr : (float *) dst->data;
+    const uint8_t * W = (const uint8_t *) src0->data;
+    auto launch = [&](auto kt, auto tn) {
+        constexpr int KK = decltype(kt)::value, TN = decltype(tn)::value;
+        const int nb = (M / G2_DOWN_BM) * ((T + 16 * TN - 1) / (16 * TN));
+        mmb_g2_kernel<KK, TN, false, false, true><<<nb, 256, 0, stream>>>(W, W, 0, xhp, nullptr, nullptr, nullptr, Dh, D, M, T);
+    };
+    if (K == 2048) launch(std::integral_constant<int, 2048>{}, std::integral_constant<int, 4>{});
+    else           launch(std::integral_constant<int, 4096>{}, std::integral_constant<int, 4>{});
+    CUDA_CHECK(cudaGetLastError());
+}
+
 bool ggml_cuda_mmb_down_g2_wanted(ggml_backend_cuda_context & ctx, const ggml_tensor * t) {
     return t && t->op == GGML_OP_MUL_MAT_ID && mmb_g2_down_eligible(t->src[0]) && t->src[2] &&
            mmb_supported_mmid_from(ctx, t->src[0], t->src[1], t->src[2], t, 1);
@@ -4318,9 +4360,9 @@ static bool mmb_down_g2_launch(ggml_backend_cuda_context & ctx, const ggml_tenso
     }
     const uint8_t * W = (const uint8_t *) src0->data;
     if (src0->type == GGML_TYPE_Q6_K) {
-        mmb_g2_kernel<G2_DOWN_K, TN, false, true><<<n_max, 256, 0, stream>>>(W, W, (size_t) src0->nb[2], xhp, ids_src1, ids_dst, desc.get(), Dh, D, M);
+        mmb_g2_kernel<G2_DOWN_K, TN, false, true><<<n_max, 256, 0, stream>>>(W, W, (size_t) src0->nb[2], xhp, ids_src1, ids_dst, desc.get(), Dh, D, M, 0);
     } else {
-        mmb_g2_kernel<G2_DOWN_K, TN, false><<<n_max, 256, 0, stream>>>(W, W, (size_t) src0->nb[2], xhp, ids_src1, ids_dst, desc.get(), Dh, D, M);
+        mmb_g2_kernel<G2_DOWN_K, TN, false><<<n_max, 256, 0, stream>>>(W, W, (size_t) src0->nb[2], xhp, ids_src1, ids_dst, desc.get(), Dh, D, M, 0);
     }
     CUDA_CHECK(cudaGetLastError());
     return true;
@@ -4340,7 +4382,7 @@ static void mmb_glu_r2_launch(ggml_backend_cuda_context & ctx, const ggml_tensor
     const size_t eb = gw->nb[2];
     auto launch = [&](auto kt) {
         constexpr int KK = decltype(kt)::value;
-        mmb_g2_kernel<KK, TN, true><<<n_max, 256, 0, stream>>>(Wg, Wu, eb, xhp, ids_src1, ids_dst, desc.get(), Dh, D, M);
+        mmb_g2_kernel<KK, TN, true><<<n_max, 256, 0, stream>>>(Wg, Wu, eb, xhp, ids_src1, ids_dst, desc.get(), Dh, D, M, 0);
     };
     if (K == 2560) launch(std::integral_constant<int, 2560>{});
     else if (K == 2048) launch(std::integral_constant<int, 2048>{});
