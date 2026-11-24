@@ -4472,7 +4472,7 @@ void ggml_cuda_mul_mat_id_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor
     CUDA_CHECK(cudaGetLastError());
 }
 
-bool ggml_cuda_mmb_supported_glu(ggml_backend_cuda_context & ctx, const ggml_tensor * gw, const ggml_tensor * uw, const ggml_tensor * src1, const ggml_tensor * ids, const ggml_tensor * glu) {
+static bool mmb_glu_from(ggml_backend_cuda_context & ctx, const ggml_tensor * gw, const ggml_tensor * uw, const ggml_tensor * src1, const ggml_tensor * ids, const ggml_tensor * glu, const bool any_t) {
     if (!mmb_enabled(ctx) || !gw || !uw || !src1 || !ids || !glu) return false;
     if (!mmb_quant_type_routed(gw->type) || uw->type != gw->type) return false;
     if (!ggml_are_same_shape(gw, uw) || gw->nb[1] != uw->nb[1] || gw->nb[2] != uw->nb[2]) return false;
@@ -4481,8 +4481,16 @@ bool ggml_cuda_mmb_supported_glu(ggml_backend_cuda_context & ctx, const ggml_ten
     if (glu->src[0]->op != GGML_OP_MUL_MAT_ID || glu->src[1]->op != GGML_OP_MUL_MAT_ID) return false;
     if (glu->src[0]->src[0] != gw || glu->src[1]->src[0] != uw || glu->src[0]->src[1] != src1 || glu->src[1]->src[1] != src1 || glu->src[0]->src[2] != ids || glu->src[1]->src[2] != ids) return false;
     if (ggml_nelements(glu) != ggml_nelements(glu->src[0]) || glu->ne[0] != gw->ne[1]) return false;
-    const int64_t min_t = ggml_cuda_mmb_g2_packed(gw) && ggml_cuda_mmb_g2_packed(uw) ? 32 : INT64_MAX;
+    const int64_t min_t = any_t ? 1 : ggml_cuda_mmb_g2_packed(gw) && ggml_cuda_mmb_g2_packed(uw) ? 32 : INT64_MAX;
     return mmb_supported_mmid_from(ctx, gw, src1, ids, glu->src[0], min_t) && mmb_supported_mmid_from(ctx, uw, src1, ids, glu->src[1], min_t);
+}
+
+bool ggml_cuda_mmb_supported_glu(ggml_backend_cuda_context & ctx, const ggml_tensor * gw, const ggml_tensor * uw, const ggml_tensor * src1, const ggml_tensor * ids, const ggml_tensor * glu) {
+    return mmb_glu_from(ctx, gw, uw, src1, ids, glu, false);
+}
+
+bool ggml_cuda_mmb_glu_r2_wanted(ggml_backend_cuda_context & ctx, const ggml_tensor * gw, const ggml_tensor * uw, const ggml_tensor * src1, const ggml_tensor * ids, const ggml_tensor * glu) {
+    return mmb_glu_from(ctx, gw, uw, src1, ids, glu, true);
 }
 
 static constexpr bool mmb_gluk_type(ggml_type type) {

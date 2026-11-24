@@ -9234,11 +9234,14 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
         for (int i = 0; i < cgraph->n_nodes; ++i) {
             const ggml_tensor * glu = cgraph->nodes[i];
             if (glu->op != GGML_OP_GLU || !glu->src[0] || !glu->src[1] || glu->src[0]->op != GGML_OP_MUL_MAT_ID) continue;
-            if (!ggml_cuda_mmb_supported_glu(*cuda_ctx, glu->src[0]->src[0], glu->src[1]->src[0], glu->src[0]->src[1], glu->src[0]->src[2], glu)) continue;
+            // MMB_GLU_R2: in-place G2 repack of the Q4_K pair, already in the first graph that has it (the warmup), so the
+            // first prefill does not pay for it
             if (glu->src[0]->src[0]->buffer && ggml_backend_buffer_is_cuda(glu->src[0]->src[0]->buffer) &&
-                    glu->src[1]->src[0]->buffer && ggml_backend_buffer_is_cuda(glu->src[1]->src[0]->buffer)) {
-                ggml_cuda_mmb_glu_r2_prepare(*cuda_ctx, glu->src[0]->src[0], glu->src[1]->src[0]);   // MMB_GLU_R2: in-place G2 repack of the Q4_K pair
+                    glu->src[1]->src[0]->buffer && ggml_backend_buffer_is_cuda(glu->src[1]->src[0]->buffer) &&
+                    ggml_cuda_mmb_glu_r2_wanted(*cuda_ctx, glu->src[0]->src[0], glu->src[1]->src[0], glu->src[0]->src[1], glu->src[0]->src[2], glu)) {
+                ggml_cuda_mmb_glu_r2_prepare(*cuda_ctx, glu->src[0]->src[0], glu->src[1]->src[0]);
             }
+            if (!ggml_cuda_mmb_supported_glu(*cuda_ctx, glu->src[0]->src[0], glu->src[1]->src[0], glu->src[0]->src[1], glu->src[0]->src[2], glu)) continue;
             for (const auto * input : {glu->src[0]->src[0], glu->src[1]->src[0], glu->src[0]->src[1], glu->src[0]->src[2], glu->src[0], glu->src[1]}) {
                 auto * root = const_cast<ggml_tensor *>(input->view_src ? input->view_src : input);
                 params->add_alloc_dep(params->user_data, root, const_cast<ggml_tensor *>(glu));
