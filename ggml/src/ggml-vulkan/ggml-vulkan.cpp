@@ -13732,6 +13732,14 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
     GGML_UNUSED(src2);
 }
 
+// get_rows.comp's flat mode (param3 = 1) for rows shorter than its 512-wide workgroup: one invocation per element of the
+// gathered rows instead of one workgroup per row. A 24-head relative-position bias gathered per key and query (Inkling) ran
+// 488 of 512 lanes idle. Same copies, same values.
+static bool ggml_vk_get_rows_flat(const ggml_tensor * src0, const ggml_tensor * src1) {
+    const bool plain = src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16 || src0->type == GGML_TYPE_I32;
+    return plain && src0->ne[0] < 512 && (uint64_t)src0->ne[0] * (uint64_t)src1->ne[0] <= UINT32_MAX;
+}
+
 template<typename PC>
 static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * src2, const ggml_tensor * src3, ggml_tensor * dst, ggml_op op, PC&& pc, vk_pipeline pipeline_override = nullptr) {
     VK_LOG_DEBUG("ggml_vk_op_f32((" << src0 << ", name=" << src0->name << ", type=" << src0->type << ", ne0=" << src0->ne[0] << ", ne1=" << src0->ne[1] << ", ne2=" << src0->ne[2] << ", ne3=" << src0->ne[3] << ", nb0=" << src0->nb[0] << ", nb1=" << src0->nb[1] << ", nb2=" << src0->nb[2] << ", nb3=" << src0->nb[3];
@@ -13864,8 +13872,14 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
 
         } break;
     case GGML_OP_GET_ROWS:
-        elements = { (uint32_t)ne00, (uint32_t)ne10, (uint32_t)(ne11 * ne12) };
-        elements[1] = std::min(elements[1], ctx->device->properties.limits.maxComputeWorkGroupCount[1]);
+        if (ggml_vk_get_rows_flat(src0, src1)) {
+            // get_rows.comp flat mode: x runs over ne00 * ne10 (grid-stride past the cap), one row group per z
+            const uint64_t cap = 512ull * std::min<uint32_t>(ctx->device->properties.limits.maxComputeWorkGroupCount[0], 65535u);
+            elements = { (uint32_t)std::min<uint64_t>((uint64_t)ne00 * ne10, cap), 1, (uint32_t)(ne11 * ne12) };
+        } else {
+            elements = { (uint32_t)ne00, (uint32_t)ne10, (uint32_t)(ne11 * ne12) };
+            elements[1] = std::min(elements[1], ctx->device->properties.limits.maxComputeWorkGroupCount[1]);
+        }
         elements[2] = std::min(elements[2], ctx->device->properties.limits.maxComputeWorkGroupCount[2]);
         break;
     case GGML_OP_GET_ROWS_BACK:
@@ -14185,7 +14199,7 @@ void ggml_vk_get_rows(ggml_backend_vk_context * ctx, vk_context& subctx, const g
         (uint32_t)src1->ne[0], (uint32_t)src1->ne[1], (uint32_t)src1->ne[2],(uint32_t)src1->ne[3], (uint32_t)src1->nb[0] / src1_type_size, (uint32_t)src1->nb[1] / src1_type_size, (uint32_t)src1->nb[2] / src1_type_size, (uint32_t)src1->nb[3] / src1_type_size,
         (uint32_t) dst->ne[0], (uint32_t) dst->ne[1], (uint32_t) dst->ne[2],(uint32_t) dst->ne[3], (uint32_t) dst->nb[0] /  dst_type_size, (uint32_t) dst->nb[1] /  dst_type_size, (uint32_t) dst->nb[2] /  dst_type_size, (uint32_t) dst->nb[3] /  dst_type_size,
         0,
-        0.0f, 0.0f, 0,
+        0.0f, 0.0f, ggml_vk_get_rows_flat(src0, src1) ? 1 : 0,
     });
 }
 
