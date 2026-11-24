@@ -2603,6 +2603,10 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
         return;
     }
+    if (ggml_cuda_mmb_g2_dense_supported(ctx, src0, src1, dst)) {
+        ggml_cuda_mul_mat_g2_dense(ctx, src0, src1, dst);
+        return;
+    }
 
     const int cc        = ggml_cuda_info().devices[ctx.device].cc;
     const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
@@ -5753,6 +5757,7 @@ static bool ggml_cuda_mmb_claims(ggml_backend_cuda_context & ctx, const ggml_ten
         return t->src[2] && ggml_cuda_mmb_supported_mmid(ctx, t->src[0], t->src[1], t->src[2], t);
     }
     if (t->op == GGML_OP_MUL_MAT && ggml_cuda_mmb_dq_packed(t->src[0])) return true;   // MMB_DENSE_R2 layout
+    if (t->op == GGML_OP_MUL_MAT && ggml_cuda_mmb_g2_dense_supported(ctx, t->src[0], t->src[1], t)) return true;
     return t->op == GGML_OP_MUL_MAT && ggml_cuda_mmb_supported_mm(ctx, t->src[0], t->src[1], t);
 }
 

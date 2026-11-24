@@ -17841,6 +17841,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_moe_glu_f16(GGML_TYPE_Q4_K, GGML_TYPE_F16, 2560, 640, 512, 10, 2048, false, true));
     test_cases.emplace_back(new test_moe_glu_f16(GGML_TYPE_Q5_K, GGML_TYPE_F16, 2560, 640, 512, 10, 2048, false, true));
     test_cases.emplace_back(new test_moe_glu_f16(GGML_TYPE_IQ3_S, GGML_TYPE_F32, 2560, 640, 512, 10, 2048, false, true));
+    // dense Q4_K GEMMs of the Qwen3-30B-A3B attention (Q/K/V 2048 -> 4096 / 512, output 4096 -> 2048) from 64 rows
+    for (int n : {64, 100, 333, 512}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 4096, n, 2048, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 512, n, 2048, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 2048, n, 4096, {1, 1}, {1, 1}));
+    }
     // Qwen3-30B-A3B expert FFN (K = 768 down), decode to a full ubatch
     for (ggml_type td : {GGML_TYPE_Q4_K, GGML_TYPE_Q6_K}) {
         for (int64_t nt : {1, 8, 32, 100, 512}) {
