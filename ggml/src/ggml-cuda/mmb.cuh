@@ -67,6 +67,8 @@ bool ggml_cuda_mmb_r2_packed(const ggml_tensor * w);
 void ggml_cuda_mmb_r2_forget(const void * base, size_t size);
 // the in-place layout ("dense R2", "down R2", "GLU R2") of a repacked weight overlapping the range, nullptr if none
 const char * ggml_cuda_mmb_r2_layout(const void * base, size_t size);
+// a whole-tensor read of a G2 / G6 tensor in its ggml layout (false: not such a tensor or not the whole of it)
+bool ggml_cuda_mmb_g2_read(const ggml_tensor * t, void * data, size_t offset, size_t size);
 void ggml_cuda_mul_mat_id_r2_gemv(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst);
 // GLU R2: routed Q4_K gate/up pairs repacked in place (G2 layout). ggml_cuda_mmb_r2_packed() is true for them too;
 // their consumers are ggml_cuda_mul_mat_id_mmb_glu (G2 WMMA), the fused G2 GLU GEMV and ggml_cuda_mul_mat_id_g2_gemv.
@@ -74,6 +76,12 @@ bool ggml_cuda_mmb_g2_packed(const ggml_tensor * w);
 void ggml_cuda_mmb_glu_r2_prepare(ggml_backend_cuda_context & ctx, const ggml_tensor * gw, const ggml_tensor * uw);
 void ggml_cuda_mul_mat_id_g2_gemv(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst);
 bool ggml_cuda_mmb_g2_glu_gemv_ok(const ggml_tensor * gw, const ggml_tensor * uw, const ggml_tensor * src1, const ggml_tensor * ids, const ggml_tensor * glu);
+// G2 down: routed Q4_K down experts [768, M, E] in the G2 layout (also ggml_cuda_mmb_g2_packed). MUL_MAT_IDs on them
+// take ggml_cuda_mul_mat_id_mmb (G2 WMMA) from 32 rows up, else ggml_cuda_mul_mat_id_g2_gemv. wanted: the node's shape
+// and types are ones the MMB path takes at some batch size.
+bool ggml_cuda_mmb_down_g2_wanted(ggml_backend_cuda_context & ctx, const ggml_tensor * mmid);
+void ggml_cuda_mmb_down_g2_prepare(ggml_backend_cuda_context & ctx, const ggml_tensor * w);
+bool ggml_cuda_mmb_down_g2_packed(const ggml_tensor * w);
 void ggml_cuda_mul_mat_id_g2_gemv_glu(ggml_backend_cuda_context & ctx, const ggml_tensor * gw, const ggml_tensor * uw, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * glu);
 // dense R2: dense Q8_0 weights repacked in place to the k7/k8 tile layout; every MUL_MAT on a packed tensor must go
 // through ggml_cuda_mul_mat_mmb (MMB batches), ggml_cuda_mul_mat_dq (any other T > 1) or the RDNA3.5 fused-quantize
