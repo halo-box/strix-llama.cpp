@@ -1253,7 +1253,22 @@ static __device__ __forceinline__ int vrow(const int d) {
     return (d & ~7) | ((d & 7) ^ ((d >> 3) & 7));
 }
 
-template <int G>
+typedef uint32_t u32a2 __attribute__((aligned(2)));
+// 8 q8_0 values (qs bytes lo, hi) of a block with scale bits d -> 8 f16 RN(d*q), the f16 values of the q8_0 -> f16 conversion
+static __device__ __forceinline__ u4 deq8(const uint2 q, const uint16_t d) {
+    const float df = (float) __builtin_bit_cast(_Float16, d);
+    u4 r;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const uint32_t w = i < 2 ? q.x : q.y, sh = 16 * (i & 1);
+        r[i] = __builtin_bit_cast(unsigned, h2{(_Float16) (df * (float) (int8_t) (w >> sh)), (_Float16) (df * (float) (int8_t) (w >> (sh + 8)))});
+    }
+    return r;
+}
+
+// Q8: K/V are q8_0 (34-byte blocks of 32 values, rows 2-byte aligned), sk / sv strides in bytes; dequantized to f16 when
+// staged in LDS.
+template <int G, bool Q8 = false>
 __global__ void __launch_bounds__(NTH, 1) fa_kernel(const float * __restrict__ Q, const _Float16 * __restrict__ K,
         const _Float16 * __restrict__ V, const _Float16 * __restrict__ M, const int * __restrict__ kv_max, float * __restrict__ O,
         float * __restrict__ Op, float2 * __restrict__ ML, const int ns,
@@ -1300,6 +1315,8 @@ __global__ void __launch_bounds__(NTH, 1) fa_kernel(const float * __restrict__ Q
 
     const _Float16 * Kh = K + (int64_t) kvh * sk2;
     const _Float16 * Vh = V + (int64_t) kvh * sv2;
+    [[maybe_unused]] const uint8_t * K8 = (const uint8_t *) K + (int64_t) kvh * sk2;
+    [[maybe_unused]] const uint8_t * V8 = (const uint8_t *) V + (int64_t) kvh * sv2;
 
     int k_key[2], k_ch[2];
 #pragma unroll
@@ -1316,19 +1333,32 @@ __global__ void __launch_bounds__(NTH, 1) fa_kernel(const float * __restrict__ Q
     for (int r = 0; r < MW; ++r) { const int it = tid + r * NTH; m_tok[r] = it / (NK / 2); m_key[r] = (it % (NK / 2)) * 2; }
 
     u4 rk[2], rv[2];
+    [[maybe_unused]] uint2 qk[2], qv[2];
+    [[maybe_unused]] uint16_t dk[2], dv[2];
     unsigned rm[MW];
     auto gload = [&](const int t) {
         const int key0 = t * NK;
 #pragma unroll
         for (int r = 0; r < 2; ++r) {
-            rk[r] = *(const u4 *) (Kh + (int64_t) (key0 + k_key[r]) * sk1 + k_ch[r] * 8);
-            rv[r] = *(const u4 *) (Vh + (int64_t) (key0 + v_key[r]) * sv1 + v_d0);
+            if constexpr (Q8) {
+                const uint8_t * kp = K8 + (int64_t) (key0 + k_key[r]) * sk1 + (k_ch[r] >> 2) * 34;
+                const uint8_t * vp = V8 + (int64_t) (key0 + v_key[r]) * sv1 + (v_d0 >> 5) * 34;
+                dk[r] = *(const uint16_t *) kp; qk[r] = make_uint2(*(const u32a2 *) (kp + 2 + (k_ch[r] & 3) * 8), *(const u32a2 *) (kp + 6 + (k_ch[r] & 3) * 8));
+                dv[r] = *(const uint16_t *) vp; qv[r] = make_uint2(*(const u32a2 *) (vp + 2 + (v_d0 & 31)), *(const u32a2 *) (vp + 6 + (v_d0 & 31)));
+            } else {
+                rk[r] = *(const u4 *) (Kh + (int64_t) (key0 + k_key[r]) * sk1 + k_ch[r] * 8);
+                rv[r] = *(const u4 *) (Vh + (int64_t) (key0 + v_key[r]) * sv1 + v_d0);
+            }
         }
 #pragma unroll
         for (int r = 0; r < MW; ++r)
             rm[r] = *(const unsigned *) (M + (int64_t) min(t0 + m_tok[r], m_rows - 1) * sm1 + key0 + m_key[r]);
     };
     auto sstore = [&](smem<BT> & b) {
+        if constexpr (Q8) {
+#pragma unroll
+            for (int r = 0; r < 2; ++r) { rk[r] = deq8(qk[r], dk[r]); rv[r] = deq8(qv[r], dv[r]); }
+        }
 #pragma unroll
         for (int r = 0; r < 2; ++r) {
             *(u4 *) &b.k[k_key[r]][k_ch[r] * 8] = rk[r];
@@ -1467,7 +1497,9 @@ static int ggml_cuda_fakv_gqa(const ggml_backend_cuda_context & ctx, const ggml_
     const ggml_tensor * Q = dst->src[0], * K = dst->src[1], * V = dst->src[2], * mask = dst->src[3];
     if (!GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[ctx.device].cc)) return 0;
     if (!K || !V || !mask || dst->src[4] || dst->src[5] || dst->src[6] || dst->src[7]) return 0;
-    if (Q->type != GGML_TYPE_F32 || K->type != GGML_TYPE_F16 || V->type != GGML_TYPE_F16 || mask->type != GGML_TYPE_F16 || dst->type != GGML_TYPE_F32) return 0;
+    const bool q8 = K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q8_0;
+    if (Q->type != GGML_TYPE_F32 || mask->type != GGML_TYPE_F16 || dst->type != GGML_TYPE_F32) return 0;
+    if (!q8 && (K->type != GGML_TYPE_F16 || V->type != GGML_TYPE_F16)) return 0;
     if (Q->ne[0] != fakv::D || K->ne[0] != fakv::D || V->ne[0] != fakv::D || K->ne[2] != V->ne[2] || K->ne[1] != V->ne[1]) return 0;
     if (K->ne[2] == 0 || Q->ne[2] % K->ne[2] != 0) return 0;
     const int G = (int) (Q->ne[2] / K->ne[2]);
@@ -1480,10 +1512,11 @@ static int ggml_cuda_fakv_gqa(const ggml_backend_cuda_context & ctx, const ggml_
     memcpy(&max_bias, (const float *) dst->op_params + 1, sizeof(float));
     memcpy(&softcap, (const float *) dst->op_params + 2, sizeof(float));
     if (max_bias != 0.0f || softcap != 0.0f) return 0;
-    if (Q->nb[0] != 4 || K->nb[0] != 2 || V->nb[0] != 2 || mask->nb[0] != 2 || !ggml_is_contiguous(dst)) return 0;
+    const size_t ka = q8 ? 2 : 16;   // K / V row alignment
+    if (Q->nb[0] != 4 || K->nb[0] != ggml_type_size(K->type) || V->nb[0] != ggml_type_size(V->type) || mask->nb[0] != 2 || !ggml_is_contiguous(dst)) return 0;
     if (dst->ne[0] != fakv::D || dst->ne[1] != Q->ne[2] || dst->ne[2] != T) return 0;
-    if (Q->nb[1] % 16 || Q->nb[2] % 16 || K->nb[1] % 16 || K->nb[2] % 16 || V->nb[1] % 16 || V->nb[2] % 16 || mask->nb[1] % 4) return 0;
-    if (((uintptr_t) Q->data) % 16 || ((uintptr_t) K->data) % 16 || ((uintptr_t) V->data) % 16 || ((uintptr_t) mask->data) % 4) return 0;
+    if (Q->nb[1] % 16 || Q->nb[2] % 16 || K->nb[1] % ka || K->nb[2] % ka || V->nb[1] % ka || V->nb[2] % ka || mask->nb[1] % 4) return 0;
+    if (((uintptr_t) Q->data) % 16 || ((uintptr_t) K->data) % ka || ((uintptr_t) V->data) % ka || ((uintptr_t) mask->data) % 4) return 0;
     return G;
 #else
     GGML_UNUSED(ctx); GGML_UNUSED(dst);
@@ -1514,6 +1547,7 @@ static void ggml_cuda_fakv(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, fakv::fa_kernel<G>, fakv::NTH, 0));
         return std::max(1, per_sm) * ggml_cuda_info().devices[ggml_cuda_get_device()].nsm;
     }();
+    const bool q8 = K->type == GGML_TYPE_Q8_0;
     const int ns = ggml_cuda_fakv_splits(blocks, n_kv / fakv::NK, resident);
     ggml_cuda_pool_alloc<int> kv_max(ctx.pool());
     if (n_kv % FATTN_KQ_STRIDE == 0 && mask->ne[1] >= (int64_t) ntb * BT) {
@@ -1528,9 +1562,15 @@ static void ggml_cuda_fakv(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         op.alloc(ns * rows * fakv::D);
         ml.alloc(ns * rows);
     }
-    fakv::fa_kernel<G><<<blocks * ns, fakv::NTH, 0, stream>>>((const float *) Q->data, (const _Float16 *) K->data,
-        (const _Float16 *) V->data, (const _Float16 *) mask->data, kv_max.ptr, (float *) dst->data, op.ptr, ml.ptr, ns, scale_log2, T, n_kv, ntb, HQ,
-        Q->nb[1] / 4, Q->nb[2] / 4, K->nb[1] / 2, K->nb[2] / 2, V->nb[1] / 2, V->nb[2] / 2, mask->nb[1] / 2, (int) mask->ne[1]);
+    if (q8) {
+        fakv::fa_kernel<G, true><<<blocks * ns, fakv::NTH, 0, stream>>>((const float *) Q->data, (const _Float16 *) K->data,
+            (const _Float16 *) V->data, (const _Float16 *) mask->data, kv_max.ptr, (float *) dst->data, op.ptr, ml.ptr, ns, scale_log2, T, n_kv, ntb, HQ,
+            Q->nb[1] / 4, Q->nb[2] / 4, K->nb[1], K->nb[2], V->nb[1], V->nb[2], mask->nb[1] / 2, (int) mask->ne[1]);
+    } else {
+        fakv::fa_kernel<G><<<blocks * ns, fakv::NTH, 0, stream>>>((const float *) Q->data, (const _Float16 *) K->data,
+            (const _Float16 *) V->data, (const _Float16 *) mask->data, kv_max.ptr, (float *) dst->data, op.ptr, ml.ptr, ns, scale_log2, T, n_kv, ntb, HQ,
+            Q->nb[1] / 4, Q->nb[2] / 4, K->nb[1] / 2, K->nb[2] / 2, V->nb[1] / 2, V->nb[2] / 2, mask->nb[1] / 2, (int) mask->ne[1]);
+    }
     if (ns > 1) {
         fakv::combine<<<rows, fakv::D, 0, stream>>>(op.ptr, ml.ptr, (float *) dst->data, ns, rows);
     }
