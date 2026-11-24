@@ -1684,6 +1684,12 @@ static __device__ __forceinline__ void mmvq_fq_quantize_y(
 
 #define MMVQ_KQW_V      4
 #define MMVQ_KQW_NWARPS 16
+// Longer rows keep quantize_q8_1 + one wave per row: there the in-kernel quantization of every 64-row block costs more
+// than the saved launch (Qwen3.5-4B, K = 2560: tg128 61.5 vs 62.1 t/s; Qwen3.6-27B, K = 5120: 12.0 vs 12.2 t/s).
+#define MMVQ_KQW_MAX_NCOLS 2048
+// ... unless the matrix has few rows (Qwen3-Coder-30B-A3B attention output, 2048 x 4096: tg128 at depth 0 88.9 -> 90.0)
+#define MMVQ_KQW_MAX_NROWS_LONG 2048
+#define MMVQ_KQW_MAX_NCOLS_LONG 4096
 
 static constexpr __host__ __device__ bool mmvq_kq_wide_type_ok(ggml_type type) {
     return type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q6_K;
@@ -2609,7 +2615,7 @@ static __device__ __forceinline__ void mmvq_kq_group_rms_norm(
 
 // norm_x != nullptr: y is not read, the kernel computes it as rms_norm(norm_x) * norm_w first
 __launch_bounds__(MMVQ_KQW_NWARPS*ggml_cuda_get_physical_warp_size(), 1)
-static __global__ void mul_mat_vec_q_kq_group(
+static __global__ void mul_mat_vec_q_kq_group_wide(
         const mmvq_kq_group_args_dev args, const float * GGML_CUDA_RESTRICT y, const int ncols_x,
         const float * GGML_CUDA_RESTRICT norm_x, const float * GGML_CUDA_RESTRICT norm_w, const float norm_eps) {
     constexpr int V = MMVQ_KQW_V;
@@ -2655,14 +2661,64 @@ static __global__ void mul_mat_vec_q_kq_group(
     }
 }
 
+// rows longer than MMVQ_KQW_MAX_NCOLS: the activation is quantized by quantize_q8_1, one wave per row
+template <ggml_type type>
+static __device__ __forceinline__ float mmvq_kq_group_row(
+        const void * GGML_CUDA_RESTRICT vx, const block_q8_1 * GGML_CUDA_RESTRICT y, const int kbx_offset, const int ncols_x) {
+    constexpr int qk  = ggml_cuda_type_traits<type>::qk;
+    constexpr int qi  = ggml_cuda_type_traits<type>::qi;
+    constexpr int vdr = get_vdr_mmvq(type);
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int blocks_per_iter = vdr * warp_size / qi;
+    constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
+
+    const int tid = threadIdx.x;
+    const int blocks_per_row_x = ncols_x / qk;
+    float tmp = 0.0f;
+    for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+        const int kby = kbx * (qk/QK8_1);
+        const int kqs = vdr * (tid % (qi/vdr));
+        tmp += vec_dot_q_cuda(vx, &y[kby], kbx_offset + kbx, kqs);
+    }
+    return warp_reduce_sum<warp_size>(tmp);
+}
+
+__launch_bounds__(ggml_cuda_get_physical_warp_size(), 1)
+static __global__ void mul_mat_vec_q_kq_group(
+        const mmvq_kq_group_args_dev args, const block_q8_1 * GGML_CUDA_RESTRICT y, const int ncols_x) {
+    int s = 0;
+#pragma unroll
+    for (int k = 1; k < MMVQ_GROUP_MAX; ++k) {
+        if (k < args.nseg && (int) blockIdx.x >= args.seg[k].blocks_begin) {
+            s = k;
+        }
+    }
+    const mmvq_kq_group_seg_dev seg = args.seg[s];
+    const int row = (int) blockIdx.x - seg.blocks_begin;
+    const int kbx_offset = row*seg.stride_row;
+
+    float result;
+    switch (seg.type) {
+        case GGML_TYPE_Q4_K: result = mmvq_kq_group_row<GGML_TYPE_Q4_K>(seg.vx, y, kbx_offset, ncols_x); break;
+        case GGML_TYPE_Q5_K: result = mmvq_kq_group_row<GGML_TYPE_Q5_K>(seg.vx, y, kbx_offset, ncols_x); break;
+        default:             result = mmvq_kq_group_row<GGML_TYPE_Q6_K>(seg.vx, y, kbx_offset, ncols_x); break;
+    }
+    if (threadIdx.x == 0) {
+        seg.dst[row] = result;
+        if (seg.dst16) {
+            const int64_t r = seg.idx64 ? *(const int64_t *) seg.idx : (int64_t) *(const int32_t *) seg.idx;
+            seg.dst16[r*seg.stride16 + row] = ggml_cuda_cast<half>(result);
+        }
+    }
+}
+
 bool ggml_cuda_mmvq_kq_group_seg_ok(const ggml_tensor * w, const ggml_tensor * y) {
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     if (!GGML_CUDA_CC_IS_RDNA3_5(cc) || !ggml_cuda_mmvq_kq_group_type_ok(w->type)) {
         return false;
     }
     if (y->type != GGML_TYPE_F32 || y->ne[1] != 1 || y->ne[2] != 1 || y->ne[3] != 1 || !ggml_is_contiguous(y) ||
-            y->ne[0] != w->ne[0] || w->ne[0] % QK_K != 0 || (uintptr_t) y->data % 16 != 0 ||
-            (y->ne[0] / QK8_1) * (int64_t) sizeof(block_q8_1) > 16384) {
+            y->ne[0] != w->ne[0] || w->ne[0] % QK_K != 0) {
         return false;
     }
     return w->ne[2] == 1 && w->ne[3] == 1 && w->nb[0] == ggml_type_size(w->type) && w->ne[1] <= INT32_MAX &&
@@ -2688,7 +2744,7 @@ bool ggml_cuda_mmvq_kq_group_rms_norm_ok(const ggml_tensor * rms_norm, const ggm
     return rms_norm->op == GGML_OP_RMS_NORM && mul->op == GGML_OP_MUL && y == mul && (mul->src[0] == rms_norm || mul->src[1] == rms_norm) &&
         x->type == GGML_TYPE_F32 && w->type == GGML_TYPE_F32 && ggml_is_contiguous(x) && ggml_nrows(x) == 1 &&
         ggml_is_contiguous(w) && ggml_nelements(w) == ncols && ggml_are_same_shape(mul, x) &&
-        ncols % 128 == 0 && ncols/4 > 256 && ncols/4 <= 512 &&
+        ncols % 128 == 0 && ncols/4 > 256 && ncols/4 <= 512 && ncols <= MMVQ_KQW_MAX_NCOLS &&
         (uintptr_t) x->data % 16 == 0 && (uintptr_t) w->data % 16 == 0 && (uintptr_t) y->data % 16 == 0;
 }
 
@@ -2700,7 +2756,9 @@ void ggml_cuda_mmvq_kq_group(ggml_backend_cuda_context & ctx, const ggml_tensor 
     cudaStream_t stream = ctx.stream();
 
     const int64_t ncols = y->ne[0];
-    constexpr int rows_per_block = MMVQ_KQW_V*MMVQ_KQW_NWARPS;
+    const bool wide = ncols <= MMVQ_KQW_MAX_NCOLS && (uintptr_t) y->data % 16 == 0;
+    GGML_ASSERT(wide || rms_norm == nullptr);
+    const int rows_per_block = wide ? MMVQ_KQW_V*MMVQ_KQW_NWARPS : 1;
     mmvq_kq_group_args_dev args{};
     args.nseg = nseg;
     int nblocks = 0;
@@ -2725,6 +2783,15 @@ void ggml_cuda_mmvq_kq_group(ggml_backend_cuda_context & ctx, const ggml_tensor 
         nblocks += (int) ((w->ne[1] + rows_per_block - 1) / rows_per_block);
     }
 
+    if (!wide) {
+        const int64_t ncols_padded = GGML_PAD(ncols, MATRIX_ROW_PADDING);
+        ggml_cuda_pool_alloc<char> y_q8(ctx.pool(), ncols_padded * sizeof(block_q8_1) / QK8_1);
+        quantize_row_q8_1_cuda((const float *) y->data, y_q8.get(), ncols, ncols, ncols, ncols, ncols_padded, 1, 1, 1, stream);
+        const ggml_cuda_kernel_launch_params params(dim3(nblocks, 1, 1), dim3(warp_size, 1, 1), 0, stream);
+        ggml_cuda_kernel_launch(mul_mat_vec_q_kq_group, params, args, (const block_q8_1 *) y_q8.get(), (int) ncols);
+        return;
+    }
+
     const float * norm_x = nullptr;
     const float * norm_w = nullptr;
     float norm_eps = 0.0f;
@@ -2736,7 +2803,7 @@ void ggml_cuda_mmvq_kq_group(ggml_backend_cuda_context & ctx, const ggml_tensor 
     }
     const int nbytes_shared = (int) (ncols / QK8_1 * sizeof(block_q8_1) + (rms_norm ? ncols * sizeof(float) : 0));
     const ggml_cuda_kernel_launch_params params(dim3(nblocks, 1, 1), dim3(warp_size, MMVQ_KQW_NWARPS, 1), nbytes_shared, stream);
-    ggml_cuda_kernel_launch(mul_mat_vec_q_kq_group, params, args, (const float *) y->data, (int) ncols, norm_x, norm_w, norm_eps);
+    ggml_cuda_kernel_launch(mul_mat_vec_q_kq_group_wide, params, args, (const float *) y->data, (int) ncols, norm_x, norm_w, norm_eps);
 }
 
 // Dedicated MoE multi-token kernel.
@@ -3450,7 +3517,9 @@ static bool mul_mat_vec_q_fq_try(
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     // the wide kernel takes every K-quant except the LM-head-sized Q6_K matvecs, where mul_mat_vec_q_fq streams at ~97% of
     // the DRAM bandwidth already (Qwen3-Coder-30B-A3B output.weight: 1086 us here, 1121 us with the wide kernel)
-    const bool wide_fq = mmvq_kq_wide_type_ok(src0->type) && !(src0->type == GGML_TYPE_Q6_K && !ids && ne01 >= 65536);
+    const bool wide_fq = mmvq_kq_wide_type_ok(src0->type) &&
+        (ne00 <= MMVQ_KQW_MAX_NCOLS || (!ids && ne01 <= MMVQ_KQW_MAX_NROWS_LONG && ne00 <= MMVQ_KQW_MAX_NCOLS_LONG)) &&
+        !(src0->type == GGML_TYPE_Q6_K && !ids && ne01 >= 65536);
     const int64_t ncols_dst_fq = ids ? ne2 : ne1;
     const bool aligned = (uintptr_t) src1->data % 16 == 0 && nb11 % 16 == 0 && nb12 % 16 == 0 && nb13 % 16 == 0;
     const bool fusion_ok = !fusion ||
