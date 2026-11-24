@@ -185,6 +185,11 @@ __device__ __forceinline__ void mmb_tile_gemm(const uint8_t * __restrict__ Wbase
     // Q5_1 at BM=128 (routed down): two threads per row, one 24-byte block (32 weights) each. One thread per row left
     // half the CTA idle while the other half decoded 64 weights (~600 VALU per stage against 16 WMMA per wave).
     constexpr bool Q51S = false && WTYPE == 32 + GGML_TYPE_Q5_1 && BM * 2 == MMB_NT && MMB_BK == 64;   // off: measured neutral-to-negative (1678 -> 1668 t/s pp2048)
+    constexpr bool Q4KP = WTYPE == 32 + GGML_TYPE_Q4_K && BM * 2 == MMB_NT && MMB_BK == 64 && !F16;
+    uint4 q4m, q4q;
+    constexpr bool Q6KP = WTYPE == 32 + GGML_TYPE_Q6_K && BM * 2 == MMB_NT && MMB_BK == 64 && !F16;
+    typedef uint32_t q6u32 __attribute__((aligned(2)));
+    uint32_t q6l[8], q6h[8], q6s;
 
     // gfx1151/ROCm 10.1 clang 24: S119 has seven saves/32 bytes with loop-head BF16 row prefetch (2026-10-24); load the last three vectors near the final WMMAs.
     // Remove this schedule when full-row prefetch is spill-free at the measured throughput.
@@ -203,6 +208,29 @@ __device__ __forceinline__ void mmb_tile_gemm(const uint8_t * __restrict__ Wbase
                 const uint2 w0 = p[0], w1 = p[1], w2 = p[2];
                 a0[0] = make_uint4(w0.x, w0.y, w1.x, w1.y); a1[0] = make_uint4(w2.x, w2.y, 0u, 0u);
             } else { a0[0] = a1[0] = make_uint4(0,0,0,0); }   // d = m = 0: zero rows (never stored)
+        }
+        if constexpr (Q4KP) {
+            const int row = tid >> 1;
+            if (row < a_rows) {
+                const uint8_t * p = Wbase + (size_t)row * wrow_bytes + (size_t)(ks / 4) * sizeof(block_q4_K);
+                q4m = *(const uint4 *) p;
+                q4q = *(const uint4 *) (p + 16 + (ks & 3) * 32 + (tid & 1) * 16);
+            } else { q4m = q4q = make_uint4(0, 0, 0, 0); }
+        }
+        if constexpr (Q6KP) {
+            const int row = tid >> 1, h = tid & 1, ip = (ks & 3) >> 1, half = ks & 1;
+            const block_q6_K * x = (const block_q6_K *)(Wbase + (size_t)row * wrow_bytes) + ks / 4;
+            if (row < a_rows) {
+                const q6u32 * ql = (const q6u32 *) (x->ql + 64 * ip + 32 * h), * qh = (const q6u32 *) (x->qh + 32 * ip);
+#pragma unroll
+                for (int i = 0; i < 8; ++i) { q6l[i] = ql[i]; q6h[i] = qh[i]; }
+                const uint8_t * sc = (const uint8_t *) x->scales + 8 * ip + (half ? (h ? 6 : 4) : (h ? 2 : 0));
+                q6s = (uint32_t) sc[0] | ((uint32_t) sc[1] << 8) | ((uint32_t) *(const uint16_t *) &x->d << 16);
+            } else {
+#pragma unroll
+                for (int i = 0; i < 8; ++i) { q6l[i] = 0u; q6h[i] = 0u; }
+                q6s = 0u;
+            }
         }
         if constexpr (Q20T) {
             const int row = tid >> 1;
@@ -281,6 +309,24 @@ __device__ __forceinline__ void mmb_tile_gemm(const uint8_t * __restrict__ Wbase
                 for (int j = 0; j < 8; ++j) v[j] = ((int) ((q20q[r] >> (2 * j)) & 3) - 1) * d;
                 mmb_store8(As + row * MMB_LDS_STRIDE + 8 * (tid & 7), v);
             }
+        } else if constexpr (Q6KP) {
+            const int h = tid & 1, half = weight_ks & 1, sh = 2 * h + 4 * half;
+            const float d = mmb_h2f((uint16_t) (q6s >> 16));
+            uint16_t * dst = As + (tid >> 1) * MMB_LDS_STRIDE + 32 * h;
+#pragma unroll
+            for (int lh = 0; lh < 4; ++lh) {
+                const float sc = (float) (int8_t) ((q6s >> (8 * (lh >> 1))) & 255u);
+                float v[8];
+#pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    const uint32_t l8 = (q6l[2 * lh + j / 4] >> (8 * (j & 3))) & 255u, h8 = (q6h[2 * lh + j / 4] >> (8 * (j & 3))) & 255u;
+                    const int q = (int) ((half ? (l8 >> 4) : (l8 & 15u)) | (((h8 >> sh) & 3u) << 4));
+                    v[j] = d * sc * (float) ((int8_t) q - 32);
+                }
+                mmb_store8(dst + 8 * lh, v);
+            }
+        } else if constexpr (Q4KP) {
+            mmb_dq_q4k_slice<true>(q4q, q4q, q4m, weight_ks & 3, (uint32_t *)(As + (tid >> 1) * MMB_LDS_STRIDE), tid & 1);
         } else if constexpr (WTYPE >= 32 && WTYPE != 32 + GGML_TYPE_Q5_1) mmb_load_quant_tile<WTYPE, BM, MMB_LDS_STRIDE>(Wbase, wrow_bytes, a_rows, weight_ks, As);
         if constexpr (Q51S) {
             mmb_dq_q51_one(a0[0], a1[0], (uint32_t *)(As + (tid >> 1) * MMB_LDS_STRIDE + (tid & 1) * 32));
