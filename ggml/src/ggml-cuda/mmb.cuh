@@ -73,6 +73,8 @@ void ggml_cuda_mul_mat_id_r2_gemv(ggml_backend_cuda_context & ctx, const ggml_te
 // GLU R2: routed Q4_K gate/up pairs repacked in place (G2 layout). ggml_cuda_mmb_r2_packed() is true for them too;
 // their consumers are ggml_cuda_mul_mat_id_mmb_glu (G2 WMMA), the fused G2 GLU GEMV and ggml_cuda_mul_mat_id_g2_gemv.
 bool ggml_cuda_mmb_g2_packed(const ggml_tensor * w);
+// the pair is one ggml_cuda_mul_mat_id_mmb_glu takes at some batch size (graph_optimize repacks it on any graph)
+bool ggml_cuda_mmb_glu_r2_wanted(ggml_backend_cuda_context & ctx, const ggml_tensor * gw, const ggml_tensor * uw, const ggml_tensor * src1, const ggml_tensor * ids, const ggml_tensor * glu);
 void ggml_cuda_mmb_glu_r2_prepare(ggml_backend_cuda_context & ctx, const ggml_tensor * gw, const ggml_tensor * uw);
 void ggml_cuda_mul_mat_id_g2_gemv(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst);
 bool ggml_cuda_mmb_g2_glu_gemv_ok(const ggml_tensor * gw, const ggml_tensor * uw, const ggml_tensor * src1, const ggml_tensor * ids, const ggml_tensor * glu);
