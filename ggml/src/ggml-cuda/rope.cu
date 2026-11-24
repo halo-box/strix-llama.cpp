@@ -724,8 +724,9 @@ void ggml_cuda_op_rope_fused(ggml_backend_cuda_context & ctx, ggml_tensor * rope
 }
 
 // fused RMS_NORM + MUL + ROPE (+ VIEW + SET_ROWS)
-// one block per row: block_reduce gives the norm scale, then each thread applies mul and rope to the elements it owns
-template <int block_size, bool has_ff, typename D>
+// one block per row: block_reduce gives the norm scale, then each thread applies mul and rope to the elements it owns.
+// G > 1: G rows per block, block_size threads each, with the reduction tree of block_reduce<SUM, block_size> per row.
+template <int block_size, bool has_ff, typename D, int G = 1>
 static __device__ __forceinline__ void rms_norm_mul_rope_f32_impl(
         const int row,
         const float * x, D * dst, const int ncols, const int nchannels, const int nsamples,
@@ -743,7 +744,7 @@ static __device__ __forceinline__ void rms_norm_mul_rope_f32_impl(
         const int64_t * row_indices, const int set_rows_stride,
         const bool is_neox) {
     ggml_cuda_pdl_lc();
-    const int tid = threadIdx.x;
+    const int tid = G == 1 ? (int) threadIdx.x : (int) threadIdx.x % block_size;
 
     extern __shared__ float s_sum[];
 
@@ -766,7 +767,20 @@ static __device__ __forceinline__ void rms_norm_mul_rope_f32_impl(
                 tmp += xi * xi;
             }
 
-            tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+            if constexpr (G == 1) {
+                tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+            } else {
+                static_assert(block_size % WARP_SIZE == 0 && G * block_size / WARP_SIZE <= 32, "");
+                constexpr int NWG = block_size / WARP_SIZE;
+                const int warp = threadIdx.x / WARP_SIZE, lane = threadIdx.x % WARP_SIZE;
+                tmp = block_reduce_policy<block_reduce_method::SUM, float>::reduce(tmp);
+                if (lane == 0) {
+                    s_sum[warp] = tmp;
+                }
+                __syncthreads();
+                tmp = lane < NWG ? s_sum[warp / NWG * NWG + lane] : block_reduce_policy<block_reduce_method::SUM, float>::sentinel();
+                tmp = block_reduce_policy<block_reduce_method::SUM, float>::reduce(tmp);
+            }
 
             const float scale = rsqrtf(tmp/ncols + eps);
 
@@ -831,9 +845,9 @@ struct rms_norm_mul_rope_args {
     bool is_neox;
 };
 
-template <int block_size, bool has_ff, typename D>
+template <int block_size, bool has_ff, typename D, int G = 1>
 static __device__ __forceinline__ void rms_norm_mul_rope_f32_args(const int row, const rms_norm_mul_rope_args<D> & a) {
-    rms_norm_mul_rope_f32_impl<block_size, has_ff, D>(row, a.x, a.dst, a.ncols, a.nchannels, a.nsamples,
+    rms_norm_mul_rope_f32_impl<block_size, has_ff, D, G>(row, a.x, a.dst, a.ncols, a.nchannels, a.nsamples,
         a.s01, a.s02, a.s03, a.s1, a.s2, a.s3, a.eps, a.mul, a.mul_s01, a.mul_s02, a.mul_s03,
         a.mul_ncols_packed, a.mul_nrows_packed, a.mul_nchannels_packed, a.mul_nsamples_packed,
         a.n_dims, a.pos, a.freq_scale, a.ext_factor, a.attn_factor, a.corr_dims, a.theta_scale,
@@ -845,13 +859,15 @@ static __global__ void rms_norm_mul_rope_f32(const rms_norm_mul_rope_args<D> a) 
     rms_norm_mul_rope_f32_args<block_size, has_ff, D>(blockIdx.x, a);
 }
 
-// two independent norm + rope chains (attention Q and K) in one launch: blocks [0, nrows_a) run a, the rest b
-template <int block_size, bool has_ff, typename DA, typename DB>
+// two independent norm + rope chains (attention Q and K) in one launch: rows [0, nrows_a) run a, the rest b;
+// G rows per block of G * block_size threads (nrows_a and the row count of b are multiples of G)
+template <int block_size, bool has_ff, typename DA, typename DB, int G = 1>
 static __global__ void rms_norm_mul_rope_f32_pair(const rms_norm_mul_rope_args<DA> a, const rms_norm_mul_rope_args<DB> b, const int nrows_a) {
-    if ((int) blockIdx.x < nrows_a) {
-        rms_norm_mul_rope_f32_args<block_size, has_ff, DA>(blockIdx.x, a);
+    const int row = (int) blockIdx.x * G + (G == 1 ? 0 : (int) threadIdx.x / block_size);
+    if ((int) blockIdx.x * G < nrows_a) {
+        rms_norm_mul_rope_f32_args<block_size, has_ff, DA, G>(row, a);
     } else {
-        rms_norm_mul_rope_f32_args<block_size, has_ff, DB>(blockIdx.x - nrows_a, b);
+        rms_norm_mul_rope_f32_args<block_size, has_ff, DB, G>(row - nrows_a, b);
     }
 }
 
@@ -976,10 +992,18 @@ bool ggml_cuda_rms_norm_mul_rope_pair_ok(const ggml_tensor * rms_a, const ggml_t
 template <typename DB>
 static void rms_norm_mul_rope_pair_cuda(const rms_norm_mul_rope_args<float> & a, const int nrows_a,
         const rms_norm_mul_rope_args<DB> & b, const int nrows_b, cudaStream_t stream) {
-    const dim3 blocks_num(nrows_a + nrows_b, a.nchannels, a.nsamples);
     const int bs = a.ncols < 1024 ? 256 : 1024;
-    const ggml_cuda_kernel_launch_params launch_params = {blocks_num, dim3(bs, 1, 1), 32*sizeof(float), stream};
     const bool ff = a.freq_factors != nullptr;
+    // rows of at most 128 columns: 4 rows per block of 4 x 128 threads; each row keeps the elements per thread and the
+    // reduction tree of the 256-thread block (its upper 4 warps only add zeros), so the results are bit-identical
+    if (a.ncols <= 128 && b.ncols <= 128 && nrows_a % 4 == 0 && nrows_b % 4 == 0) {
+        const ggml_cuda_kernel_launch_params lp = {dim3((nrows_a + nrows_b) / 4, a.nchannels, a.nsamples), dim3(512, 1, 1), 32*sizeof(float), stream};
+        if (ff) { ggml_cuda_kernel_launch(rms_norm_mul_rope_f32_pair<128, true,  float, DB, 4>, lp, a, b, nrows_a); }
+        else    { ggml_cuda_kernel_launch(rms_norm_mul_rope_f32_pair<128, false, float, DB, 4>, lp, a, b, nrows_a); }
+        return;
+    }
+    const dim3 blocks_num(nrows_a + nrows_b, a.nchannels, a.nsamples);
+    const ggml_cuda_kernel_launch_params launch_params = {blocks_num, dim3(bs, 1, 1), 32*sizeof(float), stream};
     if (bs == 256) {
         if (ff) { ggml_cuda_kernel_launch(rms_norm_mul_rope_f32_pair<256, true,  float, DB>, launch_params, a, b, nrows_a); }
         else    { ggml_cuda_kernel_launch(rms_norm_mul_rope_f32_pair<256, false, float, DB>, launch_params, a, b, nrows_a); }
