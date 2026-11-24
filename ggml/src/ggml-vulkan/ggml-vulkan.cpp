@@ -20751,6 +20751,24 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     ctx->do_add_rms_partials_offset_calculation = false;
     ctx->ssm_conv_direct_matches.clear();
 
+    // A fused single-row ADD -> RMS_NORM pair takes its own slice of the partials buffer, and the offset resets only here, so
+    // the buffer must hold every pair of this graph: a pair past its end runs the unfused RMS_NORM. Every single-row f32
+    // RMS_NORM counts, an upper bound on the pairs ggml_vk_build_graph fuses. ggml_vk_preallocate_buffers grows the buffer below.
+    if (ctx->device->add_rms_fusion && !ctx->device->disable_fusion) {
+        size_t partials_size = 0;
+        for (int i = 0; i < cgraph->n_nodes; ++i) {
+            const ggml_tensor * node = cgraph->nodes[i];
+            if (node->op == GGML_OP_RMS_NORM && ggml_nrows(node) == 1 && node->src[0]->type == GGML_TYPE_F32) {
+                partials_size += ggml_vk_rms_partials_size(ctx, node);
+            }
+        }
+        if (partials_size > ctx->prealloc_size_add_rms_partials) {
+            // the previous graph may still read the buffer that is about to be replaced
+            ggml_vk_synchronize(ctx);
+            ctx->prealloc_size_add_rms_partials = partials_size;
+        }
+    }
+
     int last_node = cgraph->n_nodes - 1;
 
     // If the last op in the cgraph isn't backend GPU, the command buffer doesn't get closed properly
