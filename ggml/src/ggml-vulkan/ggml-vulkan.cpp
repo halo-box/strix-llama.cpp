@@ -13737,7 +13737,8 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
 // 488 of 512 lanes idle. Same copies, same values.
 static bool ggml_vk_get_rows_flat(const ggml_tensor * src0, const ggml_tensor * src1) {
     const bool plain = src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16 || src0->type == GGML_TYPE_I32;
-    return plain && src0->ne[0] < 512 && (uint64_t)src0->ne[0] * (uint64_t)src1->ne[0] <= UINT32_MAX;
+    // headroom for the shader's 32-bit grid-stride counter (step at most 512 x 65535 lanes)
+    return plain && src0->ne[0] < 512 && (uint64_t)src0->ne[0] * (uint64_t)src1->ne[0] <= UINT32_MAX - 512ull * 65535ull;
 }
 
 template<typename PC>
