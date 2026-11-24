@@ -16998,6 +16998,10 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
             if (ctx->prealloc_size_add_rms_partials_offset + size <= ctx->prealloc_size_add_rms_partials) {
                 ctx->do_add_rms_partials = true;
                 ggml_vk_count_fusion(ctx->device, "ADD_RMS_NORM_PARTIALS");
+                ggml_vk_path_census_add("ADD_RMS_NORM_PARTIALS");
+            } else {
+                // the partials buffer is full: this RMS_NORM runs unfused
+                ggml_vk_path_census_add("ADD_RMS_NORM_PARTIALS_NO_ROOM");
             }
         }
     }
@@ -20090,6 +20094,9 @@ static const char * ggml_backend_vk_dispatch_census_skip(ggml_backend_t backend,
     }
     if (dev->disable_fusion) {
         return "fusion disabled (GGML_VK_DISABLE_FUSION)";
+    }
+    if (l == "ADD_RMS_NORM_PARTIALS" && !dev->add_rms_fusion) {
+        return "no add + rms_norm partials fusion (needs subgroup arithmetic; off on Intel)";
     }
     if (l == "MULTI_ADD" && !dev->multi_add) {
         return "no multi_add (needs RTE f16 rounding and the push-constant size; GGML_VK_DISABLE_MULTI_ADD)";
