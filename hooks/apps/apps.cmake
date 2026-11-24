@@ -232,7 +232,8 @@ if (LLAMA_BUILD_TESTS AND TARGET hooks-tests)
         # as test-llama-context of tests/CMakeLists.txt: the generated models, abort on a graph reallocation
         add_test(NAME test-llama-context-fork COMMAND $<TARGET_FILE:test-llama-context-fork> --models ${CMAKE_BINARY_DIR}/tests/test-models/
                  WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
-        set_tests_properties(test-llama-context-fork PROPERTIES LABELS "main;behavior;backend" FIXTURES_REQUIRED generate-models
+        # on llvmpipe the same test takes 863 s in the fork on a slow CI machine, its limit there is 900 s
+        set_tests_properties(test-llama-context-fork PROPERTIES LABELS "main;behavior;backend" FIXTURES_REQUIRED generate-models TIMEOUT 1800
                              ENVIRONMENT "GGML_SCHED_DEBUG_REALLOC=1;GGML_HOOKS=${HOOKS_FORK_TEST_SWITCHES}")
     endif()
 endif()
