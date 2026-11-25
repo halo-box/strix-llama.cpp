@@ -608,6 +608,11 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
             if (cell.seq_id.size() == 1) { has_cell = true; }
         }
         if (!has_cell) {
+            // a sequence takes the cell of its own id when it is free, so that consecutive sequences sit in
+            // consecutive cells and the gather below does not move a sequence away from its rollback snapshots
+            if (cells[seq_id].is_empty()) {
+                next_empty_cell = seq_id;
+            }
             auto & empty_cell = cells[next_empty_cell];
             GGML_ASSERT(empty_cell.is_empty());
             // copy old tail into the empty cell
@@ -616,9 +621,9 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
                 empty_cell.pos = orig_cell.pos;
                 empty_cell.src = orig_cell.src;
                 orig_cell.seq_id.erase(seq_id);
-                empty_cell.seq_id.insert(seq_id); // will be overwritten
                 GGML_ASSERT(!orig_cell.is_empty()); // has at least one remaining seq_id
             }
+            empty_cell.seq_id.insert(seq_id); // will be overwritten
             seq_meta.tail = next_empty_cell;
             // find next empty cell
             if (s + 1 < n_seqs) {
@@ -646,6 +651,9 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
             std::swap(dst_cell.pos, src_cell.pos);
             std::swap(dst_cell.src, src_cell.src);
             std::swap(dst_cell.seq_id, src_cell.seq_id);
+
+            // the snapshots of dst_id stay there and this ubatch overwrites them, the moved sequence has none
+            src_cell.rs_max = 0;
 
             // swap tails
             for (uint32_t j = 0; j < size; ++j) {
