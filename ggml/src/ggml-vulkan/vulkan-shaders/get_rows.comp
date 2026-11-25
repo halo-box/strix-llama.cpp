@@ -5,7 +5,37 @@
 
 layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
 
+// One output element of row i10 (src1 index), row group gid_z.
+void copy_elem(const uint i00, const uint i10, const uint gid_z) {
+    const uint i11 = gid_z / p.ne12;
+    const uint i12 = gid_z % p.ne12;
+
+    const uint i01 = data_b[get_boffset() + i10*p.nb10 + i11*p.nb11 + i12*p.nb12];
+
+    const uint a_offset = get_aoffset() + i01*p.nb01 + i11*p.nb02 + i12*p.nb03;
+    const uint d_offset = get_doffset() + i10*p.nb21 + i11*p.nb22 + i12*p.nb23;
+
+#if defined(DATA_A_BF16)
+    TEMP_TYPE v = TEMP_TYPE(bf16_to_fp32(data_a[a_offset + i00]));
+#else
+    TEMP_TYPE v = TEMP_TYPE(data_a[a_offset + i00]);
+#endif
+    data_d[d_offset + i00] = D_TYPE(v);
+}
+
 void main() {
+    // param3 == 1 (host: rows shorter than the workgroup): x runs flat over the ne00 * ne10 elements of a row group, so
+    // short rows (e.g. a 24-head relative-position bias gathered per key and query) do not leave most of a workgroup idle
+    if (p.param3 == 1) {
+        const uint n = p.ne00 * p.ne10;
+        for (uint gid_z = gl_GlobalInvocationID.z; gid_z < p.ne11 * p.ne12; gid_z += gl_WorkGroupSize.z * gl_NumWorkGroups.z) {
+            for (uint g = gl_GlobalInvocationID.x; g < n; g += gl_WorkGroupSize.x * gl_NumWorkGroups.x) {
+                copy_elem(g % p.ne00, g / p.ne00, gid_z);
+            }
+        }
+        return;
+    }
+
     const uint i00 = gl_GlobalInvocationID.x;
 
     if (i00 >= p.ne00) {
@@ -16,25 +46,7 @@ void main() {
     while (gid_z < p.ne11 * p.ne12) {
         uint gid_y = gl_GlobalInvocationID.y;
         while (gid_y < p.ne10) {
-            const uint i10 = gid_y;
-            const uint i11 = gid_z / p.ne12;
-            const uint i12 = gid_z % p.ne12;
-
-            const uint i01 = data_b[get_boffset() + i10*p.nb10 + i11*p.nb11 + i12*p.nb12];
-
-            const uint a_offset = get_aoffset() + i01*p.nb01 + i11*p.nb02 + i12*p.nb03;
-            const uint d_offset = get_doffset() + i10*p.nb21 + i11*p.nb22 + i12*p.nb23;
-
-#if defined(DATA_A_BF16)
-            TEMP_TYPE v = TEMP_TYPE(bf16_to_fp32(data_a[a_offset + i00]));
-#else
-            TEMP_TYPE v = TEMP_TYPE(data_a[a_offset + i00]);
-#endif
-#ifndef OPTIMIZATION_ERROR_WORKAROUND
-            data_d[d_offset + i00] = D_TYPE(v);
-#else
-            data_d[d_offset + i00] = D_TYPE(v);
-#endif
+            copy_elem(i00, gid_y, gid_z);
             gid_y += gl_WorkGroupSize.y * gl_NumWorkGroups.y;
         }
         gid_z += gl_WorkGroupSize.z * gl_NumWorkGroups.z;
