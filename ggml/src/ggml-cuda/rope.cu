@@ -859,6 +859,17 @@ static __global__ void rms_norm_mul_rope_f32(const rms_norm_mul_rope_args<D> a) 
     rms_norm_mul_rope_f32_args<block_size, has_ff, D>(blockIdx.x, a);
 }
 
+template <bool has_ff, typename D>
+static __device__ __forceinline__ void rms_norm_mul_rope_angles(const rms_norm_mul_rope_args<D> & a, float * cos_tab, float * sin_tab) {
+    ggml_cuda_pdl_sync();
+    const int i0 = 2*threadIdx.x;
+    if (i0 < a.n_dims) {
+        const float theta_base  = a.pos[blockIdx.y]*powf(a.theta_scale, i0/2.0f);
+        const float freq_factor = has_ff ? a.freq_factors[i0/2] : 1.0f;
+        rope_yarn<true>(theta_base/freq_factor, a.freq_scale, a.corr_dims, i0, a.ext_factor, a.attn_factor, cos_tab[i0/2], sin_tab[i0/2]);
+    }
+}
+
 // two independent norm + rope chains (attention Q and K) in one launch: rows [0, nrows_a) run a, the rest b;
 // G rows per block of G * block_size threads (nrows_a and the row count of b are multiples of G)
 template <int block_size, bool has_ff, typename DA, typename DB, int G = 1>
@@ -869,6 +880,72 @@ static __global__ void rms_norm_mul_rope_f32_pair(const rms_norm_mul_rope_args<D
     } else {
         rms_norm_mul_rope_f32_args<block_size, has_ff, DB, G>(row - nrows_a, b);
     }
+}
+
+static __device__ __forceinline__ float rms_norm_tok_sumsq(const float * xv) {
+    float v[4];
+#pragma unroll
+    for (int w = 0; w < 4; ++w) {
+        float sq;
+#if defined(GGML_USE_HIP)
+        asm("v_mul_f32 %0, %1, %1" : "=v"(sq) : "v"(xv[w]));
+#else
+        sq = __fmul_rn(xv[w], xv[w]);
+#endif
+        v[w] = warp_reduce_sum(sq);
+    }
+    return (v[0] + v[2]) + (v[1] + v[3]);
+}
+
+template <typename D>
+static __device__ __forceinline__ void rms_norm_mul_rope_tok_row(const rms_norm_mul_rope_args<D> & a, const int row, const int channel,
+        const int sample, const int lane, const float * cs, const float * sn) {
+    const float * xc = a.x + sample*a.s03 + channel*a.s02 + row*a.s01;
+    const float * mulc = a.mul + fastmodulo(sample, a.mul_nsamples_packed)*a.mul_s03 + fastmodulo(channel, a.mul_nchannels_packed)*a.mul_s02 +
+        fastmodulo(row, a.mul_nrows_packed)*a.mul_s01;
+    float xv[4];
+#pragma unroll
+    for (int w = 0; w < 4; ++w) {
+        xv[w] = xc[32*w + lane];
+    }
+    const float tmp = rms_norm_tok_sumsq(xv);
+    const float scale = rsqrtf(tmp/a.ncols + a.eps);
+    int64_t idst = sample*a.s3 + channel*a.s2 + row*a.s1;
+    if (a.set_rows_stride != 0) {
+        idst = row*a.s1 + a.row_indices[channel]*a.set_rows_stride;
+    }
+    D * dstc = a.dst + idst;
+#pragma unroll
+    for (int p = 0; p < 2; ++p) {
+        const int ix0 = 32*p + lane, ix1 = ix0 + 64;
+        const float x0 = scale * xv[p] * mulc[fastmodulo(ix0, a.mul_ncols_packed)];
+        const float x1 = scale * xv[p + 2] * mulc[fastmodulo(ix1, a.mul_ncols_packed)];
+        const float cos_theta = cs[ix0], sin_theta = sn[ix0];
+        dstc[ix0] = ggml_cuda_cast<D>(x0*cos_theta - x1*sin_theta);
+        dstc[ix1] = ggml_cuda_cast<D>(x0*sin_theta + x1*cos_theta);
+    }
+}
+
+template <bool has_ff, typename DB>
+static __global__ void __launch_bounds__(128) rms_norm_mul_rope_f32_pair_tok(const rms_norm_mul_rope_args<float> a,
+        const rms_norm_mul_rope_args<DB> b, const int nrows_a, const int nrows) {
+    __shared__ float cos_tab[64], sin_tab[64];
+    rms_norm_mul_rope_angles<has_ff>(a, cos_tab, sin_tab);
+    __syncthreads();
+    const int lane = threadIdx.x % WARP_SIZE, wave = threadIdx.x / WARP_SIZE;
+    for (int r = wave; r < nrows; r += 4) {
+        if (r < nrows_a) rms_norm_mul_rope_tok_row(a, r, blockIdx.y, blockIdx.z, lane, cos_tab, sin_tab);
+        else             rms_norm_mul_rope_tok_row(b, r - nrows_a, blockIdx.y, blockIdx.z, lane, cos_tab, sin_tab);
+    }
+}
+
+template <typename DB>
+static bool rms_norm_mul_rope_pair_tok_ok(const rms_norm_mul_rope_args<float> & a, const rms_norm_mul_rope_args<DB> & b) {
+    return WARP_SIZE == 32 && a.nchannels >= 32 && a.ncols == 128 && b.ncols == 128 && a.n_dims == 128 && b.n_dims == 128 &&
+        a.is_neox && b.is_neox && a.pos == b.pos &&
+        a.freq_factors == b.freq_factors && a.theta_scale == b.theta_scale && a.freq_scale == b.freq_scale &&
+        a.ext_factor == b.ext_factor && a.attn_factor == b.attn_factor && a.corr_dims.v[0] == b.corr_dims.v[0] &&
+        a.corr_dims.v[1] == b.corr_dims.v[1];
 }
 
 template <typename D>
@@ -994,6 +1071,12 @@ static void rms_norm_mul_rope_pair_cuda(const rms_norm_mul_rope_args<float> & a,
         const rms_norm_mul_rope_args<DB> & b, const int nrows_b, cudaStream_t stream) {
     const int bs = a.ncols < 1024 ? 256 : 1024;
     const bool ff = a.freq_factors != nullptr;
+    if (rms_norm_mul_rope_pair_tok_ok(a, b)) {
+        const ggml_cuda_kernel_launch_params lp = {dim3(1, a.nchannels, a.nsamples), dim3(128, 1, 1), 0, stream};
+        if (ff) { ggml_cuda_kernel_launch(rms_norm_mul_rope_f32_pair_tok<true,  DB>, lp, a, b, nrows_a, nrows_a + nrows_b); }
+        else    { ggml_cuda_kernel_launch(rms_norm_mul_rope_f32_pair_tok<false, DB>, lp, a, b, nrows_a, nrows_a + nrows_b); }
+        return;
+    }
     // rows of at most 128 columns: 4 rows per block of 4 x 128 threads; each row keeps the elements per thread and the
     // reduction tree of the 256-thread block (its upper 4 warps only add zeros), so the results are bit-identical
     if (a.ncols <= 128 && b.ncols <= 128 && nrows_a % 4 == 0 && nrows_b % 4 == 0) {
