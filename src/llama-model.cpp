@@ -23,7 +23,6 @@
 #include "models/models.h"
 
 #include "ggml.h"
-#include "ggml-alloc.h"
 #include "ggml-cpp.h"
 
 #include <algorithm>
@@ -34,7 +33,6 @@
 #include <cmath>
 #include <functional>
 #include <map>
-#include <mutex>
 #include <numeric>
 #include <regex>
 #include <sstream>
@@ -324,8 +322,6 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
             return new llama_model_falcon_h1(params);
         case LLM_ARCH_INKLING2:
             return new llama_model_inkling2(params);
-        case LLM_ARCH_INKLING2_LOOP:
-            return new llama_model_inkling2_loop(params);
         case LLM_ARCH_LFM2:
             return new llama_model_lfm2(params);
         case LLM_ARCH_LFM2MOE:
@@ -1395,10 +1391,6 @@ struct llama_model::impl {
     bool has_tensor_overrides;
 
     std::vector<float> tensor_split_owned;
-
-    // MTP draft vocabulary subsets by (n_keep, buffer type), alive while a context holds one
-    std::mutex mtp_draft_mutex;
-    std::map<std::pair<int32_t, ggml_backend_buffer_type_t>, std::weak_ptr<const llama_mtp_draft_vocab>> mtp_draft_cache;
 };
 
 bool llama_prec_policy::apply(ggml_tensor * res) const {
@@ -1501,7 +1493,6 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
     }
 
     load_hparams_hadamard(ml);
-    load_hparams_exl3(ml);
 
     // get general kv
     ml.get_key(LLM_KV_GENERAL_NAME, name, false);
@@ -1912,12 +1903,6 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             }
             if (!layer.ffn_up_exps_s && layer.ffn_up_exps) {
                 layer.ffn_up_exps_s = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS, "scale", i), {n_expert}, TENSOR_NOT_REQUIRED);
-                if (layer.ffn_up_exps_s && layer.ffn_gate_up_exps) {
-                    throw std::runtime_error(format("ffn_up_exps.scale and ffn_gate_up_exps.weight both exist for layer %d", i));
-                }
-            }
-            if (!layer.ffn_up_exps_s && layer.ffn_gate_up_exps) {
-                layer.ffn_up_exps_s = create_tensor(tn(LLM_TENSOR_FFN_GATE_UP_EXPS, "scale", i), {n_expert}, TENSOR_NOT_REQUIRED);
             }
 
             // recurrent / linear-attention weight scales (per-tensor, shape {1})
@@ -2040,12 +2025,10 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
-    load_tensors_exl3();
-
     // per-tensor activation precision policy
     prec_policy.load(ml, *this);
 
-    ml.init_mappings(params.lazy_mode != LLAMA_LAZY_MODE_DIRECT, use_mlock ? &pimpl->mlock_mmaps : nullptr);
+    ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
     pimpl->mappings.reserve(ml.mappings.size());
 
     // create the backend buffers
@@ -2296,13 +2279,6 @@ void llama_model_base::load_hparams_hadamard(llama_model_loader & ml) {
             case LLM_ARCH_QWEN35:
             case LLM_ARCH_QWEN35MOE:
             case LLM_ARCH_QWEN3NEXT:
-            // qwen4exp (Qwen3.8-Flash-Next): routed experts go through build_moe_ffn ->
-            // build_lora_mm_id (gate / up / gate_up / down); llama_verify_hadamard_graph
-            // still throws if any folded weight reaches a matmul without its transform.
-            case LLM_ARCH_QWEN4EXP:
-            // inkling2_loop (Inkling-2-Mini): routed experts (fused gate_up + down) go through build_moe_ffn ->
-            // build_lora_mm_id, every pass of the looped core included; llama_verify_hadamard_graph is the backstop.
-            case LLM_ARCH_INKLING2_LOOP:
                 break;
             default:
                 throw std::runtime_error(format(
@@ -2549,113 +2525,6 @@ void llama_model_base::load_tensors_hadamard() {
             __func__, hdmd.rot.size() + hdmd.inv.size(), hdmd.inv.size(), rotations.size(), sign_tensors.size());
 }
 
-// read and check the exl3.* metadata; create_tensor then takes "<name>.exl3_trellis/_suh/_svh" for "<name>.weight"
-void llama_model_base::load_hparams_exl3(llama_model_loader & ml) {
-    uint32_t version = 0;
-    if (!ml.get_key(LLM_KV_EXL3_VERSION, version, false)) {
-        return;
-    }
-    if (version != 1) {
-        throw std::runtime_error(format("unsupported exl3.version: %u", version));
-    }
-
-    std::string codebook;
-    uint32_t    hadamard_size = 0;
-    ml.get_key(LLM_KV_EXL3_CODEBOOK, codebook);
-    ml.get_key(LLM_KV_EXL3_HADAMARD_SIZE, hadamard_size);
-    if (hadamard_size != 128) {
-        throw std::runtime_error(format("unsupported exl3.hadamard_size: %u", hadamard_size));
-    }
-    uint32_t rows_version = 0;
-    if (ml.get_key(LLM_KV_EXL3_ROWS_VERSION, rows_version, false) && rows_version != 1) {
-        throw std::runtime_error(format("unsupported exl3.rows.version: %u", rows_version));
-    }
-    static const char * codebooks[] = { "3inst", "mcg", "mul1" };
-    for (int i = 0; i < 3; i++) {
-        if (codebook == codebooks[i]) {
-            hparams.exl3_codebook = i;
-        }
-    }
-    if (hparams.exl3_codebook < 0) {
-        throw std::runtime_error(format("unknown exl3.codebook: %s", codebook.c_str()));
-    }
-
-    // a smallest linear (k = n = 128, K = 4): some device must support the op
-    {
-        ggml_init_params params = { ggml_tensor_overhead()*8, NULL, true };
-        ggml_context_ptr ctx_ptr { ggml_init(params) };
-        ggml_context * ctx = ctx_ptr.get();
-        ggml_tensor * op = ggml_exl3_mul_mat(ctx, ggml_new_tensor_3d(ctx, GGML_TYPE_I16, 64, 8, 8),
-                ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 128, 1), ggml_new_tensor_1d(ctx, GGML_TYPE_F16, 128),
-                ggml_new_tensor_1d(ctx, GGML_TYPE_F16, 128), hparams.exl3_codebook);
-        bool supported = false;
-        for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
-            supported = supported || ggml_backend_dev_supports_op(ggml_backend_dev_get(i), op);
-        }
-        if (!supported) {
-            throw std::runtime_error("the model has EXL3 linears, but no backend of this build runs them (build with -DGGML_EXL3=ON)");
-        }
-    }
-
-    if (!hdmd.weight_blocks.empty() || !hdmd.inverse_blocks.empty()) {
-        throw std::runtime_error("EXL3 linears and prism.hadamard folded weights cannot be combined");
-    }
-
-    // only build_lora_mm(_id) makes the EXL3 ops: refuse archs whose graphs are not verified to use them for every linear
-    switch (arch) {
-        case LLM_ARCH_QWEN35:
-        case LLM_ARCH_LFM2MOE:
-        case LLM_ARCH_QWEN4EXP:
-            break;
-        default:
-            throw std::runtime_error(format("exl3: arch '%s' is not verified to route all linears through build_lora_mm", llm_arch_name(arch)));
-    }
-}
-
-void llama_model_base::load_tensors_exl3() {
-    if (hparams.exl3_codebook < 0) {
-        return;
-    }
-
-    std::unordered_map<std::string, ggml_tensor *> by_name;
-    for (const auto & [name, t] : tensors_by_name) {
-        by_name.emplace(name, t);
-    }
-
-    const std::string suffix = ".exl3_trellis";
-    for (const auto & [name, t] : tensors_by_name) {
-        if (name.size() <= suffix.size() || name.compare(name.size() - suffix.size(), suffix.size(), suffix) != 0) {
-            continue;
-        }
-        const std::string base = name.substr(0, name.size() - suffix.size());
-        const auto su = by_name.find(base + ".exl3_suh");
-        const auto sv = by_name.find(base + ".exl3_svh");
-        if (su == by_name.end() || sv == by_name.end()) {
-            throw std::runtime_error(format("exl3: '%s' has no scales", name.c_str()));
-        }
-        exl3.linears.emplace(t, llama_exl3_linear { su->second, sv->second });
-    }
-
-    // row tables decode to the embedding width (only the token embedding is one)
-    // an n-gram row table (with a head bias, qwen4exp PLE) is decoded by the arch on the host, never by a graph op
-    const std::string suffix_rows = ".exl3r_trellis";
-    for (const auto & [name, t] : tensors_by_name) {
-        if (name.size() <= suffix_rows.size() || name.compare(name.size() - suffix_rows.size(), suffix_rows.size(), suffix_rows) != 0) {
-            continue;
-        }
-        if (by_name.count(name.substr(0, name.size() - suffix_rows.size()) + ".exl3r_bias")) {
-            continue;
-        }
-        const auto sg = by_name.find(name.substr(0, name.size() - suffix_rows.size()) + ".exl3r_signs");
-        if (sg == by_name.end() || t != tok_embd) {
-            throw std::runtime_error(format("exl3: '%s' has no signs or is not the token embedding", name.c_str()));
-        }
-        exl3.rows.emplace(t, llama_exl3_rows { sg->second, (int64_t) hparams.n_embd });
-    }
-
-    LLAMA_LOG_INFO("%s: %zu EXL3 linears, codebook %d, %zu row tables\n", __func__, exl3.linears.size(), hparams.exl3_codebook, exl3.rows.size());
-}
-
 ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
     const buft_list_t * buft_list_layer = nullptr;
     if (tn.bid != -1) {
@@ -2706,10 +2575,6 @@ uint32_t llama_model::n_gpu_layers() const {
 
 llama_split_mode llama_model::split_mode() const {
     return params.split_mode;
-}
-
-bool llama_model::graph_depends_on_n_tokens() const {
-    return arch == LLM_ARCH_QWEN4EXP || arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE;
 }
 
 bool llama_model::no_alloc() const {
@@ -3037,148 +2902,6 @@ const ggml_tensor * llama_model::get_tensor(const char * name) const {
     }
 
     return it->second;
-}
-
-// A token id cutoff selects common tokens only if ids follow BPE merge order (an earlier merge is a more frequent pair).
-// Check it: the vocab must be BPE, and ids must increase with the rank of the first merge that makes each token.
-static bool mtp_draft_vocab_ids_follow_merge_order(const llama_vocab & vocab, std::string & why) {
-    if (vocab.get_type() != LLAMA_VOCAB_TYPE_BPE) {
-        why = "the tokenizer is not BPE";
-        return false;
-    }
-    const std::vector<std::string> merges = vocab.get_bpe_merges();
-    const int n_vocab = (int) vocab.n_tokens();
-    if (merges.size() < (size_t) n_vocab / 2) {
-        why = format("the tokenizer has only %zu merges for %d tokens", merges.size(), n_vocab);
-        return false;
-    }
-    std::vector<uint8_t> seen((size_t) n_vocab, 0);
-    llama_token last = -1;
-    size_t n_first = 0;
-    size_t n_out_of_order = 0;
-    for (const std::string & m : merges) {
-        const size_t sp = m.find(' ');
-        if (sp == std::string::npos) {
-            continue;
-        }
-        const llama_token id = vocab.text_to_token(m.substr(0, sp) + m.substr(sp + 1));
-        if (id == LLAMA_TOKEN_NULL || id < 0 || id >= n_vocab || seen[(size_t) id]) {
-            continue;
-        }
-        seen[(size_t) id] = 1;
-        n_first++;
-        if (id < last) {
-            n_out_of_order++;
-        }
-        last = std::max(last, id);
-    }
-    if (n_first < (size_t) n_vocab / 2 || n_out_of_order > 0) {
-        why = format("token ids do not follow BPE merge order (%zu of %zu merge-produced tokens out of order)", n_out_of_order, n_first);
-        return false;
-    }
-    return true;
-}
-
-std::shared_ptr<const llama_mtp_draft_vocab> llama_model::mtp_draft_vocab_get(int32_t n_keep, const llama_model * head_src) const {
-    if (n_keep <= 0) {
-        return nullptr;
-    }
-    // a shared MTP sidecar (qwen4exp nextn_shared_target_tensors) has no LM head of its own and scores
-    // with the target's: take the subset rows from there. The graph borrows the same tensor.
-    const ggml_tensor * out = output;
-    if (out == nullptr && head_src != nullptr && head_src != this) {
-        if (head_src->hparams.n_embd != hparams.n_embd || head_src->vocab.n_tokens() != vocab.n_tokens()) {
-            LLAMA_LOG_WARN("%s: mtp_draft_vocab = %d ignored: draft and target LM heads disagree in shape\n", __func__, n_keep);
-            return nullptr;
-        }
-        out = head_src->output;
-    }
-    // probe contexts (common_fit_params) use a model with unallocated weights: no subset
-    if (out == nullptr || out->buffer == nullptr || out->data == nullptr) {
-        if (output == nullptr && head_src == nullptr) {
-            LLAMA_LOG_WARN("%s: mtp_draft_vocab = %d ignored: the draft has no LM head and no target to borrow one from\n", __func__, n_keep);
-        }
-        return nullptr;
-    }
-    // only the qwen35, qwen35moe and qwen4exp MTP graphs use the subset, and only when the MTP block scores with the model LM head
-    // the rows of an EXL3 head are not contiguous in its trellis
-    if ((arch != LLM_ARCH_QWEN35 && arch != LLM_ARCH_QWEN35MOE && arch != LLM_ARCH_QWEN4EXP) || hparams.n_layer_nextn == 0 ||
-            layers[hparams.n_layer()].nextn.shared_head_head != nullptr || exl3.linears.count(out)) {
-        LLAMA_LOG_WARN("%s: mtp_draft_vocab = %d ignored: not supported for this model\n", __func__, n_keep);
-        return nullptr;
-    }
-    const int n_vocab = (int) vocab.n_tokens();
-    if (n_keep >= n_vocab) {
-        return nullptr;
-    }
-
-    const ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(out->buffer);
-
-    // the lock covers the build, so that contexts created at the same time with the same n_keep share one subset
-    std::lock_guard<std::mutex> lock(pimpl->mtp_draft_mutex);
-
-    auto & cache = pimpl->mtp_draft_cache;
-    for (auto it = cache.begin(); it != cache.end(); ) {
-        it = it->second.expired() ? cache.erase(it) : std::next(it);
-    }
-    const auto key = std::make_pair(n_keep, buft);
-    if (auto it = cache.find(key); it != cache.end()) {
-        return it->second.lock();
-    }
-
-    std::string why;
-    if (!mtp_draft_vocab_ids_follow_merge_order(vocab, why)) {
-        LLAMA_LOG_ERROR("%s: mtp_draft_vocab = %d ignored: %s\n", __func__, n_keep, why.c_str());
-        return nullptr;
-    }
-    std::vector<int64_t> ids;
-    ids.reserve(n_vocab);
-    for (int t = 0; t < n_vocab; ++t) {
-        const int attr = (int) vocab.token_get_attr(t);
-        if (t < n_keep || (attr & (LLAMA_TOKEN_ATTR_CONTROL | LLAMA_TOKEN_ATTR_USER_DEFINED))) {
-            ids.push_back(t);
-        }
-    }
-    const int64_t n_sel = (int64_t) ids.size();
-    if (n_sel >= out->ne[1]) {
-        return nullptr;
-    }
-    const size_t row_bytes = out->nb[1];
-    std::vector<uint8_t> host((size_t) n_sel * row_bytes);
-    for (size_t j = 0; j < ids.size(); ) {
-        size_t k = j;
-        while (k + 1 < ids.size() && ids[k + 1] == ids[k] + 1) {
-            k++;
-        }
-        ggml_backend_tensor_get(out, host.data() + j * row_bytes, (size_t) ids[j] * row_bytes, (k - j + 1) * row_bytes);
-        j = k + 1;
-    }
-
-    auto res = std::make_shared<llama_mtp_draft_vocab>();
-    res->n_keep = n_keep;
-
-    ggml_init_params ip = { 2 * ggml_tensor_overhead(), nullptr, true };
-    res->ctx.reset(ggml_init(ip));
-    res->head = ggml_new_tensor_2d(res->ctx.get(), out->type, out->ne[0], n_sel);
-    res->ids  = ggml_new_tensor_1d(res->ctx.get(), GGML_TYPE_I64, n_sel);
-    ggml_format_name(res->head, "mtp_draft_head_%d", n_keep);
-    ggml_format_name(res->ids,  "mtp_draft_ids_%d",  n_keep);
-    res->buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(res->ctx.get(), buft));
-    if (!res->buf) {
-        LLAMA_LOG_ERROR("%s: mtp_draft_vocab = %d: buffer allocation failed, drafting over the full vocabulary\n", __func__, n_keep);
-        return nullptr;
-    }
-    ggml_backend_buffer_set_usage(res->buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
-    ggml_backend_tensor_set(res->head, host.data(), 0, host.size());
-    ggml_backend_tensor_set(res->ids, ids.data(), 0, ids.size() * sizeof(int64_t));
-
-    LLAMA_LOG_INFO("%s: mtp_draft_vocab = %d: MTP draft head uses %lld of %lld rows (%.2f MiB of %s, %s)\n", __func__, n_keep,
-                   (long long) n_sel, (long long) out->ne[1], (double) (n_sel * row_bytes) / 1048576.0, ggml_type_name(out->type),
-                   ggml_backend_buft_name(buft));
-
-    cache[key] = res;
-
-    return res;
 }
 
 llama_rope_params llama_model::get_rope_params(const llama_cparams & cparams, int il) const {
@@ -3579,44 +3302,11 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
         // checks
         default:
             {
-                // Dense MTP heads use a plain attention KV cache instead of the hybrid wrapper. The qwen4exp
-                // draft head with an indexer runs the same sparse attention as the trunk, so its MTP context
-                // gets an indexer cache (hybrid-idx memory holding only the nextn layer) instead.
+                // Dense MTP heads use a plain attention KV cache instead of the hybrid wrapper.
                 const bool mtp_on_hybrid_qwen =
                     params.ctx_type == LLAMA_CONTEXT_TYPE_MTP &&
                     (arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE ||
-                     arch == LLM_ARCH_BAILINGMOE3 ||
-                     (arch == LLM_ARCH_QWEN4EXP && hparams.indexer_head_size == 0));
-
-                if (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP && arch == LLM_ARCH_QWEN4EXP &&
-                        hparams.indexer_head_size > 0) {
-                    llama_memory_hybrid_idx::layer_filter_cb f_attn =
-                        [&](uint32_t il) { return il >= hparams.n_layer(); };
-                    llama_memory_hybrid_idx::layer_filter_cb f_recr =
-                        [&](uint32_t /*il*/) { return false; };          // the nextn layer is not recurrent
-                    llama_memory_hybrid_idx::layer_filter_cb f_idx =
-                        [&](uint32_t il) { return il >= hparams.n_layer(); };
-                    LLAMA_LOG_INFO("%s: MTP context uses a hybrid-idx memory (sparse draft attention)\n", __func__);
-                    return new llama_memory_hybrid_idx(
-                        /* model             */ *this,
-                        /* no_alloc          */ params.no_alloc,
-                        /* attn_type_k       */ params.type_k,
-                        /* attn_type_v       */ params.type_v,
-                        /* attn_v_trans      */ !cparams.flash_attn,
-                        /* attn_kv_size      */ cparams.n_ctx_seq,
-                        /* attn_n_swa        */ hparams.n_swa,
-                        /* attn_swa_type     */ hparams.swa_type,
-                        /* recurrent_type_k  */ GGML_TYPE_F32,
-                        /* recurrent_type_v  */ GGML_TYPE_F32,
-                        /* recurrent_kv_size */ std::max((uint32_t) 1, cparams.n_seq_max),
-                        /* n_seq_max         */ cparams.n_seq_max,
-                        /* n_rs_seq          */ cparams.n_rs_seq,
-                        /* offload           */ cparams.offload_kqv,
-                        /* unified           */ cparams.kv_unified,
-                        /* filter_attn       */ std::move(f_attn),
-                        /* filter_recr       */ std::move(f_recr),
-                        /* filter_idx        */ std::move(f_idx));
-                }
+                     arch == LLM_ARCH_BAILINGMOE3);
 
                 const bool mtp_on_hybrid_nemotron =
                     params.ctx_type == LLAMA_CONTEXT_TYPE_MTP && arch == LLM_ARCH_NEMOTRON_H_MOE;
@@ -3653,7 +3343,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         filter_idx = [&](uint32_t il) {
                             return il < hparams.n_layer() && !hparams.is_recr(il) && hparams.is_indexer_full(il);
                         };
-                    } else if (arch == LLM_ARCH_FALCON_H1 || arch == LLM_ARCH_INKLING2 || arch == LLM_ARCH_INKLING2_LOOP) {
+                    } else if (arch == LLM_ARCH_FALCON_H1 || arch == LLM_ARCH_INKLING2) {
                         filter_attn = [&](uint32_t) { return true; };
                         filter_recr = [&](uint32_t) { return true; };
                     } else if (arch == LLM_ARCH_NEMOTRON_H || arch == LLM_ARCH_NEMOTRON_H_MOE) {
@@ -3904,7 +3594,6 @@ llama_model_params llama_model_default_params() {
         /*.no_host                     =*/ false,
         /*.no_alloc                    =*/ false,
         /*.load_mtp                    =*/ false,
-        /*.path_ple                    =*/ nullptr,
     };
 
     return result;
@@ -4030,7 +3719,6 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_GLM5_NEXT:
         case LLM_ARCH_STARCODER:
         case LLM_ARCH_INKLING2:
-        case LLM_ARCH_INKLING2_LOOP:
             return LLAMA_ROPE_TYPE_NONE;
 
         // use what we call a normal RoPE, operating on pairs of consecutive head values
@@ -4462,10 +4150,7 @@ llama_model_base::nextn_flags_t llama_model_base::nextn_flags(llama_model_loader
         if (ml.get_weight(tn(trunk_probe, "weight", 0).str().c_str()) == nullptr) {
             trunk = TENSOR_NOT_REQUIRED;
         }
-        // an EXL3 eh_proj is stored as its trellis (llama_model_loader::create_tensor)
-        const std::string eh_proj = tn(LLM_TENSOR_NEXTN_EH_PROJ, "weight", hparams.n_layer()).str();
-        if (ml.get_weight(eh_proj.c_str()) == nullptr &&
-                ml.get_weight((eh_proj.substr(0, eh_proj.size() - strlen("weight")) + "exl3_trellis").c_str()) == nullptr) {
+        if (ml.get_weight(tn(LLM_TENSOR_NEXTN_EH_PROJ, "weight", hparams.n_layer()).str().c_str()) == nullptr) {
             mtp = TENSOR_NOT_REQUIRED;
         }
     }

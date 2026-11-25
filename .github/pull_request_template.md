@@ -42,8 +42,6 @@ Model:      <HF repo / file>, <quant>
 <!-- IMPORTANT: Please do NOT delete this section, otherwise your PR may be rejected -->
 
 - I have read and agree with the [contributing guidelines](CONTRIBUTING.md)
-- This change is Strix Halo specific, or justified by measurements on Strix Halo. General llama.cpp improvements
-  belong in [halo-box/llama.cpp](https://github.com/halo-box/llama.cpp) instead
 - AI usage disclosure: <!-- mention: NO / ASSISTED / AGENT-AUTHORED - and describe how AI was used -->
 - What was NOT verified: <!-- untested backends, unrun tests, hardware you do not have. An honest gap is fine; a silent one is not -->
 

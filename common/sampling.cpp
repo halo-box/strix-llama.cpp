@@ -112,8 +112,6 @@ struct ring_buffer {
 struct common_sampler {
     common_params_sampling params;
 
-    const llama_vocab * vocab; // model the sampler was built for; reuse must not cross models
-
     struct llama_sampler * grmr;
     struct llama_sampler * rbudget;
     struct llama_sampler * chain;
@@ -190,17 +188,37 @@ std::string common_params_sampling::print() const {
     return std::string(result);
 }
 
-// grammar + reasoning-budget constraint construction, shared by common_sampler_init and common_sampler_reuse.
-// throws std::runtime_error on invalid grammar; params is only read (backend_sampling downgrade happens in callers).
-static void common_sampler_build_constraints(
-        const llama_model * model,
-        const common_params_sampling & params,
-        llama_sampler ** grmr_out,
-        llama_sampler ** rbudget_out) {
+struct common_sampler * common_sampler_init(
+        const struct llama_model * model,
+        struct common_params_sampling & params) {
+    if (!std::isfinite(params.penalty_repeat) ||
+        params.penalty_repeat <= 0.0f ||
+        !std::isfinite(1.0f/params.penalty_repeat)) {
+        throw std::invalid_argument("penalty_repeat must be finite and greater than 0");
+    }
+    if (!std::isfinite(params.penalty_freq)) {
+        throw std::invalid_argument("penalty_freq must be finite");
+    }
+    if (!std::isfinite(params.penalty_present)) {
+        throw std::invalid_argument("penalty_present must be finite");
+    }
     const llama_vocab * vocab = llama_model_get_vocab(model);
+    if (!common_grammar_value(params.grammar).empty()) {
+        for (const auto & b : params.logit_bias) {
+            if (b.bias == -INFINITY && llama_vocab_is_eog(vocab, b.token)) {
+                throw std::invalid_argument("EOG tokens cannot be banned when a grammar is set");
+            }
+        }
+    }
+    llama_sampler_chain_params lparams = llama_sampler_chain_default_params();
+
+    lparams.no_perf = params.no_perf;
 
     llama_sampler * grmr = nullptr;
     llama_sampler * rbudget = nullptr;
+    llama_sampler * chain = llama_sampler_chain_init(lparams);
+
+    std::vector<llama_sampler *> samplers;
 
     const std::string & grammar_str = common_grammar_value(params.grammar);
     if (grammar_str.compare(0, 11, "%llguidance") == 0) {
@@ -301,103 +319,20 @@ static void common_sampler_build_constraints(
         }
     }
 
-    // Grammar lazy mode needs the sampler to suppress grammar in a reasoning block.
-    // The master switch gates budget forcing and runtime reasoning control only.
-    const bool reasoning_budget_active =
-        params.reasoning_budget_enabled && (params.reasoning_budget_tokens >= 0 || params.reasoning_control);
-    if (!params.reasoning_budget_start.empty() && !params.reasoning_budget_end.empty() &&
-        (params.grammar_lazy || reasoning_budget_active)) {
-        const int32_t budget_tokens = params.reasoning_budget_tokens < 0 ? INT_MAX : params.reasoning_budget_tokens;
-
-        std::vector<common_reasoning_budget_soft_point> soft_points;
-        auto add_soft_point = [&](float ratio, const llama_tokens & tokens) {
-            if (ratio > 0.0f && !tokens.empty() && budget_tokens != INT_MAX) {
-                const float r = std::min(ratio, 1.0f);
-                soft_points.push_back({ std::max(0, budget_tokens - (int32_t) std::ceil(budget_tokens * r)), tokens });
-            }
-        };
-        add_soft_point(params.reasoning_budget_soft_ratio, params.reasoning_budget_soft_forced);
-        add_soft_point(params.reasoning_budget_soft2_ratio, params.reasoning_budget_soft2_forced);
-
-        const llama_tokens intro_tokens =
-            reasoning_budget_active ? params.reasoning_budget_intro_forced : llama_tokens();
-        rbudget = common_reasoning_budget_init(vocab, { params.reasoning_budget_start }, params.reasoning_budget_end,
-                                               params.reasoning_budget_forced, soft_points, intro_tokens, budget_tokens,
-                                               params.reasoning_budget_grace_tokens, REASONING_BUDGET_IDLE,
-                                               params.reasoning_budget_intro_mode == "once");
+    // reasoning budget sampler (skip when budget is unlimited unless a lazy grammar is active, which needs rbudget for thinking-block suppression)
+    if (!params.reasoning_budget_start.empty() && !params.reasoning_budget_end.empty() && (params.grammar_lazy || params.reasoning_budget_tokens >= 0 || params.reasoning_control)) {
+        rbudget = common_reasoning_budget_init(
+            vocab,
+            {params.reasoning_budget_start},
+            params.reasoning_budget_end,
+            params.reasoning_budget_forced,
+            params.reasoning_budget_tokens < 0 ? INT_MAX : params.reasoning_budget_tokens);
 
         for (const auto & token : prefill_tokens) {
             llama_sampler_accept(rbudget, token);
             LOG_DBG("%s: reasoning-budget accepted prefill token (%d)\n", __func__, token);
-
-            const auto state = common_reasoning_budget_get_state(rbudget);
-            if (state == REASONING_BUDGET_INTRO_FORCING || state == REASONING_BUDGET_SOFT_FORCING ||
-                state == REASONING_BUDGET_FORCING) {
-                break;
-            }
         }
     }
-
-    *grmr_out   = grmr;
-    *rbudget_out = rbudget;
-}
-
-static void common_sampler_apply_backend_sampling_downgrade(
-        common_params_sampling & params,
-        const llama_sampler * grmr,
-        const llama_sampler * rbudget) {
-    if (grmr && params.backend_sampling) {
-        LOG_WRN("%s: backend sampling is not compatible with grammar, disabling\n", __func__);
-
-        params.backend_sampling = false;
-    }
-
-    if (rbudget && params.backend_sampling) {
-        LOG_WRN("%s: backend sampling is not compatible with reasoning budget, disabling\n", __func__);
-
-        params.backend_sampling = false;
-    }
-}
-
-// seed mix shared by init and reuse, so the two rngs cannot drift apart
-static uint32_t common_sampler_rng_seed(const llama_sampler * chain) {
-    return llama_sampler_get_seed(chain) ^ 0x9e3779b9u;
-}
-
-struct common_sampler * common_sampler_init(
-        const struct llama_model * model,
-        struct common_params_sampling & params) {
-    if (!std::isfinite(params.penalty_repeat) ||
-        params.penalty_repeat <= 0.0f ||
-        !std::isfinite(1.0f/params.penalty_repeat)) {
-        throw std::invalid_argument("penalty_repeat must be finite and greater than 0");
-    }
-    if (!std::isfinite(params.penalty_freq)) {
-        throw std::invalid_argument("penalty_freq must be finite");
-    }
-    if (!std::isfinite(params.penalty_present)) {
-        throw std::invalid_argument("penalty_present must be finite");
-    }
-    const llama_vocab * vocab = llama_model_get_vocab(model);
-    if (!common_grammar_value(params.grammar).empty()) {
-        for (const auto & b : params.logit_bias) {
-            if (b.bias == -INFINITY && llama_vocab_is_eog(vocab, b.token)) {
-                throw std::invalid_argument("EOG tokens cannot be banned when a grammar is set");
-            }
-        }
-    }
-    llama_sampler_chain_params lparams = llama_sampler_chain_default_params();
-
-    lparams.no_perf = params.no_perf;
-
-    llama_sampler * grmr = nullptr;
-    llama_sampler * rbudget = nullptr;
-
-    common_sampler_build_constraints(model, params, &grmr, &rbudget);
-
-    llama_sampler * chain = llama_sampler_chain_init(lparams);
-
-    std::vector<llama_sampler *> samplers;
 
     // logit bias: user biases + model suppress tokens (-INFINITY)
     {
@@ -492,11 +427,20 @@ struct common_sampler * common_sampler_init(
         llama_sampler_chain_add(chain, smpl);
     }
 
-    common_sampler_apply_backend_sampling_downgrade(params, grmr, rbudget);
+    if (grmr && params.backend_sampling) {
+        LOG_WRN("%s: backend sampling is not compatible with grammar, disabling\n", __func__);
+
+        params.backend_sampling = false;
+    }
+
+    if (rbudget && params.backend_sampling) {
+        LOG_WRN("%s: backend sampling is not compatible with reasoning budget, disabling\n", __func__);
+
+        params.backend_sampling = false;
+    }
 
     auto * result = new common_sampler {
         /* .params  = */ params,
-        /* .vocab   = */ vocab,
         /* .grmr    = */ grmr,
         /* .rbudget = */ rbudget,
         /* .chain   = */ chain,
@@ -504,7 +448,7 @@ struct common_sampler * common_sampler_init(
         /* .cur     = */ {},
         /* .cur_p   = */ {},
         // mix it, the chain and the draft are seeded from this one too
-        /* .rng     = */ std::mt19937(common_sampler_rng_seed(chain)),
+        /* .rng     = */ std::mt19937(llama_sampler_get_seed(chain) ^ 0x9e3779b9u),
     };
 
     return result;
@@ -520,138 +464,6 @@ void common_sampler_free(struct common_sampler * gsmpl) {
     llama_sampler_free(gsmpl->chain);
 
     delete gsmpl;
-}
-
-static bool common_grammar_equal(const common_grammar & a, const common_grammar & b) {
-    return a.type == b.type && a.grammar == b.grammar;
-}
-
-static bool common_grammar_triggers_equal(const std::vector<common_grammar_trigger> & a, const std::vector<common_grammar_trigger> & b) {
-    if (a.size() != b.size()) {
-        return false;
-    }
-    for (size_t i = 0; i < a.size(); ++i) {
-        if (a[i].type != b[i].type || a[i].value != b[i].value || a[i].token != b[i].token) {
-            return false;
-        }
-    }
-    return true;
-}
-
-static bool logit_bias_equal(const std::vector<llama_logit_bias> & a, const std::vector<llama_logit_bias> & b) {
-    if (a.size() != b.size()) {
-        return false;
-    }
-    for (size_t i = 0; i < a.size(); ++i) {
-        if (a[i].token != b[i].token || a[i].bias != b[i].bias) {
-            return false;
-        }
-    }
-    return true;
-}
-
-// true when both param sets build the same chain, excluding backend_sampling: the effective flag
-// depends on built constraints, so common_sampler_reuse() checks it. covers init()'s fields.
-static bool common_params_sampling_equal(
-        const common_params_sampling & a, const common_params_sampling & b) {
-    return a.seed == b.seed
-        && a.n_probs == b.n_probs
-        && a.n_prev == b.n_prev
-        && a.min_keep == b.min_keep
-        && a.top_k == b.top_k
-        && a.top_p == b.top_p
-        && a.min_p == b.min_p
-        && a.xtc_probability == b.xtc_probability
-        && a.xtc_threshold == b.xtc_threshold
-        && a.typ_p == b.typ_p
-        && a.temp == b.temp
-        && a.dynatemp_range == b.dynatemp_range
-        && a.dynatemp_exponent == b.dynatemp_exponent
-        && a.penalty_last_n == b.penalty_last_n
-        && a.penalty_repeat == b.penalty_repeat
-        && a.penalty_freq == b.penalty_freq
-        && a.penalty_present == b.penalty_present
-        && a.dry_multiplier == b.dry_multiplier
-        && a.dry_base == b.dry_base
-        && a.dry_allowed_length == b.dry_allowed_length
-        && a.dry_penalty_last_n == b.dry_penalty_last_n
-        && a.adaptive_target == b.adaptive_target
-        && a.adaptive_decay == b.adaptive_decay
-        && a.mirostat == b.mirostat
-        && a.top_n_sigma == b.top_n_sigma
-        && a.mirostat_tau == b.mirostat_tau
-        && a.mirostat_eta == b.mirostat_eta
-        && a.no_perf == b.no_perf
-        && a.samplers == b.samplers
-        && a.dry_sequence_breakers == b.dry_sequence_breakers
-        && common_grammar_equal(a.grammar, b.grammar)
-        && a.grammar_lazy == b.grammar_lazy
-        && common_grammar_triggers_equal(a.grammar_triggers, b.grammar_triggers)
-        && logit_bias_equal(a.logit_bias, b.logit_bias)
-        && a.generation_prompt == b.generation_prompt
-        && a.reasoning_budget_enabled == b.reasoning_budget_enabled
-        && a.reasoning_control == b.reasoning_control
-        && a.reasoning_budget_tokens == b.reasoning_budget_tokens
-        && a.reasoning_budget_start == b.reasoning_budget_start
-        && a.reasoning_budget_end == b.reasoning_budget_end
-        && a.reasoning_budget_forced == b.reasoning_budget_forced
-        && a.reasoning_budget_message == b.reasoning_budget_message
-        && a.reasoning_budget_soft_ratio == b.reasoning_budget_soft_ratio
-        && a.reasoning_budget_soft_forced == b.reasoning_budget_soft_forced
-        && a.reasoning_budget_soft_message == b.reasoning_budget_soft_message
-        && a.reasoning_budget_soft2_ratio == b.reasoning_budget_soft2_ratio
-        && a.reasoning_budget_soft2_forced == b.reasoning_budget_soft2_forced
-        && a.reasoning_budget_soft2_message == b.reasoning_budget_soft2_message
-        && a.reasoning_budget_intro_forced == b.reasoning_budget_intro_forced
-        && a.reasoning_budget_grace_tokens == b.reasoning_budget_grace_tokens
-        && a.reasoning_budget_intro_mode == b.reasoning_budget_intro_mode;
-}
-
-bool common_sampler_reuse(common_sampler * gsmpl, const llama_model * model, common_params_sampling & params) {
-    if (!gsmpl || gsmpl->vocab != llama_model_get_vocab(model)) {
-        return false;
-    }
-
-    // compare the plain fields first: building the constraints is the expensive part
-    if (!common_params_sampling_equal(gsmpl->params, params)) {
-        return false;
-    }
-
-    // the effective backend flag comes from the real grmr / rbudget pointers, not from re-derived
-    // presence rules. gsmpl->params.backend_sampling is already the effective flag of the stored chain
-    llama_sampler * grmr = nullptr;
-    llama_sampler * rbudget = nullptr;
-
-    common_sampler_build_constraints(model, params, &grmr, &rbudget);
-
-    const bool backend_effective = params.backend_sampling && !grmr && !rbudget;
-
-    if (gsmpl->params.backend_sampling != backend_effective) {
-        llama_sampler_free(grmr);
-        llama_sampler_free(rbudget);
-        return false;
-    }
-
-    llama_sampler_free(gsmpl->grmr);
-    llama_sampler_free(gsmpl->rbudget);
-
-    gsmpl->grmr    = grmr;
-    gsmpl->rbudget = rbudget;
-
-    common_sampler_apply_backend_sampling_downgrade(params, grmr, rbudget);
-
-    gsmpl->params = params;
-    gsmpl->t_total_us = 0;
-
-    // keep the chain pointer (graph reuse, no sched_reserve); reset() clears prev + per-child state
-    // like a fresh init. grmr / rbudget are rebuilt because their reset() would drop prefill.
-    gsmpl->reset();
-
-    // reset() covers the chain's rng, not gsmpl->rng - the generator speculative decoding uses to
-    // accept/reject drafts. reseed as in common_sampler_init so identical requests stay identical.
-    gsmpl->rng = std::mt19937(common_sampler_rng_seed(gsmpl->chain));
-
-    return true;
 }
 
 static bool grammar_should_apply(struct common_sampler * gsmpl) {
@@ -714,7 +526,6 @@ void common_sampler_reset(struct common_sampler * gsmpl) {
 struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
     return new common_sampler {
         /* .params  = */ gsmpl->params,
-        /* .vocab   = */ gsmpl->vocab,
         /* .grmr    = */ llama_sampler_clone(gsmpl->grmr),
         /* .rbudget = */ llama_sampler_clone(gsmpl->rbudget),
         /* .chain   = */ llama_sampler_clone(gsmpl->chain),
@@ -934,8 +745,6 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct com
     GGML_ASSERT(idxs.size()    == draft.size() + 1 && "idxs.size() must be draft.size() + 1");
     GGML_ASSERT(draft_q.size() == draft.size() && "draft_q must have one entry per draft token");
 
-    const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx));
-
     std::vector<llama_token> result;
     result.reserve(idxs.size());
 
@@ -994,11 +803,6 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct com
         if (q_x > 0.0f && (p_x >= q_x || uni(gsmpl->rng) < p_x / q_x)) {
             common_sampler_accept(gsmpl, draft[i], true);
             result.push_back(draft[i]);
-
-            // stop after an EOG like the greedy verifier: later draft tokens are not output but would stay in the context
-            if (llama_vocab_is_eog(vocab, draft[i]) && i + 1 < draft.size()) {
-                break;
-            }
             continue;
         }
 

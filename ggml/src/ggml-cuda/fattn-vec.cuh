@@ -25,7 +25,7 @@ static __global__ void flash_attn_ext_vec(
         const char * mask_ptr,
         const char * sinks_ptr,
         const int  * KV_max_ptr,
-        GGML_FATTN_KV_ROWS_PARAM
+        const int  * KV_rows_ptr,
         float      * dst_ptr,
         float2     * dst_meta_ptr,
         const float scale,
@@ -40,8 +40,7 @@ static __global__ void flash_attn_ext_vec(
                             const int32_t nb11, const int32_t nb12, const int64_t nb13,
                             const int32_t nb21, const int32_t nb22, const int64_t nb23,
                             const int32_t ne31, const int32_t ne32, const int32_t ne33,
-                            const int32_t nb31, const GGML_FATTN_NB32_T nb32, const int64_t nb33) {
-    GGML_FATTN_KV_ROWS_LOCAL
+                            const int32_t nb31, const int64_t nb32, const int64_t nb33) {
     ggml_cuda_pdl_lc();
 #ifdef FLASH_ATTN_AVAILABLE
     const char * GGML_CUDA_RESTRICT Q        = Q_ptr;
@@ -55,12 +54,7 @@ static __global__ void flash_attn_ext_vec(
     GGML_UNUSED(KV_rows_ptr);
 
     // Skip unused kernel variants for faster compilation:
-#if defined(GGML_USE_HIP)
-    constexpr bool fp8_kv = type_K == GGML_TYPE_F8_E4M3 || type_V == GGML_TYPE_F8_E4M3;
-#else
-    constexpr bool fp8_kv = false;
-#endif // defined(GGML_USE_HIP)
-    if (fp8_kv || (use_logit_softcap && !(D == 128 || D == 256))) {
+    if (use_logit_softcap && !(D == 128 || D == 256)) {
         GGML_UNUSED_VARS(Q, K, V, mask, sinks, KV_max, dst, dst_meta, scale,
             max_bias, m0, m1, n_head_log2, logit_softcap,
             ne00, ne01, ne02, ne03,
@@ -569,7 +563,7 @@ void ggml_cuda_flash_attn_ext_vec_case_impl(ggml_backend_cuda_context & ctx, ggm
     const bool need_f16_K = type_K == GGML_TYPE_F16;
     const bool need_f16_V = type_V == GGML_TYPE_F16;
     constexpr size_t nbytes_shared = 0;
-    launch_fattn<D, cols_per_block, 1, false>(ctx, dst, fattn_kernel, nwarps, nbytes_shared, D, need_f16_K, need_f16_V, false);
+    launch_fattn<D, cols_per_block, 1>(ctx, dst, fattn_kernel, nwarps, nbytes_shared, D, need_f16_K, need_f16_V, false, false);
 }
 
 template <int D, ggml_type type_K, ggml_type type_V>

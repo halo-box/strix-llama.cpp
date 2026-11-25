@@ -310,7 +310,7 @@ public:
 
     // remove seq_id from its cells at positions in [p0, p1)
     // return the lowest index of a cell that becomes empty, or size() if none does
-    uint32_t seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1, std::vector<uint32_t> * freed = nullptr) {
+    uint32_t seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
         assert(seq_id >= 0);
         assert(seq_id < LLAMA_MAX_SEQ);
 
@@ -323,14 +323,7 @@ public:
 
             if (seq_rm(i, seq_id)) {
                 res = std::min(res, i);
-                if (freed) {
-                    freed->push_back(i);
-                }
             }
-        }
-
-        if (freed) {
-            std::sort(freed->begin(), freed->end());
         }
 
         return res;

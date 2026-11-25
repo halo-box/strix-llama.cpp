@@ -39,12 +39,6 @@ else()
     if(GPU_TARGETS AND NOT CMAKE_HIP_ARCHITECTURES)
         set(CMAKE_HIP_ARCHITECTURES ${GPU_TARGETS})
     endif()
-
-    # This fork only supports Strix Halo (gfx1151), also covering Gorgon Halo.
-    # Without this, cmake/clang defaults to the full ROCm arch list.
-    if(NOT DEFINED CMAKE_HIP_ARCHITECTURES)
-        set(CMAKE_HIP_ARCHITECTURES "gfx1151")
-    endif()
     cmake_minimum_required(VERSION 3.21)
     enable_language(HIP)
 endif()
@@ -79,18 +73,10 @@ list(APPEND GGML_SOURCES_ROCM ${SRCS})
 ggml_cuda_fattn_vec_instances(${CMAKE_CURRENT_SOURCE_DIR}/../ggml-cuda SRCS)
 list(APPEND GGML_SOURCES_ROCM ${SRCS})
 
-if (NOT GGML_EXL3)
-    list(FILTER GGML_SOURCES_ROCM EXCLUDE REGEX "/ggml-cuda/exl3\\.cu$")
-endif()
-
 ggml_add_backend_library(ggml-hip
                          ${GGML_HEADERS_ROCM}
                          ${GGML_SOURCES_ROCM}
                         )
-
-if (GGML_EXL3)
-    target_compile_definitions(ggml-hip PRIVATE GGML_USE_EXL3)
-endif()
 
 # TODO: do not use CUDA definitions for HIP
 if (NOT GGML_BACKEND_DL)

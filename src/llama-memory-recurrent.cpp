@@ -677,18 +677,8 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
         if (ubatch.n_pos == 1 && cell.pos >= 0 && last_pos != cell.pos + (llama_pos) n_seq_tokens) {
             // What should happen when the pos backtracks or skips a value?
             // Clearing the state mid-batch would require special-casing which isn't done.
-            // A hybrid model that filters out every recurrent layer leaves this cache with no tensors.
-            // The hybrid then skips seq_rm on it, so its positions are never rewound and a rejected
-            // speculative draft trips this on every step - with no state to be inconsistent about.
-            bool has_state = false;
-            for (ggml_tensor * t : r_l) { if (t) { has_state = true; break; } }
-            if (!has_state) {
-                for (ggml_tensor * t : s_l) { if (t) { has_state = true; break; } }
-            }
-            if (has_state) {
-                LLAMA_LOG_WARN("%s: non-consecutive token position %d after %d for sequence %d with %u new tokens\n",
-                    __func__, last_pos, cell.pos, ubatch.seq_id[i][0], n_seq_tokens);
-            }
+            LLAMA_LOG_WARN("%s: non-consecutive token position %d after %d for sequence %d with %u new tokens\n",
+                __func__, last_pos, cell.pos, ubatch.seq_id[i][0], n_seq_tokens);
         }
         cell.pos = last_pos;
         cell.rs_max = n_seq_tokens <= n_rs_seq + 1 ? n_seq_tokens - 1 : 0;
@@ -1376,20 +1366,6 @@ ggml_tensor * llama_memory_recurrent_context::get_s_l(int32_t il) const {
 
 ggml_tensor * llama_memory_recurrent_context::get_p_l(int32_t il) const {
     return mem->p_l[il];
-}
-
-bool llama_memory_recurrent_context::is_s_copy_main_identity(uint32_t n_seqs) const {
-    // with n_rs_seq == 0, s_copy(i) is cells[head + i].src0
-    if (is_full || mem->n_rs_seq > 0 || n_seqs > get_n_rs()) {
-        return false;
-    }
-    for (uint32_t i = 0; i < n_seqs; ++i) {
-        const uint32_t cell = mem->head + i;
-        if (mem->cells[cell].src0 != (int32_t) cell) {
-            return false;
-        }
-    }
-    return true;
 }
 
 int32_t llama_memory_recurrent_context::s_copy(int i) const {

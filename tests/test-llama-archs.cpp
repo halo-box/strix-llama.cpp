@@ -9,7 +9,6 @@
 #include "../src/llama-ext.h"
 
 #include <algorithm>
-#include <array>
 #include <cinttypes>
 #include <cmath>
 #include <cstddef>
@@ -20,7 +19,6 @@
 #include <memory>
 #include <random>
 #include <regex>
-#include <set>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -178,9 +176,6 @@ static void usage(char ** argv) {
     LOG("  -o, --out <dir>          Save generated test models to <dir> instead of running backend tests\n");
     LOG("  -v <N>                   Set log verbosity level\n");
     LOG("  -b, --backend <backend>  Run only on the given backend device\n");
-    LOG("  --mtp-cache-only        Test Qwen4Exp MTP cache growth on CPU and on the first ROCm and Vulkan devices\n");
-    LOG("  --qwen4exp-merged       Test that a Qwen4Exp file with merged shared-input weights gives the logits of the separate weights\n");
-    LOG("  --qwen35-merged         The same for a Qwen3.5 file\n");
     LOG("  --kv-shift               Check K-shift against a decode at the shifted positions (CPU only)\n");
     LOG("  -h, --help               Show this help message\n\n");
     LOG("Examples:\n");
@@ -331,7 +326,7 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
         n_vocab = 3072; // TODO: should be 4096, but user code cannot get `n_vocab_out` yet [TAG_LLAMA_N_VOCAB_OUT]
     } else if (arch == LLM_ARCH_HRM_TEXT) {
         n_layer = 6; // 1 layer per stack x 2 h-cycles x (2 l-cycles + 1) cache slots
-    } else if (arch == LLM_ARCH_INKLING2 || arch == LLM_ARCH_INKLING2_LOOP) {
+    } else if (arch == LLM_ARCH_INKLING2) {
         n_embd  = 128;
         n_head  = 4;
         n_ff    = 24;
@@ -701,8 +696,7 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
         ms.add_kv(LLM_KV_MUDD_TAP_INDICES,            std::vector<int32_t>({-1, -1, -1, -1, 0, 2, 1, 3}));
     }
 
-    if (arch == LLM_ARCH_INKLING2 || arch == LLM_ARCH_INKLING2_LOOP) {
-        const bool loop = arch == LLM_ARCH_INKLING2_LOOP;
+    if (arch == LLM_ARCH_INKLING2) {
         ms.add_kv(LLM_KV_ATTENTION_RELATIVE_LENGTH,   uint32_t(4));
         ms.add_kv(LLM_KV_ATTENTION_RELATIVE_EXTENT,   uint32_t(16));
         ms.add_kv(LLM_KV_ATTENTION_QK_CLIP,           0.25f);
@@ -710,14 +704,6 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
         ms.add_kv(LLM_KV_ATTENTION_LOG_SCALE_FLOOR,   uint32_t(4));
         ms.add_kv(LLM_KV_ATTENTION_LOG_SCALE_ALPHA,   0.1f);
         ms.add_kv(LLM_KV_ATTN_RES_BLOCK_SIZE,         uint32_t(2));
-        if (loop) {
-            // prelude 0, core 1, coda 2; the loader adds slot 3 for the second pass over the core
-            ms.add_kv(LLM_KV_LOOP_START,     uint32_t(1));
-            ms.add_kv(LLM_KV_LOOP_END,       uint32_t(2));
-            ms.add_kv(LLM_KV_LOOP_COUNT,     uint32_t(2));
-            ms.add_kv(LLM_KV_LOOP_GATE_RANK, uint32_t(8));
-            ms.add_kv(LLM_KV_LOOP_VARYING,   false);
-        }
         ms.add_kv(LLM_KV_SHORTCONV_L_CACHE,           uint32_t(4));
         ms.add_kv(LLM_KV_VOCAB_SIZE,                  n_vocab + 2);
         ms.add_kv(LLM_KV_VOCAB_SIZE_UNPADDED,         n_vocab);
@@ -833,8 +819,7 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
     ms.add_kv(LLM_KV_WKV_HEAD_SIZE,               n_embd/n_head);
     ms.add_kv(LLM_KV_SHORTCONV_L_CACHE,           uint32_t(3));
     ms.add_kv(LLM_KV_RESIDUAL_SCALE,              3.5565588200778455f);
-    // the inkling2_loop core boundaries must be multiples of the block size
-    ms.add_kv(LLM_KV_ATTN_RES_BLOCK_SIZE,         uint32_t(arch == LLM_ARCH_INKLING2_LOOP ? 1 : 12));
+    ms.add_kv(LLM_KV_ATTN_RES_BLOCK_SIZE,         uint32_t(12));
     ms.add_kv(LLM_KV_ACTIVATION_SITU_BETA,        4.0f);
     ms.add_kv(LLM_KV_ACTIVATION_SITU_LINEAR_BETA, 25.0f);
     ms.add_kv(LLM_KV_KDA_GATE_LOWER_BOUND,        -5.0f);
@@ -859,127 +844,9 @@ static bool silent_model_load_progress(float /*progress*/, void * /*user_data*/)
     return true;
 }
 
-// dev == nullptr: CPU
-static void test_mtp_cache_only_dev(ggml_backend_dev_t dev, const size_t seed, const float stdev) {
-    gguf_context_ptr meta = get_gguf_ctx(LLM_ARCH_QWEN4EXP, true);
-    const uint32_t sections[] = { 8, 8, 0, 0 };
-    gguf_set_val_u32(meta.get(), "qwen4exp.nextn_predict_layers", 1);
-    gguf_set_val_u32(meta.get(), "qwen4exp.context_length", 4096);
-    gguf_set_val_u32(meta.get(), "qwen4exp.embedding_length", 32);
-    gguf_set_val_u32(meta.get(), "qwen4exp.attention.head_count", 1);
-    gguf_set_val_u32(meta.get(), "qwen4exp.attention.head_count_kv", 1);
-    gguf_set_val_u32(meta.get(), "qwen4exp.attention.key_length", 32);
-    gguf_set_val_u32(meta.get(), "qwen4exp.attention.value_length", 32);
-    gguf_set_val_u32(meta.get(), "qwen4exp.rope.dimension_count", 32);
-    gguf_set_arr_data(meta.get(), "qwen4exp.rope.dimension_sections", GGUF_TYPE_UINT32, sections, 4);
-    gguf_set_val_u32(meta.get(), "qwen4exp.attention.indexer.head_count", 1);
-    gguf_set_val_u32(meta.get(), "qwen4exp.attention.indexer.key_length", 32);
-    gguf_set_val_u32(meta.get(), "qwen4exp.attention.indexer.top_k", 8);
-    gguf_set_arr_data(meta.get(), "qwen4exp.ple.layers", GGUF_TYPE_UINT32, nullptr, 0);
-
-    ggml_backend_dev_t devices[] = { dev, nullptr };
-    llama_model_params mp = llama_model_default_params();
-    mp.devices = devices;
-    if (dev == nullptr) {
-        mp.n_gpu_layers = 0;
-    }
-    mp.use_extra_bufts = false;
-    mp.load_mtp = true;
-    tensor_data_params data = { seed, stdev };
-    llama_model_ptr model(llama_model_init_from_user(meta.get(), set_tensor_data, &data, mp));
-    GGML_ASSERT(model);
-
-    struct observations {
-        int stores = 0;
-        int queries = 0;
-    } seen[2];
-    llama_context_params cp = llama_context_default_params();
-    cp.n_ctx = cp.n_batch = cp.n_ubatch = 4096;
-    cp.n_seq_max = 1;
-    cp.n_rs_seq = 0;
-    cp.n_threads = cp.n_threads_batch = 4;
-    cp.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
-    cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
-    cp.cb_eval = [](ggml_tensor * t, bool ask, void * opaque) {
-        if (!ask) { return false; }
-        auto & seen = *static_cast<observations *>(opaque);
-        if (strstr(t->name, "indexer_q-") != nullptr) { ++seen.queries; }
-        if (t->op == GGML_OP_SET_ROWS && t->src[1]->type == GGML_TYPE_I64) {
-            auto * ids = t->src[1];
-            std::vector<int64_t> rows(ggml_nelements(ids));
-            ggml_backend_tensor_get(ids, rows.data(), 0, ggml_nbytes(ids));
-            for (const int64_t row : rows) { GGML_ASSERT(row >= 0 && row < t->ne[1]); }
-            ++seen.stores;
-        }
-        return false;
-    };
-
-    std::vector<uint8_t> states[2];
-    std::vector<float> logits[2];
-    const std::vector<float> hidden(llama_model_n_embd_out(model.get()), 0.125f);
-    const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model.get()));
-    for (int pruned = 0; pruned < 2; ++pruned) {
-        cp.cb_eval_user_data = &seen[pruned];
-        llama_context_ptr ctx(llama_init_from_model(model.get(), cp));
-        GGML_ASSERT(ctx);
-        llama_set_embeddings_nextn(ctx.get(), true, pruned != 0);
-        llama_batch_ext_ptr batch(llama_batch_ext_init(ctx.get()));
-        const auto run = [&](int first, int count, bool output) {
-            llama_batch_ext_clear(batch.get());
-            for (int i = first; i < first + count; ++i) {
-                const int idx = llama_batch_ext_add_token(batch.get(), 0, i % n_vocab);
-                const llama_pos pos[] = { i, i, i, 0 };
-                GGML_ASSERT(idx >= 0);
-                GGML_ASSERT(llama_batch_ext_set_pos(batch.get(), idx, pos));
-                GGML_ASSERT(llama_batch_ext_set_embd_state(batch.get(), idx, { hidden.data(), 1, hidden.size() }));
-                llama_batch_ext_set_output_logits(batch.get(), idx, output);
-            }
-            GGML_ASSERT(llama_process(ctx.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get()) == 0);
-        };
-        // Three equal catch-ups grow metadata without changing incremental-pooling shapes.
-        for (int first = 0; first < 1536; first += 512) { run(first, 512, false); }
-        GGML_ASSERT(seen[pruned].stores == 11);
-        GGML_ASSERT(pruned ? seen[pruned].queries == 0 : seen[pruned].queries > 0);
-        const auto save = [&] {
-            std::vector<uint8_t> state(llama_state_seq_get_size(ctx.get(), 0));
-            GGML_ASSERT(llama_state_seq_get_data(ctx.get(), state.data(), state.size(), 0) == state.size());
-            states[pruned].insert(states[pruned].end(), state.begin(), state.end());
-        };
-        save();
-        llama_set_embeddings_nextn(ctx.get(), true, true);
-        for (int i = 1536; i < 1540; ++i) {
-            run(i, 1, true);
-            const float * output = llama_get_logits_ith(ctx.get(), 0);
-            GGML_ASSERT(output);
-            for (int j = 0; j < n_vocab; ++j) { GGML_ASSERT(std::isfinite(output[j])); }
-            logits[pruned].insert(logits[pruned].end(), output, output + n_vocab);
-        }
-        save();
-    }
-    GGML_ASSERT(states[0] == states[1]);
-    GGML_ASSERT(logits[0].size() == logits[1].size());
-    GGML_ASSERT(memcmp(logits[0].data(), logits[1].data(), logits[0].size()*sizeof(float)) == 0);
-    LOG("PASS: Qwen4Exp MTP cache-only growth, row bounds, cache bytes and four continuation logits match the full graph (%s)\n", dev ? ggml_backend_dev_name(dev) : "CPU");
-}
-
-static int test_mtp_cache_only(const size_t seed, const float stdev) {
-    test_mtp_cache_only_dev(nullptr, seed, stdev);
-    for (const char * backend : { "ROCm", "Vulkan" }) {
-        for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
-            ggml_backend_dev_t dev = ggml_backend_dev_get(i);
-            if (strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev)), backend) == 0) {
-                test_mtp_cache_only_dev(dev, seed, stdev);
-                break;
-            }
-        }
-    }
-    return 0;
-}
-
 static std::string get_tmp_gguf_path() {
-    static const std::string run = std::to_string(std::random_device{}());
     static size_t id = 0;
-    return (std::filesystem::temp_directory_path() / ("test-llama-archs-" + run + "-" + std::to_string(++id) + ".gguf")).string();
+    return (std::filesystem::temp_directory_path() / ("test-llama-archs-" + std::to_string(++id) + ".gguf")).string();
 }
 
 static llama_model_ptr get_model(
@@ -1152,88 +1019,6 @@ static bool check_causal_attn_toggle(
     return ok;
 }
 
-// a qwen35 / qwen4exp file whose shared-input weights are merged as the upstream converter writes them gives the same logits
-static int test_merged_weights(const llm_arch arch, const char * arch_name, const size_t seed, const float stdev) {
-    gguf_context_ptr meta = get_gguf_ctx(arch, true);
-    llama_model_ptr model = get_model(meta.get(), nullptr, seed, stdev, {});
-    const std::string path_sep = get_tmp_gguf_path();
-    const std::string path_mrg = get_tmp_gguf_path();
-    llama_model_save_to_file(model.get(), path_sep.c_str());
-    model.reset();
-
-    ggml_context * ctx_data = nullptr;
-    gguf_context_ptr in(gguf_init_from_file(path_sep.c_str(), { false, &ctx_data }));
-    GGML_ASSERT(in && ctx_data != nullptr);
-    ggml_context_ptr ctx_data_ptr(ctx_data);
-    ggml_context_ptr ctx_mrg(ggml_init({ ggml_get_mem_size(ctx_data), nullptr, false }));
-
-    const std::vector<std::array<const char *, 3>> merges = {
-        {{ "hc_attn_down", "hc_attn_inject", "hc_attn_down_inject" }},
-        {{ "hc_ffn_down",  "hc_ffn_inject",  "hc_ffn_down_inject"  }},
-        {{ "attn_qkv",     "attn_gate",      "attn_qkv_gate"       }},
-        {{ "ssm_beta",     "ssm_alpha",      "ssm_beta_alpha"      }},
-    };
-    gguf_context_ptr out(gguf_init_empty());
-    gguf_set_kv(out.get(), in.get());
-    std::set<std::string> merged_parts;
-    for (int64_t i = 0; i < gguf_get_n_tensors(in.get()); i++) {
-        const std::string name = gguf_get_tensor_name(in.get(), i);
-        int il = -1;
-        char part[64] = {};
-        if (sscanf(name.c_str(), "blk.%d.%63[a-z_]", &il, part) == 2 && name == string_format("blk.%d.%s.weight", il, part)) {
-            for (const auto & m : merges) {
-                const std::string b = string_format("blk.%d.%s.weight", il, m[1]);
-                if (strcmp(part, m[0]) == 0 && ggml_get_tensor(ctx_data, b.c_str()) != nullptr) {
-                    merged_parts.insert(b);
-                }
-            }
-        }
-    }
-    int n_merged = 0;
-    for (int64_t i = 0; i < gguf_get_n_tensors(in.get()); i++) {
-        const std::string name = gguf_get_tensor_name(in.get(), i);
-        if (merged_parts.count(name) > 0) {
-            continue;
-        }
-        ggml_tensor * t = ggml_get_tensor(ctx_data, name.c_str());
-        int il = -1;
-        char part[64] = {};
-        if (sscanf(name.c_str(), "blk.%d.%63[a-z_]", &il, part) == 2 && name == string_format("blk.%d.%s.weight", il, part)) {
-            for (const auto & m : merges) {
-                ggml_tensor * b = ggml_get_tensor(ctx_data, string_format("blk.%d.%s.weight", il, m[1]).c_str());
-                if (strcmp(part, m[0]) != 0 || b == nullptr) {
-                    continue;
-                }
-                ggml_tensor * ab = ggml_new_tensor_2d(ctx_mrg.get(), t->type, t->ne[0], t->ne[1] + b->ne[1]);
-                ggml_set_name(ab, string_format("blk.%d.%s.weight", il, m[2]).c_str());
-                memcpy(ab->data, t->data, ggml_nbytes(t));
-                memcpy((char *) ab->data + ggml_nbytes(t), b->data, ggml_nbytes(b));
-                t = ab;
-                n_merged++;
-                break;
-            }
-        }
-        gguf_add_tensor(out.get(), t);
-    }
-    GGML_ASSERT(n_merged > 0);
-    gguf_write_to_file(out.get(), path_mrg.c_str(), false);
-
-    std::vector<std::vector<float>> logits;
-    for (const std::string & path : { path_sep, path_mrg }) {
-        FILE * file = fopen(path.c_str(), "rb");
-        GGML_ASSERT(file != nullptr);
-        auto mc = get_model_and_ctx(nullptr, file, seed, stdev, {});
-        const std::vector<llama_token> tokens = get_tokens(16, llama_vocab_n_tokens(llama_model_get_vocab(mc.first.get())), seed);
-        logits.push_back(get_logits(mc.first.get(), mc.second.get(), tokens));
-        fclose(file);
-        std::filesystem::remove(path);
-    }
-    GGML_ASSERT(logits[0].size() == logits[1].size());
-    GGML_ASSERT(memcmp(logits[0].data(), logits[1].data(), logits[0].size()*sizeof(float)) == 0);
-    LOG("PASS: %s with %d merged shared-input weights gives the logits of the separate weights\n", arch_name, n_merged);
-    return 0;
-}
-
 // speculative decoding: each step decodes a token and 0 to n_draft_max drafts, then rejects the drafts
 // the logits of the token must match a decode without drafts
 static double check_draft_rollback(llama_model * model, const std::vector<llama_token> & tokens, const std::vector<float> & logits_ref) {
@@ -1351,7 +1136,6 @@ static bool moe_mandatory(const llm_arch arch) {
         case LLM_ARCH_METIS16:
         case LLM_ARCH_ZONOS3:
         case LLM_ARCH_INKLING2:
-        case LLM_ARCH_INKLING2_LOOP:
             return true;
         default:
             return false;
@@ -2110,9 +1894,6 @@ int main(int argc, char ** argv) {
     float stdev = 0.1f;
     std::string out;
     const char * target_backend = nullptr;
-    bool mtp_cache_only = false;
-    bool qwen4exp_merged = false;
-    bool qwen35_merged = false;
     bool kv_shift = false;
 
     int verbosity = LOG_LEVEL_ERROR;
@@ -2140,12 +1921,6 @@ int main(int argc, char ** argv) {
                 usage(argv);
                 return 1;
             }
-        } else if (strcmp(argv[i], "--mtp-cache-only") == 0) {
-            mtp_cache_only = true;
-        } else if (strcmp(argv[i], "--qwen4exp-merged") == 0) {
-            qwen4exp_merged = true;
-        } else if (strcmp(argv[i], "--qwen35-merged") == 0) {
-            qwen35_merged = true;
         } else if (strcmp(argv[i], "-s") == 0 || strcmp(argv[i], "--seed") == 0) {
             if (i + 1 < argc) {
                 seed = std::stoull(argv[++i]);
@@ -2204,15 +1979,6 @@ int main(int argc, char ** argv) {
     init_normal_pool(seed, stdev);
 
     try {
-        if (mtp_cache_only) {
-            return test_mtp_cache_only(seed, stdev);
-        }
-        if (qwen4exp_merged) {
-            return test_merged_weights(LLM_ARCH_QWEN4EXP, "qwen4exp", seed, stdev);
-        }
-        if (qwen35_merged) {
-            return test_merged_weights(LLM_ARCH_QWEN35, "qwen35", seed, stdev);
-        }
         if (!out.empty()) {
             return save_models(arch_filter, seed, stdev, verbosity, out);
         }

@@ -7,8 +7,6 @@
 // note: almost all graphs require at least sqrtf, so include cmath globally
 #include <cmath>
 #include <map>
-#include <mutex>
-#include <vector>
 
 class llama_memory_hybrid_idx_context;
 
@@ -2450,77 +2448,11 @@ struct llama_model_inkling2 : public llama_model_base {
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
 
-    // the layers stored in the file
-    virtual int n_layer_phys() const { return hparams.n_layer(); }
-
-    // message controllers of the q, k, v and ffn inputs of a looped layer (inkling2_loop)
-    enum { LOOP_CTRL_Q, LOOP_CTRL_K, LOOP_CTRL_V, LOOP_CTRL_FFN, LOOP_CTRL_COUNT };
-
-    struct loop_layer {
-        ggml_tensor * msg_query = nullptr;
-        ggml_tensor * ctrl_down[LOOP_CTRL_COUNT]   = {};
-        ggml_tensor * ctrl_gain[LOOP_CTRL_COUNT]   = {};
-        ggml_tensor * ctrl_forget[LOOP_CTRL_COUNT] = {};
-    };
-
     struct graph : public llm_graph_context {
         graph(const llm_graph_params & params);
         ggml_tensor * mix(const std::vector<ggml_tensor *> & blocks, ggml_tensor * cur, ggml_tensor * query);
         ggml_tensor * clip(ggml_tensor * cur, ggml_tensor * scale, float threshold);
-        ggml_tensor * convolve(
-                ggml_tensor * cur,
-                ggml_tensor * weight,
-                ggml_tensor * dynamic,
-                ggml_tensor * state,
-                ggml_tensor * history,
-                llm_graph_input_rs * inp,
-                int64_t offset);
-        ggml_tensor * control(ggml_tensor * cur, ggml_tensor * message, const loop_layer & loop, int ctrl);
-
-    protected:
-        // the helpers alone, a derived graph builds its own body
-        struct no_build {};
-        graph(const llm_graph_params & params, no_build) : llm_graph_context(params) {}
-
-        // the inputs and the token embeddings
-        ggml_tensor * build_inputs();
-        // cache slot il of physical layer ip; messages [n_embd, LOOP_CTRL_COUNT, n_tokens] are mixed into its inputs
-        ggml_tensor * build_layer(int il, int ip, ggml_tensor * cur, std::vector<ggml_tensor *> & blocks,
-                ggml_tensor * messages = nullptr, const loop_layer * loop = nullptr);
-        void build_output(ggml_tensor * cur, const std::vector<ggml_tensor *> & blocks);
-
-        llm_graph_input_mem_hybrid_iswa_rel * inp  = nullptr;
-        llm_graph_input_attn_kv_iswa        * attn = nullptr;
-        llm_graph_input_rs                  * recr = nullptr;
-
-        ggml_tensor * inp_out_ids = nullptr;
-        ggml_tensor * tau         = nullptr; // log-scaled positions
-    };
-
-    std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
-};
-
-// the cache slots after the physical layers repeat the core [core_start, core_end) for each later pass
-struct llama_model_inkling2_loop : public llama_model_inkling2 {
-    llama_model_inkling2_loop(const struct llama_model_params & params) : llama_model_inkling2(params) {}
-    void load_arch_hparams(llama_model_loader & ml) override;
-    void load_arch_tensors(llama_model_loader & ml) override;
-
-    int n_layer_phys() const override { return n_phys; }
-    int layer_phys(int il) const;
-
-    int      n_phys     = 0;
-    uint32_t core_start = 0;
-    uint32_t core_end   = 0;
-    uint32_t n_passes   = 0;
-    uint32_t gate_rank  = 0;
-    bool     varying    = false; // trained for a varying number of passes
-
-    // indexed by physical layer - core_start
-    std::vector<loop_layer> loop_layers;
-
-    struct graph : public llama_model_inkling2::graph {
-        graph(const llm_graph_params & params);
+        ggml_tensor * convolve(ggml_tensor * cur, ggml_tensor * weight, ggml_tensor * dynamic, ggml_tensor * state, ggml_tensor * history, llm_graph_input_rs * inp, int64_t offset);
     };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
@@ -2861,60 +2793,35 @@ struct llama_model_clef : public llama_model_qwen35 {
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
 };
 
-struct llama_ple_disk;
-
 struct llama_model_qwen4exp : public llama_model_base {
     llama_model_qwen4exp(const struct llama_model_params & params) : llama_model_base(params) {}
 
-    class llm_graph_input_qsa;
-    class llm_graph_input_qsa_k;
-
-    // Set when the n-gram table is left on disk (--lazy-mode on-direct): per_layer_tok_embd is
-    // counted as created but never allocated, mapped or read, and build_ple takes its
-    // rows from this reader instead of ggml_get_rows.
-    std::shared_ptr<llama_ple_disk> ple_disk;
-    // a bf16 matmul weight left after load keeps the hc mixed stream f32; counted once, on the first graph
-    mutable std::once_flag bf16_mm_once;
-    mutable bool           bf16_mm = false;
-    // once per model: the fit probe loads its own model, with its logs demoted to debug
-    mutable std::once_flag qsa_depth_warn_once;
-
-    // An EXL3 n-gram table: per_layer_tok_embd is its I16 trellis, one ring of ple_exl3_k bits per element and row,
-    // and every row adds the F16 bias [ple_head_dim, ple_n_heads] of its hash head. Rows are decoded as they are gathered.
-    ggml_tensor * ple_exl3_bias = nullptr;
-    int32_t       ple_exl3_k    = 0;
+    class llm_graph_input_kpool;
 
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
 
-    bool load_tensors(llama_model_loader & ml) override;
-
-    // bf16 twins of the f32 weights decode reads as mat-vecs, made at load where the values are bf16-exact
-    // (LLAMA_BF16_TWINS=0 disables); bf16_twin() returns nullptr for a weight without one
-    void load_bf16_twins();
-    ggml_tensor * bf16_twin(const ggml_tensor * w) const;
-    std::map<const ggml_tensor *, ggml_tensor *> bf16_twins;
-    std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> bf16_twin_bufs;
-
-    // the PLE rows of the batch gathered one ubatch ahead on a worker thread (LLAMA_PLE_ASYNC=0: page-cache advice only)
-    void prefetch_begin(std::unique_ptr<llama_model_prefetch> & state, const llama_batch & batch, uint32_t n_ubatch) const override;
-    void prefetch_end(llama_model_prefetch * state) const override;
-
     struct graph : public llm_build_delta_net_base {
         graph(const llm_graph_params & params);
     protected:
-        // members only, no trunk: graph_mtp builds its own single block
-        graph(const llm_graph_params & params, bool mtp);
+        // the helpers alone, graph_mtp builds its own body
+        struct no_build {};
+        graph(const llm_graph_params & params, no_build) :
+            llm_build_delta_net_base(params) {}
 
         // HC replaces every layer norm: residual is [n_embd, hc, n_tokens]
-        ggml_tensor * build_hc_mix(
+        struct hc_mix {
+            ggml_tensor * cur;     // the mixed [n_embd, T] stream
+            ggml_tensor * inject;  // [hc, T] scatter weights, null when the inject weights are null
+        };
+
+        hc_mix build_hc_mix(
                     ggml_tensor * x,
                     ggml_tensor * w_norm,
                     ggml_tensor * w_down,
                     ggml_tensor * w_up,
                     ggml_tensor * w_inject,
                     ggml_tensor * w_down_inject, // [w_down | w_inject] in one weight, can be null
-                    ggml_tensor ** inject,
                             int   il);
 
         ggml_tensor * build_hc_combine(
@@ -2923,54 +2830,35 @@ struct llama_model_qwen4exp : public llama_model_base {
                     ggml_tensor * inject,
                             int   il);
 
-        // q_first > 0 (LLAMA_FN_LAST_ATTN_TRIM, the last layer only): queries, indexer queries, selection and attention for
-        // rows [q_first, n_tokens) only; K/V and the indexer keys of every row are still stored. When the trim is taken,
-        // *tile_out_ids gets the output rows relative to q_first (the returned tensor has n_tokens - q_first rows).
         ggml_tensor * build_layer_attn(
               llm_graph_input_attn_kv * inp_attn,
   const llama_memory_hybrid_idx_context * mctx_hyb,
+          llm_graph_input_kpool * inp_kpool,
                     ggml_tensor * cur,
                     ggml_tensor * inp_pos,
-                            int * sections,
-                            int   il,
-                        int64_t   q_first = 0,
-                    ggml_tensor ** tile_out_ids = nullptr,
-                           bool   cache_only = false);
+                            int   il);
 
-        // dense self-attention restricted to the cells that top_k names
+        // dense self-attention over the cells the QSA mask keeps
         ggml_tensor * build_attn_qsa(
         llm_graph_input_attn_kv * inp,
                     ggml_tensor * q_cur,
                     ggml_tensor * k_cur,
                     ggml_tensor * v_cur,
-                    ggml_tensor * top_k,
+                    ggml_tensor * sel,
+                        int64_t   n_sel,
                           float   kq_scale,
                             int   il);
 
-        // the QSA cache layout inputs do not depend on the layer, only on its compress ratio,
-        // so the layers sharing a ratio share one input set
-        std::map<uint32_t, llm_graph_input_qsa *> qsa_inps;
-        llm_graph_input_qsa_k * qsa_k_inp = nullptr;
+        // the QSA layers share one set of k-pool inputs, see llama_memory_hybrid_idx
+        llm_graph_input_kpool * build_inp_kpool(const llama_memory_hybrid_idx_context * mctx_hyb);
 
-        // QSA: store this ubatch's raw indexer keys in the indexer cache (no selection)
-        void build_qsa_store_k(
+        // QSA: the additive mask [n_kv, n_tokens] of the top blocks and the tail
+        ggml_tensor * build_qsa_sel(
   const llama_memory_hybrid_idx_context * mctx_hyb,
-                    ggml_tensor * cur,
-                            int   il);
-
-        // QSA: token indices this layer's queries may attend to, or nullptr for dense
-        // q_first > 0: the selection for query rows [q_first, n_tokens) only (q_first a multiple of the score strip),
-        // with q_pos their positions; the indexer keys of every row are stored as before
-        ggml_tensor * build_qsa_top_k(
-  const llama_memory_hybrid_idx_context * mctx_hyb,
+          llm_graph_input_kpool * inp_kpool,
                     ggml_tensor * cur,
                     ggml_tensor * inp_pos,
-                    ggml_tensor * kq_mask,
-                            int * sections,
-                            int   il,
-                        int64_t   q_first = 0,
-                    ggml_tensor * q_pos = nullptr,
-                           bool   cache_only = false);
+                            int   il);
 
         ggml_tensor * build_layer_attn_linear(
              llm_graph_input_rs * inp,
@@ -2989,12 +2877,6 @@ struct llama_model_qwen4exp : public llama_model_base {
 
         // build_rs writes the state tensor in place, so one gather per cache tensor is reused
         std::map<ggml_tensor *, ggml_tensor *> rs_rows;
-
-        // padded f16 destinations (LLAMA_HC_XN_PAD / LLAMA_GDN_NORM_PAD), one per graph: graph leaves are allocated before the
-        // first node, so per-layer buffers would all stay resident (2.8 GB of Flash-Next's 5.3 GB compute buffer at ub 2048)
-        ggml_tensor * hc_xn_pad_buf    = nullptr;
-        ggml_tensor * gdn_norm_pad_buf = nullptr;
-        ggml_tensor * pad_buf(ggml_tensor ** slot, int64_t ne0, int64_t ne1, const char * name);
 
         // one conv history per cache tensor: delta-net and PLE each have their own
         ggml_tensor * build_conv_state_at(
@@ -3020,6 +2902,7 @@ struct llama_model_qwen4exp : public llama_model_base {
                             int   il);
     };
 
+    // MTP draft head: one QSA block after the trunk, fed by the trunk's hc-wide residual
     struct graph_mtp : public graph {
         graph_mtp(const llm_graph_params & params);
     };

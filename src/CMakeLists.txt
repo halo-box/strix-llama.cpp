@@ -34,8 +34,6 @@ set(LLAMA_CORE_SOURCES
     llama-memory-hybrid-idx.cpp
     llama-memory-recurrent.cpp
     llama-mmap.cpp
-    llama-ple-async.cpp
-    llama-ple-disk.cpp
     llama-model-loader.cpp
     llama-model-saver.cpp
     llama-model.cpp
@@ -73,12 +71,6 @@ target_compile_features   (llama PRIVATE cxx_std_17) # don't bump
 
 find_package(Threads REQUIRED)
 target_link_libraries(llama PUBLIC ggml PRIVATE Threads::Threads)
-
-if (GGML_EXL3)
-    # the qwen4exp PLE gather decodes EXL3 n-gram rows on the host (ggml/exl3)
-    target_compile_definitions(llama PRIVATE LLAMA_USE_EXL3)
-    target_include_directories(llama PRIVATE ../ggml/exl3)
-endif()
 
 if (BUILD_SHARED_LIBS)
     set_target_properties(llama PROPERTIES POSITION_INDEPENDENT_CODE ON)

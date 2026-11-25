@@ -1,6 +1,5 @@
 <script lang="ts">
 	import { Button } from '@ggml-org/llama-ui/ui/button';
-	import { ExternalLink } from '@lucide/svelte';
 	import { KeyboardShortcutInfo } from '#lib/components/app/index.ts';
 	import {
 		ICON_CLASS_DEFAULT,
@@ -94,8 +93,7 @@
 <div class="{className} flex flex-col md:gap-1">
 	{#each actions as item, i (item.tooltip)}
 		{@const isActive = isItemActive(item)}
-		{@const itemHref = item.externalHref ?? item.route}
-		{@const itemOnClick = item.externalHref ? undefined : itemClickHandler(item)}
+		{@const itemOnClick = itemClickHandler(item)}
 		{@const itemTransition = {
 			delay: !initialized ? i * ICON_STRIP_TRANSITION_DELAY_MULTIPLIER : 0,
 			duration: ICON_STRIP_TRANSITION_DURATION,
@@ -108,16 +106,14 @@
 					class="w-full min-w-9 justify-between px-2 backdrop-blur-none! hover:[&>kbd]:opacity-100 rounded-(--surface-row-radius) max-md:h-12 max-md:rounded-2xl max-md:px-3 max-md:text-[17px] {isActive
 						? 'selected-row-surface text-accent-foreground'
 						: ''}"
-					href={itemHref}
+					href={item.route}
 					onclick={() => {
 						// a phone confirms the tap by feel, as a native list does
 						if (deviceStore.isMobile) hapticTap();
 
 						itemOnClick?.();
 					}}
-					rel={item.externalHref ? 'noopener noreferrer' : undefined}
 					size="default"
-					target={item.externalHref ? '_blank' : undefined}
 					variant="ghost"
 				>
 					<span class="flex min-w-0 items-center gap-2 px-0.5 max-md:gap-3.5">
@@ -134,9 +130,6 @@
 
 					{#if item.keys}
 						<KeyboardShortcutInfo keys={item.keys} />
-					{:else if item.externalHref}
-						<!-- wrapped: a direct <svg> child would trigger the button's has-[>svg] padding -->
-						<span class="opacity-50"><ExternalLink class="h-3 w-3" /></span>
 					{/if}
 				</Button>
 			</div>

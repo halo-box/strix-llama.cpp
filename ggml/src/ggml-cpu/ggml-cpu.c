@@ -16,14 +16,6 @@
 #include "common.h"
 #include "tiled/tiled.h"
 
-// ROCmFPx experimental AMD-native quant formats
-#include "../../rocmfp4/rocmfp4.h"
-#include "../../rocmfpx/rocmfpx.h"
-
-#ifdef GGML_USE_EXL3
-#include "exl3-ops.h"
-#endif
-
 #if defined(_MSC_VER) || defined(__MINGW32__)
 #include <malloc.h> // using malloc.h with MSC/MINGW
 #elif !defined(__FreeBSD__) && !defined(__NetBSD__) && !defined(__OpenBSD__)
@@ -223,167 +215,8 @@ typedef pthread_t ggml_thread_t;
 #include <TargetConditionals.h>
 #endif
 
-static inline uint32_t ggml_rocmfpx_get_bits_cpu(const uint8_t * src, int bit_pos, int nbits) {
-    const int byte_pos = bit_pos >> 3;
-    const int shift    = bit_pos & 7;
-    uint32_t v = src[byte_pos];
-
-    v |= (uint32_t) src[byte_pos + 1] << 8;
-    v |= (uint32_t) src[byte_pos + 2] << 16;
-
-    return (v >> shift) & ((1u << nbits) - 1u);
-}
-
-static inline int ggml_rocmfpx_decode_fp3_cpu(uint32_t code) {
-    static const int8_t table[8] = { 0, 1, 2, 4, 0, -1, -2, -4 };
-    return table[code & 7u];
-}
-
-static inline int ggml_rocmfpx_decode_fp2_cpu(uint32_t code) {
-    static const int8_t table[4] = { -4, -1, 1, 4 };
-    return table[code & 3u];
-}
-
-static void ggml_vec_dot_rocmfpx_fp2_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
-    GGML_UNUSED(bs);
-    GGML_UNUSED(bx);
-    GGML_UNUSED(by);
-    assert(nrc == 1);
-    GGML_UNUSED(nrc);
-    assert(n % QK_ROCMFP2 == 0);
-    assert(QK_ROCMFP2 == QK8_0);
-
-    const block_rocmfp2 * GGML_RESTRICT x = (const block_rocmfp2 *) vx;
-    const block_q8_0    * GGML_RESTRICT y = (const block_q8_0 *) vy;
-    const int nb = n / QK_ROCMFP2;
-    float sumf = 0.0f;
-
-    for (int ib = 0; ib < nb; ++ib) {
-        const float dy = GGML_CPU_FP16_TO_FP32(y[ib].d);
-        int sumi0 = 0;
-        int sumi1 = 0;
-        for (int j = 0; j < QK_ROCMFP2/2; ++j) {
-            const uint8_t c0 = (x[ib].qs[j/4] >> (2*(j % 4))) & 3u;
-            const uint8_t c1 = (x[ib].qs[4 + j/4] >> (2*(j % 4))) & 3u;
-            sumi0 += ggml_rocmfpx_decode_fp2_cpu(c0) * (int) y[ib].qs[j];
-            sumi1 += ggml_rocmfpx_decode_fp2_cpu(c1) * (int) y[ib].qs[j + QK_ROCMFP2/2];
-        }
-        sumf += dy * (
-            rocmfpx_ue4m3_to_fp32(x[ib].e[0]) * (float) sumi0 +
-            rocmfpx_ue4m3_to_fp32(x[ib].e[1]) * (float) sumi1);
-    }
-    *s = sumf;
-}
-
-static inline int ggml_rocmfpx_decode_fp6_cpu(uint32_t code) {
-    // asymmetric signed range [-32, 31]: sign|0 encodes -32, matching
-    // rocmfpx_decode_fp6_code() in ggml/rocmfpx/rocmfpx.c
-    const int mag = (int) (code & 31u);
-    return (code & 32u) ? -(mag == 0 ? 32 : mag) : mag;
-}
-
-static void ggml_vec_dot_rocmfpx_fp3_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
-    GGML_UNUSED(bs);
-    GGML_UNUSED(bx);
-    GGML_UNUSED(by);
-    assert(nrc == 1);
-    GGML_UNUSED(nrc);
-    assert(n % QK_ROCMFP3 == 0);
-    assert(QK_ROCMFP3 == QK8_0);
-
-    const block_rocmfp3 * GGML_RESTRICT x = (const block_rocmfp3 *) vx;
-    const block_q8_0    * GGML_RESTRICT y = (const block_q8_0 *) vy;
-
-    const int nb = n / QK_ROCMFP3;
-    float sumf = 0.0f;
-
-    for (int ib = 0; ib < nb; ++ib) {
-        const float dy = GGML_CPU_FP16_TO_FP32(y[ib].d);
-
-        int sumi0 = 0;
-        int sumi1 = 0;
-        for (int j = 0; j < QK_ROCMFP3/2; ++j) {
-            const int q0 = ggml_rocmfpx_decode_fp3_cpu(ggml_rocmfpx_get_bits_cpu(x[ib].qs, j*3, 3));
-            const int q1 = ggml_rocmfpx_decode_fp3_cpu(ggml_rocmfpx_get_bits_cpu(x[ib].qs, (j + QK_ROCMFP3/2)*3, 3));
-            sumi0 += q0 * (int) y[ib].qs[j];
-            sumi1 += q1 * (int) y[ib].qs[j + QK_ROCMFP3/2];
-        }
-
-        sumf += dy * (
-            rocmfpx_ue4m3_to_fp32(x[ib].e[0]) * (float) sumi0 +
-            rocmfpx_ue4m3_to_fp32(x[ib].e[1]) * (float) sumi1);
-    }
-
-    *s = sumf;
-}
-
-static void ggml_vec_dot_rocmfpx_fp6_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
-    GGML_UNUSED(bs);
-    GGML_UNUSED(bx);
-    GGML_UNUSED(by);
-    assert(nrc == 1);
-    GGML_UNUSED(nrc);
-    assert(n % QK_ROCMFP6 == 0);
-    assert(QK_ROCMFP6 == QK8_0);
-
-    const block_rocmfp6 * GGML_RESTRICT x = (const block_rocmfp6 *) vx;
-    const block_q8_0    * GGML_RESTRICT y = (const block_q8_0 *) vy;
-
-    const int nb = n / QK_ROCMFP6;
-    float sumf = 0.0f;
-
-    for (int ib = 0; ib < nb; ++ib) {
-        const float dy = GGML_CPU_FP16_TO_FP32(y[ib].d);
-
-        int sumi0 = 0;
-        int sumi1 = 0;
-        for (int j = 0; j < QK_ROCMFP6/2; ++j) {
-            const int q0 = ggml_rocmfpx_decode_fp6_cpu(ggml_rocmfpx_get_bits_cpu(x[ib].qs, j*6, 6));
-            const int q1 = ggml_rocmfpx_decode_fp6_cpu(ggml_rocmfpx_get_bits_cpu(x[ib].qs, (j + QK_ROCMFP6/2)*6, 6));
-            sumi0 += q0 * (int) y[ib].qs[j];
-            sumi1 += q1 * (int) y[ib].qs[j + QK_ROCMFP6/2];
-        }
-
-        sumf += dy * (
-            rocmfpx_ue4m3_to_fp32(x[ib].e[0]) * (float) sumi0 +
-            rocmfpx_ue4m3_to_fp32(x[ib].e[1]) * (float) sumi1);
-    }
-
-    *s = sumf;
-}
-
-static void ggml_vec_dot_rocmfpx_fp8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
-    GGML_UNUSED(bs);
-    GGML_UNUSED(bx);
-    GGML_UNUSED(by);
-    assert(nrc == 1);
-    GGML_UNUSED(nrc);
-    assert(n % QK_ROCMFP8 == 0);
-    assert(QK_ROCMFP8 == QK8_0);
-
-    const block_rocmfp8 * GGML_RESTRICT x = (const block_rocmfp8 *) vx;
-    const block_q8_0    * GGML_RESTRICT y = (const block_q8_0 *) vy;
-
-    const int nb = n / QK_ROCMFP8;
-    float sumf = 0.0f;
-
-    for (int ib = 0; ib < nb; ++ib) {
-        const float dx = rocmfpx_ue4m3_to_fp32(x[ib].e);
-        const float dy = GGML_CPU_FP16_TO_FP32(y[ib].d);
-        const float d  = dx * dy;
-
-        int sumi = 0;
-        for (int j = 0; j < QK_ROCMFP8; ++j) {
-            sumi += (int) x[ib].qs[j] * (int) y[ib].qs[j];
-        }
-
-        sumf += d * (float) sumi;
-    }
-
-    *s = sumf;
-}
-
 static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
+    GGML_HOOK_TYPE_TRAITS_CPU // HOOK(type-traits-cpu)
     [GGML_TYPE_F32] = {
         .from_float               = (ggml_from_float_t) ggml_cpu_fp32_to_fp32,
         .vec_dot                  = (ggml_vec_dot_t) ggml_vec_dot_f32,
@@ -408,50 +241,6 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
         .vec_dot_type             = GGML_TYPE_Q8_0,
         .nrows                    = 1,
     },
-#ifdef GGML_USE_TRELLIS
-    [GGML_TYPE_PTQ1_0] = {
-        .from_float               = quantize_row_ptq1_0,
-        .vec_dot                  = ggml_vec_dot_ptq1_0_q8_0,
-        .vec_dot_type             = GGML_TYPE_Q8_0,
-        .nrows                    = 1,
-    },
-    [GGML_TYPE_TQ2_T] = {
-        .from_float               = quantize_row_tq2_t,
-        .vec_dot                  = ggml_vec_dot_tq2_t_q8_0,
-        .vec_dot_type             = GGML_TYPE_Q8_0,
-        .nrows                    = 1,
-    },
-    [GGML_TYPE_TQK6] = {
-        .from_float               = quantize_row_tqk6,
-        .vec_dot                  = ggml_vec_dot_tqk6_q8_0,
-        .vec_dot_type             = GGML_TYPE_Q8_0,
-        .nrows                    = 1,
-    },
-    [GGML_TYPE_TQK7] = {
-        .from_float               = quantize_row_tqk7,
-        .vec_dot                  = ggml_vec_dot_tqk7_q8_0,
-        .vec_dot_type             = GGML_TYPE_Q8_0,
-        .nrows                    = 1,
-    },
-    [GGML_TYPE_TQP5] = {
-        .from_float               = quantize_row_tqp5,
-        .vec_dot                  = ggml_vec_dot_tqp5_q8_0,
-        .vec_dot_type             = GGML_TYPE_Q8_0,
-        .nrows                    = 1,
-    },
-    [GGML_TYPE_TQP6] = {
-        .from_float               = quantize_row_tqp6,
-        .vec_dot                  = ggml_vec_dot_tqp6_q8_0,
-        .vec_dot_type             = GGML_TYPE_Q8_0,
-        .nrows                    = 1,
-    },
-    [GGML_TYPE_TQP7] = {
-        .from_float               = quantize_row_tqp7,
-        .vec_dot                  = ggml_vec_dot_tqp7_q8_0,
-        .vec_dot_type             = GGML_TYPE_Q8_0,
-        .nrows                    = 1,
-    },
-#endif // GGML_USE_TRELLIS
     [GGML_TYPE_Q4_0] = {
         .from_float               = quantize_row_q4_0,
         .vec_dot                  = ggml_vec_dot_q4_0_q8_0,
@@ -461,42 +250,6 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
 #else
         .nrows                    = 1,
 #endif
-    },
-    [GGML_TYPE_Q4_0_ROCMFP4] = {
-        .from_float               = rocmfp4_quantize_row_q4_0,
-        .vec_dot                  = rocmfp4_vec_dot_q4_0_q8_0,
-        .vec_dot_type             = GGML_TYPE_Q8_0,
-        .nrows                    = 1,
-    },
-    [GGML_TYPE_Q4_0_ROCMFP4_FAST] = {
-        .from_float               = rocmfp4_quantize_row_q4_0_fast,
-        .vec_dot                  = rocmfp4_vec_dot_q4_0_fast_q8_0,
-        .vec_dot_type             = GGML_TYPE_Q8_0,
-        .nrows                    = 1,
-    },
-    [GGML_TYPE_Q3_0_ROCMFPX] = {
-        .from_float               = rocmfpx_quantize_row_fp3,
-        .vec_dot                  = ggml_vec_dot_rocmfpx_fp3_q8_0,
-        .vec_dot_type             = GGML_TYPE_Q8_0,
-        .nrows                    = 1,
-    },
-    [GGML_TYPE_Q2_0_ROCMFPX] = {
-        .from_float               = rocmfpx_quantize_row_fp2,
-        .vec_dot                  = ggml_vec_dot_rocmfpx_fp2_q8_0,
-        .vec_dot_type             = GGML_TYPE_Q8_0,
-        .nrows                    = 1,
-    },
-    [GGML_TYPE_Q6_0_ROCMFPX] = {
-        .from_float               = rocmfpx_quantize_row_fp6,
-        .vec_dot                  = ggml_vec_dot_rocmfpx_fp6_q8_0,
-        .vec_dot_type             = GGML_TYPE_Q8_0,
-        .nrows                    = 1,
-    },
-    [GGML_TYPE_Q8_0_ROCMFPX] = {
-        .from_float               = rocmfpx_quantize_row_fp8,
-        .vec_dot                  = ggml_vec_dot_rocmfpx_fp8_q8_0,
-        .vec_dot_type             = GGML_TYPE_Q8_0,
-        .nrows                    = 1,
     },
     [GGML_TYPE_Q4_1] = {
         .from_float               = quantize_row_q4_1,
@@ -1594,12 +1347,11 @@ UseGgmlGemm1:;
         const size_t nbw3 = nbw2*ne12;
 
         assert(params->wsize >= ne13*nbw3);
-        // src1 is packed from F32 into vec_dot_type, widened from F16 or BF16 into an F32 work buffer, or (F16 into a
-        // quantised vec_dot_type) converted through F32: the f16 activations of a Vulkan-first graph
+        // src1 is either packed from F32 into vec_dot_type, or widened from F16 or BF16 into the F32 work buffer
         const bool widen = src1->type != GGML_TYPE_F32;
 
+        GGML_ASSERT(!widen || vec_dot_type == GGML_TYPE_F32);
         GGML_ASSERT(!widen || src1->type == GGML_TYPE_F16 || src1->type == GGML_TYPE_BF16);
-        GGML_ASSERT(src1->type != GGML_TYPE_BF16 || vec_dot_type == GGML_TYPE_F32);
 
     #if 0
         for (int64_t i13 = 0; i13 < ne13; ++i13) {
@@ -1624,19 +1376,10 @@ UseGgmlGemm1:;
 
                     const int64_t ne10_block_size = (ne10_block_end - ne10_block_start) * bs;
 
-                    if (src1->type == GGML_TYPE_F16 && vec_dot_type == GGML_TYPE_F32) {
+                    if (src1->type == GGML_TYPE_F16) {
                         ggml_cpu_fp16_to_fp32((const ggml_fp16_t *) src1_row, (float *) wdata_row, ne10_block_size);
                     } else if (src1->type == GGML_TYPE_BF16) {
                         ggml_cpu_bf16_to_fp32((const ggml_bf16_t *) src1_row, (float *) wdata_row, ne10_block_size);
-                    } else if (src1->type == GGML_TYPE_F16) {
-                        // F16 into another vec_dot_type: through F32, in chunks of whole blocks (1024 is a
-                        // multiple of every block size)
-                        float tmp[1024];
-                        for (int64_t off = 0; off < ne10_block_size; off += 1024) {
-                            const int64_t n = MIN(1024, ne10_block_size - off);
-                            ggml_cpu_fp16_to_fp32((const ggml_fp16_t *) src1_row + off, tmp, n);
-                            from_float(tmp, (char *) wdata_row + (off/bs)*nbw0, n);
-                        }
                     } else {
                         from_float((const float *) src1_row, wdata_row, ne10_block_size);
                     }
@@ -1743,8 +1486,7 @@ UseGgmlGemm2:;
 
 // ggml_compute_forward_mul_mat_id
 
-// the rows of each src0 matrix are stored back to back, starting at matrix_row_offs[row_id]
-#define MMID_MATRIX_ROW(row_id, i1) matrix_rows[matrix_row_offs[row_id] + (i1)]
+#define MMID_MATRIX_ROW(row_id, i1) matrix_rows[(row_id)*ids->ne[0]*ids->ne[1] + (i1)]
 
 struct mmid_row_mapping {
     int32_t i1;
@@ -1755,12 +1497,14 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
     struct ggml_tensor * dst,
     const struct ggml_tensor * src0,
     const struct ggml_tensor * src1,
+    const struct ggml_tensor * ids,
+    const int64_t cur_a,
     const int64_t ir0_start,
     const int64_t ir0_end,
     const int64_t ir1_start,
     const int64_t ir1_end,
     const char * src0_cur,
-    const struct mmid_row_mapping * matrix_rows, // rows of the current src0 matrix
+    const struct mmid_row_mapping * matrix_rows,
     const size_t row_size,
     const bool src1_cont,
     const void * wdata) {
@@ -1782,7 +1526,7 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
             for (int64_t ir1 = iir1; ir1 < iir1 + blck_1 && ir1 < ir1_end; ++ir1) {
                 const int64_t _i12 = ir1; // logical row index for this expert
 
-                struct mmid_row_mapping row_mapping = matrix_rows[_i12];
+                struct mmid_row_mapping row_mapping = MMID_MATRIX_ROW(cur_a, _i12);
                 const int id       = row_mapping.i1; // selected expert index
 
                 const int64_t  i11 = id % ne11;
@@ -1866,11 +1610,8 @@ static void ggml_compute_forward_mul_mat_id(
     int64_t * matrix_row_counts = // [n_as]
         incr_ptr_aligned(&wdata_cur, n_as*sizeof(int64_t), sizeof(int64_t));
 
-    int64_t * matrix_row_offs = // [n_as]
-        incr_ptr_aligned(&wdata_cur, n_as*sizeof(int64_t), sizeof(int64_t));
-
-    struct mmid_row_mapping * matrix_rows = // [ids->ne[0]*ids->ne[1]]
-        incr_ptr_aligned(&wdata_cur, ids->ne[0]*ids->ne[1]*sizeof(struct mmid_row_mapping), sizeof(int64_t));
+    struct mmid_row_mapping * matrix_rows = // [n_as][ids->ne[0]*ids->ne[1]]
+        incr_ptr_aligned(&wdata_cur, n_as*ids->ne[0]*ids->ne[1]*sizeof(struct mmid_row_mapping), sizeof(int64_t));
 
     char (*atomic_current_chunk)[CACHE_LINE_SIZE] = // [n_as]
         incr_ptr_aligned(&wdata_cur, CACHE_LINE_SIZE * n_as, CACHE_LINE_SIZE);
@@ -1890,7 +1631,7 @@ static void ggml_compute_forward_mul_mat_id(
         const size_t nbw3 = nbw2*ne12;
 
         assert(params->wsize >= ne13*nbw3);
-        GGML_ASSERT(src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16);
+        GGML_ASSERT(src1->type == GGML_TYPE_F32);
 
 #if 0
         for (int64_t i13 = 0; i13 < ne13; ++i13) {
@@ -1909,23 +1650,9 @@ static void ggml_compute_forward_mul_mat_id(
                     size_t bs = ggml_blck_size(vec_dot_type);
                     int64_t ne10_block_start = (ith * ne10/bs) / nth;
                     int64_t ne10_block_end   = ((ith + 1) * ne10/bs) / nth;
-                    const char * src1_block = (const char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11 + ne10_block_start*bs*nb10;
-                    char * dst_block = wdata + i13*nbw3 + i12*nbw2 + i11*nbw1 + ne10_block_start*nbw0;
-                    const int64_t n_block = (ne10_block_end - ne10_block_start) * bs;
-                    if (src1->type == GGML_TYPE_F32) {
-                        from_float((const float *) src1_block, dst_block, n_block);
-                    } else if (vec_dot_type == GGML_TYPE_F32) {
-                        ggml_cpu_fp16_to_fp32((const ggml_fp16_t *) src1_block, (float *) dst_block, n_block);
-                    } else {
-                        // F16 into another vec_dot_type (the f16 MoE activations): through F32, in chunks of
-                        // whole blocks (1024 is a multiple of every block size)
-                        float tmp[1024];
-                        for (int64_t off = 0; off < n_block; off += 1024) {
-                            const int64_t n = MIN(1024, n_block - off);
-                            ggml_cpu_fp16_to_fp32((const ggml_fp16_t *) src1_block + off, tmp, n);
-                            from_float(tmp, dst_block + (off/(int64_t) bs)*nbw0, n);
-                        }
-                    }
+                    from_float((float *)((char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11 + ne10_block_start*bs*nb10),
+                               (void *)               (wdata + i13*nbw3 + i12*nbw2 + i11*nbw1 + ne10_block_start*nbw0),
+                               (ne10_block_end - ne10_block_start) * bs);
                 }
             }
         }
@@ -1936,6 +1663,7 @@ static void ggml_compute_forward_mul_mat_id(
         // initialize matrix_row_counts
         memset(matrix_row_counts, 0, n_as*sizeof(int64_t));
 
+        // group rows by src0 matrix
         for (int64_t iid1 = 0; iid1 < ids->ne[1]; ++iid1) {
             for (int id = 0; id < n_ids; ++id) {
                 const int32_t i02 = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
@@ -1944,25 +1672,6 @@ static void ggml_compute_forward_mul_mat_id(
 
                 if (i02 == -1) {
                     memset((char *) dst->data + id*nb1 + iid1*nb2, 0, ne0*sizeof(float));
-                    continue;
-                }
-
-                matrix_row_counts[i02] += 1;
-            }
-        }
-
-        int64_t offs = 0;
-        for (int i02 = 0; i02 < n_as; ++i02) {
-            matrix_row_offs[i02] = offs;
-            offs += matrix_row_counts[i02];
-            matrix_row_counts[i02] = 0;
-        }
-
-        for (int64_t iid1 = 0; iid1 < ids->ne[1]; ++iid1) {
-            for (int id = 0; id < n_ids; ++id) {
-                const int32_t i02 = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
-
-                if (i02 == -1) {
                     continue;
                 }
 
@@ -2033,9 +1742,9 @@ static void ggml_compute_forward_mul_mat_id(
             const int64_t ir1_end = MIN(ir1_start + dr1, nr1);
 
             ggml_compute_forward_mul_mat_id_one_chunk(
-                dst, src0, src1,
+                dst, src0, src1, ids, cur_a,
                 ir0_start, ir0_end, ir1_start, ir1_end,
-                src0_cur, &MMID_MATRIX_ROW(cur_a, 0), row_size, src1_cont, wdata
+                src0_cur, matrix_rows, row_size, src1_cont, wdata
             );
 
             if (nth >= nchunk0 * nchunk1) {
@@ -2449,30 +2158,6 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_opt_step_sgd(params, tensor);
             }
             break;
-        case GGML_OP_EXL3_MUL_MAT:
-            {
-#ifdef GGML_USE_EXL3
-                ggml_compute_forward_exl3_mul_mat(params, tensor);
-#else
-                GGML_ABORT("EXL3_MUL_MAT needs a build with GGML_EXL3=ON");
-#endif
-            } break;
-        case GGML_OP_EXL3_GET_ROWS:
-            {
-#ifdef GGML_USE_EXL3
-                ggml_compute_forward_exl3_get_rows(params, tensor);
-#else
-                GGML_ABORT("EXL3_GET_ROWS needs a build with GGML_EXL3=ON");
-#endif
-            } break;
-        case GGML_OP_EXL3_MUL_MAT_ID:
-            {
-#ifdef GGML_USE_EXL3
-                ggml_compute_forward_exl3_mul_mat_id(params, tensor);
-#else
-                GGML_ABORT("EXL3_MUL_MAT_ID needs a build with GGML_EXL3=ON");
-#endif
-            } break;
         case GGML_OP_NONE:
             {
                 // nop
@@ -2816,9 +2501,6 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
         case GGML_OP_OPT_STEP_ADAMW:
         case GGML_OP_OPT_STEP_SGD:
-        case GGML_OP_EXL3_MUL_MAT:
-        case GGML_OP_EXL3_GET_ROWS:
-        case GGML_OP_EXL3_MUL_MAT_ID:
             {
                 n_tasks = n_threads;
             } break;
@@ -3232,10 +2914,8 @@ struct ggml_cplan ggml_graph_plan(
                         }
                         // matrix_row_counts
                         cur += n_as * sizeof(int64_t) + sizeof(int64_t);
-                        // matrix_row_offs
-                        cur += n_as * sizeof(int64_t) + sizeof(int64_t);
                         // matrix_rows
-                        cur += ids->ne[0]*ids->ne[1]*sizeof(struct mmid_row_mapping) + sizeof(int64_t);
+                        cur += n_as*ids->ne[0]*ids->ne[1]*sizeof(struct mmid_row_mapping) + sizeof(int64_t);
                         // atomic_current_chunk
                         cur += CACHE_LINE_SIZE*n_as + CACHE_LINE_SIZE;
                         // Workspace for tiled (see tiled.h)
@@ -3329,11 +3009,6 @@ struct ggml_cplan ggml_graph_plan(
                         size_t n_chunks = n_tasks;
                         size_t decode   = sizeof(float)*(neq2*n_chunks*(2+DV) + n_tasks*(DK + 2*DV));
 
-                        // selected-key rows (src[6]) are gathered per thread after the decode partials
-                        if (node->src[6]) {
-                            decode += sizeof(float)*n_tasks*CACHE_LINE_SIZE_F32 + sizeof(int32_t)*n_tasks*node->src[6]->ne[0];
-                        }
-
                         cur += MAX(prefill, decode);
                     } break;
                 case GGML_OP_FLASH_ATTN_BACK:
@@ -3374,16 +3049,6 @@ struct ggml_cplan ggml_graph_plan(
                         const int64_t ne10 = node->src[1]->ne[0];
                         cur += sizeof(float)*ne10*n_tasks;
                     } break;
-#ifdef GGML_USE_EXL3
-                case GGML_OP_EXL3_MUL_MAT:
-                    {
-                        cur = ggml_cpu_exl3_work_size(node, n_tasks);
-                    } break;
-                case GGML_OP_EXL3_MUL_MAT_ID:
-                    {
-                        cur = ggml_cpu_exl3_mul_mat_id_work_size(node, n_tasks);
-                    } break;
-#endif
                 default:
                     break;
             }
@@ -4267,12 +3932,6 @@ void ggml_cpu_init(void) {
             }
 #endif
         }
-
-#ifdef GGML_USE_TRELLIS
-        // TQ2_T / TQK6 / TQK7 state -> weights table used by their vec_dot
-        // (after the FP16 table: GGML_CPU_FP16_TO_FP32 may be a lookup in it)
-        ggml_cpu_tq_init();
-#endif
 
 #if defined(__ARM_ARCH)
         ggml_init_arm_arch_features();

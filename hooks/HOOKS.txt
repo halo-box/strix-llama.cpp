@@ -1,0 +1,60 @@
+# Hook points: the only changes in upstream files. Checked by hooks/tools/check-hooks.sh.
+# Everything else connects to upstream without a changed line (run-time wrapping, link-time wrapping, CMake).
+#
+# name                 file                              lines  why there is no seam
+type-range             ggml/include/ggml.h               1      the ggml_type enum must hold ids up to 255 (C++ enum range)
+types                  ggml/include/ggml.h               7      the hook types and the GGML_TYPE_COUNT of the hooks, for every user of ggml.h
+type-traits            ggml/src/ggml.c                   1      type_traits is a const static table
+type-quantize          ggml/src/ggml.c                   1      ggml_quantize_chunk is a switch on the type
+type-traits-cpu        ggml/src/ggml-cpu/ggml-cpu.c      1      type_traits_cpu is a const static table
+type-validate          ggml/src/ggml-quants.c            1      ggml_validate_row_data is a switch on the type
+common-include         common/arg.cpp                    1      for common-args
+common-args            common/arg.cpp                    1      common_params_parser_init is called from its own file
+server-include         tools/server/server-context.cpp   1      for the server-slot-* and server-token hooks
+server-slot-release    tools/server/server-context.cpp   1      server_slot is local to server-context.cpp
+server-slot-start      tools/server/server-context.cpp   1      server_context_impl is local to server-context.cpp
+server-token           tools/server/server-context.cpp   1      server_context_impl is local to server-context.cpp
+server-task-params     tools/server/server-task.h        1      a request field must travel with the task: a struct field
+sched-realloc-sync     ggml/src/ggml-backend.cpp         1      the scheduler sync before a re-reserve is inside ggml_backend_sched_alloc_splits
+gguf-type              ggml/src/gguf.cpp                 1      gguf_init_from_reader is static, the type check is inside its tensor loop
+context-include        src/llama-context.cpp             1      for the llama_context hook points
+fused-ops              src/llama-context.cpp             1      resolve_fused_ops is called from its own file
+sched-reserve          src/llama-context.cpp             1      sched_reserve is called from its own file
+ubatch-done            src/llama-context.cpp             1      process_ubatch is called from its own file
+graph-max-nodes        src/llama-context.cpp             1      graph_max_nodes is called from its own file
+arch-include           src/llama-arch.cpp                1      for tensor-name and tensor-info
+tensor-name            src/llama-arch.cpp                1      the tensor names are a const static table
+tensor-info            src/llama-arch.cpp                1      the tensor infos are a const static table
+kv-include             src/llama-kv-cache.cpp            1      for the kv-* hook points
+kv-clear               src/llama-kv-cache.cpp            1      KV cache methods are called through virtual calls
+kv-seq-rm              src/llama-kv-cache.cpp            1      same
+kv-seq-cp              src/llama-kv-cache.cpp            1      same
+kv-seq-keep            src/llama-kv-cache.cpp            1      same
+kv-seq-add             src/llama-kv-cache.cpp            1      same
+kv-seq-div             src/llama-kv-cache.cpp            1      same
+kv-stream-copy         src/llama-kv-cache.cpp            1      inside llama_kv_cache::update
+kv-apply-ubatch        src/llama-kv-cache.cpp            1      apply_ubatch is called from its own file
+kv-dsa-include         src/llama-kv-cache-dsa.cpp        1      for kv-type-dsa
+kv-type-dsa            src/llama-kv-cache-dsa.cpp        1      the indexer cache is created inside the DSA cache constructor
+kv-dsv4-include        src/llama-kv-cache-dsv4.cpp       1      for kv-type-dsv4
+kv-type-dsv4           src/llama-kv-cache-dsv4.cpp       1      the indexer cache is created inside the DSV4 cache constructor
+loader-include         src/llama-model-loader.cpp        1      for mmap-ranges
+mmap-ranges            src/llama-model-loader.cpp        2      the mmap is created inside init_mappings (one changed line)
+quant-include          src/llama-quant.cpp               1      for quant-type
+quant-type             src/llama-quant.cpp               1      llama_tensor_get_type is static
+quantize-include       tools/quantize/quantize.cpp       1      for quantize-ftypes
+quantize-options       tools/quantize/quantize.cpp       2      QUANT_OPTIONS is a const static table (one changed line)
+quantize-ftypes        tools/quantize/quantize.cpp       1      the hooks add their quantization types to it
+server-task-launch     tools/server/server-context.cpp   1      launch_slot_with_task is local to server-context.cpp
+server-update          tools/server/server-context.cpp   1      update_slots is local to server-context.cpp
+server-n-ctx-max       tools/server/server-context.cpp   1      n_ctx_slot is local to server-context.cpp
+server-task-include    tools/server/server-task.cpp      1      for server-usage
+server-usage-begin     tools/server/server-task.cpp      2      usage_json_oaicompat is called from its own file (one changed line)
+server-usage-end       tools/server/server-task.cpp      1      same
+server-http-include    tools/server/server-http.cpp      1      for server-public-paths
+server-public-paths    tools/server/server-http.cpp      1      the public paths are a local static of server_http_context::init
+server-models-include  tools/server/server-models.cpp    1      for server-model-hidden
+server-model-hidden    tools/server/server-models.cpp    1      apply_hidden is a local lambda
+hooks                  CMakeLists.txt                    1      the hooks build, after project(): CMAKE_PROJECT_INCLUDE would need an option at every configure
+cpu-amx                ggml/src/ggml-cpu/CMakeLists.txt  1      the AMX mmq build flags of the fork for clang 22, with or without the hooks build
+ui-assets              scripts/ui-assets.cmake           1      the fork UI functions (hooks/ui), with or without the hooks build: the script runs in cmake -P mode

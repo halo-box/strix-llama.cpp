@@ -146,7 +146,7 @@ int main()
     )""");
 
     verify_failure(R"""(
-        root ::= (((((([^x]*){0,999}){0,999}){0,999}){0,999}){0,999}){0,999}
+        root ::= (((((([^x]*){0,99}){0,99}){0,99}){0,99}){0,99}){0,99}
     )""");
 
     verify_failure(R"""(
@@ -154,15 +154,15 @@ int main()
     )""");
 
     verify_failure(R"""(
-        root ::= "a"{500000}
+        root ::= "a"{5000}
     )""");
 
     verify_failure(R"""(
-        root ::= "a"{500000,}
+        root ::= "a"{5000,}
     )""");
 
     verify_failure(R"""(
-        root ::= "a"{500000,600000}
+        root ::= "a"{5000,6000}
     )""");
 
     // Recursion depth limit exceeded (Issue #29495)
@@ -180,7 +180,7 @@ int main()
     }
 
     verify_parsing(R"""(
-        root ::= "a"{0,500000}
+        root ::= "a"{0,5000}
     )""", {
         {"root", 0},
         {"root_1", 1},
@@ -196,7 +196,7 @@ int main()
     });
 
     verify_parsing(R"""(
-        root ::= "a"{3,500000}
+        root ::= "a"{3,5000}
     )""", {
         {"root", 0},
         {"root_1", 1},

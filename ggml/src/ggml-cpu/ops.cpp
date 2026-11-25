@@ -675,13 +675,6 @@ void ggml_compute_forward_add(
             } break;
         case GGML_TYPE_Q1_0:
         case GGML_TYPE_Q2_0:
-        case GGML_TYPE_PTQ1_0:
-        case GGML_TYPE_TQ2_T:
-        case GGML_TYPE_TQK6:
-        case GGML_TYPE_TQK7:
-        case GGML_TYPE_TQP5:
-        case GGML_TYPE_TQP6:
-        case GGML_TYPE_TQP7:
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q4_1:
         case GGML_TYPE_Q5_0:
@@ -689,12 +682,6 @@ void ggml_compute_forward_add(
         case GGML_TYPE_Q8_0:
         case GGML_TYPE_MXFP4:
         case GGML_TYPE_NVFP4:
-        case GGML_TYPE_Q4_0_ROCMFP4:
-        case GGML_TYPE_Q4_0_ROCMFP4_FAST:
-        case GGML_TYPE_Q3_0_ROCMFPX:
-        case GGML_TYPE_Q2_0_ROCMFPX:
-        case GGML_TYPE_Q6_0_ROCMFPX:
-        case GGML_TYPE_Q8_0_ROCMFPX:
         case GGML_TYPE_F8_E4M3:
         case GGML_TYPE_Q2_K:
         case GGML_TYPE_Q3_K:
@@ -1145,13 +1132,6 @@ void ggml_compute_forward_add1(
             } break;
         case GGML_TYPE_Q1_0:
         case GGML_TYPE_Q2_0:
-        case GGML_TYPE_PTQ1_0:
-        case GGML_TYPE_TQ2_T:
-        case GGML_TYPE_TQK6:
-        case GGML_TYPE_TQK7:
-        case GGML_TYPE_TQP5:
-        case GGML_TYPE_TQP6:
-        case GGML_TYPE_TQP7:
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q4_1:
         case GGML_TYPE_Q5_0:
@@ -1160,12 +1140,6 @@ void ggml_compute_forward_add1(
         case GGML_TYPE_Q8_1:
         case GGML_TYPE_MXFP4:
         case GGML_TYPE_NVFP4:
-        case GGML_TYPE_Q4_0_ROCMFP4:
-        case GGML_TYPE_Q4_0_ROCMFP4_FAST:
-        case GGML_TYPE_Q3_0_ROCMFPX:
-        case GGML_TYPE_Q2_0_ROCMFPX:
-        case GGML_TYPE_Q6_0_ROCMFPX:
-        case GGML_TYPE_Q8_0_ROCMFPX:
         case GGML_TYPE_F8_E4M3:
         case GGML_TYPE_Q2_K:
         case GGML_TYPE_Q3_K:
@@ -1290,13 +1264,6 @@ void ggml_compute_forward_acc(
         case GGML_TYPE_BF16:
         case GGML_TYPE_Q1_0:
         case GGML_TYPE_Q2_0:
-        case GGML_TYPE_PTQ1_0:
-        case GGML_TYPE_TQ2_T:
-        case GGML_TYPE_TQK6:
-        case GGML_TYPE_TQK7:
-        case GGML_TYPE_TQP5:
-        case GGML_TYPE_TQP6:
-        case GGML_TYPE_TQP7:
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q4_1:
         case GGML_TYPE_Q5_0:
@@ -1305,12 +1272,6 @@ void ggml_compute_forward_acc(
         case GGML_TYPE_Q8_1:
         case GGML_TYPE_MXFP4:
         case GGML_TYPE_NVFP4:
-        case GGML_TYPE_Q4_0_ROCMFP4:
-        case GGML_TYPE_Q4_0_ROCMFP4_FAST:
-        case GGML_TYPE_Q3_0_ROCMFPX:
-        case GGML_TYPE_Q2_0_ROCMFPX:
-        case GGML_TYPE_Q6_0_ROCMFPX:
-        case GGML_TYPE_Q8_0_ROCMFPX:
         case GGML_TYPE_F8_E4M3:
         case GGML_TYPE_Q2_K:
         case GGML_TYPE_Q3_K:
@@ -4896,13 +4857,6 @@ void ggml_compute_forward_out_prod(
     switch (src0->type) {
         case GGML_TYPE_Q1_0:
         case GGML_TYPE_Q2_0:
-        case GGML_TYPE_PTQ1_0:
-        case GGML_TYPE_TQ2_T:
-        case GGML_TYPE_TQK6:
-        case GGML_TYPE_TQK7:
-        case GGML_TYPE_TQP5:
-        case GGML_TYPE_TQP6:
-        case GGML_TYPE_TQP7:
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q4_1:
         case GGML_TYPE_Q5_0:
@@ -4910,12 +4864,6 @@ void ggml_compute_forward_out_prod(
         case GGML_TYPE_Q8_0:
         case GGML_TYPE_MXFP4:
         case GGML_TYPE_NVFP4:
-        case GGML_TYPE_Q4_0_ROCMFP4:
-        case GGML_TYPE_Q4_0_ROCMFP4_FAST:
-        case GGML_TYPE_Q3_0_ROCMFPX:
-        case GGML_TYPE_Q2_0_ROCMFPX:
-        case GGML_TYPE_Q6_0_ROCMFPX:
-        case GGML_TYPE_Q8_0_ROCMFPX:
         case GGML_TYPE_F8_E4M3:
         case GGML_TYPE_Q2_K:
         case GGML_TYPE_Q3_K:
@@ -5234,13 +5182,6 @@ void ggml_compute_forward_set(
         case GGML_TYPE_BF16:
         case GGML_TYPE_Q1_0:
         case GGML_TYPE_Q2_0:
-        case GGML_TYPE_PTQ1_0:
-        case GGML_TYPE_TQ2_T:
-        case GGML_TYPE_TQK6:
-        case GGML_TYPE_TQK7:
-        case GGML_TYPE_TQP5:
-        case GGML_TYPE_TQP6:
-        case GGML_TYPE_TQP7:
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q4_1:
         case GGML_TYPE_Q5_0:
@@ -5249,12 +5190,6 @@ void ggml_compute_forward_set(
         case GGML_TYPE_Q8_1:
         case GGML_TYPE_MXFP4:
         case GGML_TYPE_NVFP4:
-        case GGML_TYPE_Q4_0_ROCMFP4:
-        case GGML_TYPE_Q4_0_ROCMFP4_FAST:
-        case GGML_TYPE_Q3_0_ROCMFPX:
-        case GGML_TYPE_Q2_0_ROCMFPX:
-        case GGML_TYPE_Q6_0_ROCMFPX:
-        case GGML_TYPE_Q8_0_ROCMFPX:
         case GGML_TYPE_F8_E4M3:
         case GGML_TYPE_Q2_K:
         case GGML_TYPE_Q3_K:
@@ -5473,13 +5408,6 @@ void ggml_compute_forward_get_rows(
     switch (src0->type) {
         case GGML_TYPE_Q1_0:
         case GGML_TYPE_Q2_0:
-        case GGML_TYPE_PTQ1_0:
-        case GGML_TYPE_TQ2_T:
-        case GGML_TYPE_TQK6:
-        case GGML_TYPE_TQK7:
-        case GGML_TYPE_TQP5:
-        case GGML_TYPE_TQP6:
-        case GGML_TYPE_TQP7:
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q4_1:
         case GGML_TYPE_Q5_0:
@@ -5488,12 +5416,6 @@ void ggml_compute_forward_get_rows(
         case GGML_TYPE_Q8_1:
         case GGML_TYPE_MXFP4:
         case GGML_TYPE_NVFP4:
-        case GGML_TYPE_Q4_0_ROCMFP4:
-        case GGML_TYPE_Q4_0_ROCMFP4_FAST:
-        case GGML_TYPE_Q3_0_ROCMFPX:
-        case GGML_TYPE_Q2_0_ROCMFPX:
-        case GGML_TYPE_Q6_0_ROCMFPX:
-        case GGML_TYPE_Q8_0_ROCMFPX:
         case GGML_TYPE_F8_E4M3:
         case GGML_TYPE_Q2_K:
         case GGML_TYPE_Q3_K:
@@ -6159,13 +6081,6 @@ void ggml_compute_forward_clamp(
         case GGML_TYPE_BF16:
         case GGML_TYPE_Q1_0:
         case GGML_TYPE_Q2_0:
-        case GGML_TYPE_PTQ1_0:
-        case GGML_TYPE_TQ2_T:
-        case GGML_TYPE_TQK6:
-        case GGML_TYPE_TQK7:
-        case GGML_TYPE_TQP5:
-        case GGML_TYPE_TQP6:
-        case GGML_TYPE_TQP7:
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q4_1:
         case GGML_TYPE_Q5_0:
@@ -6174,12 +6089,6 @@ void ggml_compute_forward_clamp(
         case GGML_TYPE_Q8_1:
         case GGML_TYPE_MXFP4:
         case GGML_TYPE_NVFP4:
-        case GGML_TYPE_Q4_0_ROCMFP4:
-        case GGML_TYPE_Q4_0_ROCMFP4_FAST:
-        case GGML_TYPE_Q3_0_ROCMFPX:
-        case GGML_TYPE_Q2_0_ROCMFPX:
-        case GGML_TYPE_Q6_0_ROCMFPX:
-        case GGML_TYPE_Q8_0_ROCMFPX:
         case GGML_TYPE_F8_E4M3:
         case GGML_TYPE_Q2_K:
         case GGML_TYPE_Q3_K:
@@ -8876,7 +8785,6 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
     const ggml_tensor * v     = dst->src[2];
     const ggml_tensor * mask  = dst->src[3];
     const ggml_tensor * sinks = dst->src[4];
-    const ggml_tensor * ids   = dst->src[6];
     const ggml_tensor * kv_rows = dst->src[5];
 
     GGML_TENSOR_LOCALS(int64_t, neq, q,   ne)
@@ -8918,12 +8826,6 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
 
     const int64_t rv2 = neq2/nev2;
     const int64_t rv3 = neq3/nev3;
-
-    // selected keys (src[6]): the first n_kv_raw keys plus key n_kv_raw + i for each valid index i in the query's row.
-    // they are visited in ascending order, so with a mask that encodes the same selection the result is unchanged
-    const int64_t n_kv_raw = ids ? ggml_get_op_params_i32(dst, 4) : nek1;
-    int32_t * keys = ids ? (int32_t *) ((float *) params->wdata + params->nth*(DK + 2*DV + CACHE_LINE_SIZE_F32) +
-            neq2*params->nth*(2 + DV)) + params->ith*ids->ne[0] : nullptr;
 
     // parallelize by q rows using ggml_vec_dot_f32
 
@@ -8986,27 +8888,13 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         const float * pq = (const float *) ((char *) q->data + (iq1*nbq1 + iq2*nbq2 + iq3*nbq3));
         q_to_vec_dot(pq, Q_q, DK);
 
-        int64_t n_sel = 0;
-        if (ids) {
-            const int32_t * row = (const int32_t *) ((const char *) ids->data + iq1*ids->nb[1] + (iq3%ids->ne[3])*ids->nb[3]);
-            for (int64_t j = 0; j < ids->ne[0]; ++j) {
-                const int64_t ic = n_kv_raw + row[j];
-                if (row[j] >= 0 && ic >= ic_start && ic < ic_end) {
-                    keys[n_sel++] = (int32_t) ic;
-                }
-            }
-            std::sort(keys, keys + n_sel);
-            n_sel = std::unique(keys, keys + n_sel) - keys;
-        }
-        const int64_t n_dense = std::max<int64_t>(0, std::min(ic_end, n_kv_raw) - ic_start);
         const int32_t * rows = kv_rows ? (const int32_t *) ((const char *) kv_rows->data + iq3*kv_rows->nb[1]) : nullptr;
 
         // online softmax / attention
         // loop over n_kv and n_head_kv
         // ref: https://arxiv.org/pdf/2112.05682.pdf
 
-        for (int64_t j = 0; j < n_dense + n_sel; ++j) {
-            const int64_t ic = j < n_dense ? ic_start + j : keys[j - n_dense];
+        for (int64_t ic = ic_start; ic < ic_end; ++ic) {
             const float mv = mp ? slope*GGML_CPU_FP16_TO_FP32(mp[ic]) : 0.0f;
             if (mv == -INFINITY) {
                 continue;
@@ -9582,13 +9470,11 @@ static void ggml_compute_forward_flash_attn_ext_f16(
         const int64_t dr = (nr + nchunk - 1) / nchunk;
 
         static constexpr int64_t Q_TILE_SZ  = ggml_fa_tile_config::Q;
-        // the tiled kernel attends every key the mask allows, so selected keys without a mask need the per-row path
         bool use_tiled = !use_ref &&
                                (q->type == GGML_TYPE_F32 &&
                                 kv_is_f32_or_f16 &&
                                 k->type == v->type &&
-                                neq1 >= Q_TILE_SZ &&
-                                (!dst->src[6] || dst->src[3]));
+                                neq1 >= Q_TILE_SZ);
 #if defined(GGML_SIMD) && !defined(__x86_64__) && !defined(_M_X64)
 #if defined(__ARM_FEATURE_SVE)
         const int64_t f32_epr = svcntw();
@@ -11521,21 +11407,16 @@ static void ggml_compute_forward_dsv4_hc_pre_f32(
     const ggml_tensor * x       = dst->src[0];
     const ggml_tensor * weights = dst->src[1];
 
-    const bool gated = ggml_get_op_params_i32(dst, 1) != 0;
-    // the gated form also takes an f16 x and an f16 gate
-    GGML_ASSERT(x->type == GGML_TYPE_F32 || (gated && x->type == GGML_TYPE_F16));
-    GGML_ASSERT(weights->type == GGML_TYPE_F32 || (gated && weights->type == GGML_TYPE_F16));
-    // the gated form may write an f16 mixed stream (ggml_dsv4_hc_pre_gated_ext)
-    GGML_ASSERT(dst->type == GGML_TYPE_F32 || (gated && dst->type == GGML_TYPE_F16));
-    const bool d_f16 = dst->type == GGML_TYPE_F16;
-    const bool x_f16 = x->type == GGML_TYPE_F16;
-    const bool g_f16 = weights->type == GGML_TYPE_F16;
+    GGML_ASSERT(x->type == GGML_TYPE_F32);
+    GGML_ASSERT(weights->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
 
     const int64_t n_embd   = x->ne[0];
     const int64_t hc       = x->ne[1];
     const int64_t n_tokens = x->ne[2];
 
     const float scale = ggml_get_op_params_f32(dst, 0);
+    const bool  gated = ggml_get_op_params_i32(dst, 1) != 0;
 
     GGML_ASSERT(dst->ne[0] == n_embd);
     GGML_ASSERT(dst->ne[1] == n_tokens);
@@ -11566,12 +11447,10 @@ static void ggml_compute_forward_dsv4_hc_pre_f32(
 
         float sum = 0.0f;
         for (int64_t ih = 0; ih < hc; ++ih) {
-            const char * xp = (const char *) x->data + i0*nbx0 + ih*nbx1 + it*nbx2;
-            const float xv = x_f16 ? GGML_CPU_FP16_TO_FP32(*(const ggml_fp16_t *) xp) : *(const float *) xp;
+            const float xv = *(const float *) ((const char *) x->data + i0*nbx0 + ih*nbx1 + it*nbx2);
             float wv;
             if (gated) {
-                const char * gp = (const char *) weights->data + i0*nbw0 + ih*nbw1 + it*nbw2;
-                const float gv = g_f16 ? GGML_CPU_FP16_TO_FP32(*(const ggml_fp16_t *) gp) : *(const float *) gp;
+                const float gv = *(const float *) ((const char *) weights->data + i0*nbw0 + ih*nbw1 + it*nbw2);
                 wv = 1.0f / (1.0f + expf(-gv));
             } else {
                 wv = *(const float *) ((const char *) weights->data + ih*nbw0 + it*nbw1);
@@ -11579,12 +11458,7 @@ static void ggml_compute_forward_dsv4_hc_pre_f32(
             sum += xv * wv;
         }
 
-        char * dp = (char *) dst->data + i0*nbd0 + it*nbd1;
-        if (d_f16) {
-            *(ggml_fp16_t *) dp = GGML_CPU_FP32_TO_FP16(scale * sum);
-        } else {
-            *(float *) dp = scale * sum;
-        }
+        *(float *) ((char *) dst->data + i0*nbd0 + it*nbd1) = scale * sum;
     }
 }
 
@@ -11595,7 +11469,6 @@ void ggml_compute_forward_dsv4_hc_pre(
 
     switch (src0->type) {
         case GGML_TYPE_F32:
-        case GGML_TYPE_F16:   // gated form only (asserted inside)
             {
                 ggml_compute_forward_dsv4_hc_pre_f32(params, dst);
             } break;

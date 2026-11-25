@@ -14,58 +14,9 @@ uint a_shmem_stride() {
 }
 
 void store_a(uint m, uint k_pair, FLOAT_TYPEV2 value) {
-    buf_a[a_shmem_index(m, k_pair)] = TO_BUF(value);
+    buf_a[a_shmem_index(m, k_pair)] = value;
 }
 
-#if defined(DATA_A_ROCMFPX_FP3)
-int32_t rocmfpx_mm_fp3_pack4_window(uint ib, uint idx) {
-    const uint bit_pos = idx * 3u;
-    const uint byte_pos = bit_pos >> 3u;
-    const uint sh = bit_pos & 7u;
-    uint bits = uint(data_a[ib].qs[byte_pos]) |
-                (uint(data_a[ib].qs[byte_pos + 1u]) << 8);
-    if (sh > 4u) {
-        bits |= uint(data_a[ib].qs[byte_pos + 2u]) << 16;
-    }
-    bits = (bits >> sh) & 0xFFFu;
-    return pack32(i8vec4(kvalues_rocmfpx_fp3_const[ bits        & 7u],
-                         kvalues_rocmfpx_fp3_const[(bits >> 3) & 7u],
-                         kvalues_rocmfpx_fp3_const[(bits >> 6) & 7u],
-                         kvalues_rocmfpx_fp3_const[(bits >> 9) & 7u]));
-}
-
-vec4 rocmfpx_mm_fp3_vec4(uint ib, uint idx) {
-    const float d = ue4m3_to_fp32(data_a[ib].e[idx >= 16u ? 1u : 0u]);
-    return vec4(unpack8(rocmfpx_mm_fp3_pack4_window(ib, idx))) * d;
-}
-#endif
-
-#if defined(DATA_A_ROCMFPX_FP6)
-uint rocmfpx_mm_fp6_get_bits(uint ib, uint idx) {
-    const uint bit_pos  = idx * 6u;
-    const uint byte_pos = bit_pos >> 3u;
-    const uint sh       = bit_pos & 7u;
-    uint bits = uint(data_a[ib].qs[byte_pos]);
-    if (sh > 2u) {
-        bits |= uint(data_a[ib].qs[byte_pos + 1u]) << 8;
-    }
-    return (bits >> sh) & 0x3Fu;
-}
-
-float rocmfpx_mm_fp6_value(uint ib, uint idx) {
-    const float d = ue4m3_to_fp32(data_a[ib].e[idx >= 16u ? 1u : 0u]);
-    return float(rocmfpx_fp6_decode_code(rocmfpx_mm_fp6_get_bits(ib, idx))) * d;
-}
-
-vec4 rocmfpx_mm_fp6_vec4(uint ib, uint idx) {
-    return vec4(rocmfpx_mm_fp6_value(ib, idx + 0u),
-                rocmfpx_mm_fp6_value(ib, idx + 1u),
-                rocmfpx_mm_fp6_value(ib, idx + 2u),
-                rocmfpx_mm_fp6_value(ib, idx + 3u));
-}
-#endif
-
-#if !defined(MM_PREFETCH)   // MM_PREFETCH variants take load_a_to_shmem from mul_mm_pf_funcs.glsl
 void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uint idx_m, const uint block, const uint end_k) {
 #if defined(DATA_A_F32) || defined(DATA_A_F16)
 #if LOAD_VEC_A == 8
@@ -372,156 +323,6 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
                                         kvalues_mxfp4[vui2 >>  4] * d));
 
 #endif
-#elif defined(DATA_A_ROCMFP4) || defined(DATA_A_ROCMFP4_FAST)
-            const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
-
-            const uint ib = idx / 8;
-            const uint iqs = (idx & 0x07) * 2;
-
-            const uint vui  = uint(data_a[ib].qs[iqs]);
-            const uint vui2 = uint(data_a[ib].qs[iqs+1]);
-
-            // low nibbles hold the first half of the block (scale e[0]),
-            // high nibbles the second half (scale e[1])
-#if defined(DATA_A_ROCMFP4)
-            const float d0 = ue4m3_to_fp32(data_a[ib].e[0]);
-            const float d1 = ue4m3_to_fp32(data_a[ib].e[1]);
-#else
-            const float d0 = ue4m3_to_fp32(data_a[ib].e);
-            const float d1 = d0;
-#endif
-            store_a(col, row,     FLOAT_TYPEV2(float(kvalues_rocmfp4[vui  & 0xF]) * d0,
-                                               float(kvalues_rocmfp4[vui2 & 0xF]) * d0));
-            store_a(col, row + 8, FLOAT_TYPEV2(float(kvalues_rocmfp4[vui  >>  4]) * d1,
-                                               float(kvalues_rocmfp4[vui2 >>  4]) * d1));
-#elif defined(DATA_A_ROCMFPX_FP3)
-            const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
-
-            const uint ib = idx / 8;
-            const uint iqs = (idx & 0x07) * 4;
-            const vec4 v = rocmfpx_mm_fp3_vec4(ib, iqs);
-
-            const uint k_pair = row * LOAD_VEC_A / 2;
-            store_a(col, k_pair,     FLOAT_TYPEV2(v.xy));
-            store_a(col, k_pair + 1, FLOAT_TYPEV2(v.zw));
-#elif defined(DATA_A_ROCMFPX_FP6)
-            const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
-
-            const uint ib = idx / 8;
-            const uint iqs = (idx & 0x07) * 4;
-            const vec4 v = rocmfpx_mm_fp6_vec4(ib, iqs);
-
-            const uint k_pair = row * LOAD_VEC_A / 2;
-            store_a(col, k_pair,     FLOAT_TYPEV2(v.xy));
-            store_a(col, k_pair + 1, FLOAT_TYPEV2(v.zw));
-#elif defined(DATA_A_ROCMFPX_FP8)
-            const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
-
-            const uint ib = idx / 8;
-            const uint iqs = (idx & 0x07) * 4;
-
-            const float d = ue4m3_to_fp32(data_a[ib].e);
-            const vec4 v = vec4(float(data_a[ib].qs[iqs + 0u]),
-                                float(data_a[ib].qs[iqs + 1u]),
-                                float(data_a[ib].qs[iqs + 2u]),
-                                float(data_a[ib].qs[iqs + 3u])) * d;
-
-            const uint k_pair = row * LOAD_VEC_A / 2;
-            store_a(col, k_pair,     FLOAT_TYPEV2(v.xy));
-            store_a(col, k_pair + 1, FLOAT_TYPEV2(v.zw));
-#elif defined(DATA_A_PTQ1_0)
-    const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
-
-    const uint ib  = idx / 16;
-    const uint grp = idx & 0xfu;      // which 8-element group inside the block
-    const uint e0  = grp * 8u;
-
-    const float d = float(data_a[ib].d);
-
-    const uint k_pair = row * LOAD_VEC_A / 2;
-    vec4 lo, hi;
-    ptq1_0_trits8(ib, 0u, e0, lo, hi);
-    lo *= d;
-    hi *= d;
-    store_a(col, k_pair,     FLOAT_TYPEV2(lo.xy));
-    store_a(col, k_pair + 1, FLOAT_TYPEV2(lo.zw));
-    store_a(col, k_pair + 2, FLOAT_TYPEV2(hi.xy));
-    store_a(col, k_pair + 3, FLOAT_TYPEV2(hi.zw));
-#elif defined(DATA_A_TQ2_T)
-    // LOAD_VEC_A == 8: two trellis steps, which read three consecutive path bytes.
-    const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
-
-    const uint ib = idx / 16;
-    const uint t0 = (idx & 0xfu) * 2u;
-
-    const float d = float(data_a[ib].d);
-    const uint b0 = uint(data_a[ib].qs[(t0 + 31u) & 31u]);
-    const uint b1 = uint(data_a[ib].qs[t0]);
-    const uint b2 = uint(data_a[ib].qs[t0 + 1u]);
-    const vec4 lo = tq2_t_step((b0 << 8u) | b1) * d;
-    const vec4 hi = tq2_t_step((b1 << 8u) | b2) * d;
-
-    const uint k_pair = row * LOAD_VEC_A / 2;
-    store_a(col, k_pair,     FLOAT_TYPEV2(lo.xy));
-    store_a(col, k_pair + 1, FLOAT_TYPEV2(lo.zw));
-    store_a(col, k_pair + 2, FLOAT_TYPEV2(hi.xy));
-    store_a(col, k_pair + 3, FLOAT_TYPEV2(hi.zw));
-#elif defined(DATA_A_TQK6) || defined(DATA_A_TQK7)
-    // LOAD_VEC_A == 8: two trellis steps t0, t0 + 1, each state read from the three
-    // (circular) bytes covering its window (tqk.glsl, mirrors tqk_state).
-    const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
-
-    const uint ib = idx / 16;
-    const uint t0 = (idx & 0xfu) * 2u;
-
-    // Both windows lie in bits [off1, off1 + K + 16) with off1 = tqk_off(t0 + 1): at most 23 bits from
-    // word wb = off1 >> 4, so three (wrapped) u16 reads replace six byte reads (blocks are 2-byte aligned).
-    const float d = float(data_a_packed16[ib].d);
-    const uint off1 = tqk_off(t0 + 1u);
-    const uint wb = off1 >> 4u;
-    const uint w0 = uint(data_a_packed16[ib].qs[wb]);
-    const uint w1 = uint(data_a_packed16[ib].qs[tqk_word_wrap(wb + 1u)]);
-    const uint w2 = uint(data_a_packed16[ib].qs[tqk_word_wrap(wb + 2u)]);
-    const uint p01 = w0 | (w1 << 16u);
-    const uint p12 = w1 | (w2 << 16u);
-    const uint rel1 = off1 & 15u;
-    const uint s1 = tqk_state_words(p01, p12, 0u, rel1);           // step t0 + 1
-    const uint s0 = tqk_state_words(p01, p12, 0u, rel1 + TQK_K);   // step t0 (window K bits higher)
-    const vec4 lo = tq2_t_step(s0) * d;
-    const vec4 hi = tq2_t_step(s1) * d;
-
-    const uint k_pair = row * LOAD_VEC_A / 2;
-    store_a(col, k_pair,     FLOAT_TYPEV2(lo.xy));
-    store_a(col, k_pair + 1, FLOAT_TYPEV2(lo.zw));
-    store_a(col, k_pair + 2, FLOAT_TYPEV2(hi.xy));
-    store_a(col, k_pair + 3, FLOAT_TYPEV2(hi.zw));
-#elif defined(DATA_A_TQP5) || defined(DATA_A_TQP6) || defined(DATA_A_TQP7)
-    // LOAD_VEC_A == 8: four trellis steps t0 .. t0 + 3. Their windows lie in the 3K + 16 bits
-    // from S = tqp_off(t0 + 3): four (wrapped) u16 words from S >> 4 (tqp.glsl).
-    const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
-
-    const uint ib = idx / 16;
-    const uint t0 = (idx & 0xfu) * 4u;
-
-    const float d = float(data_a_packed16[ib].d);
-    const uint S = tqp_off(t0 + 3u);
-    const uint wb = S >> 4u;
-    const uint w0 = uint(data_a_packed16[ib].qs[wb]);
-    const uint w1 = uint(data_a_packed16[ib].qs[tqp_word_wrap(wb + 1u)]);
-    const uint w2 = uint(data_a_packed16[ib].qs[tqp_word_wrap(wb + 2u)]);
-    const uint w3 = uint(data_a_packed16[ib].qs[tqp_word_wrap(wb + 3u)]);
-    uint lo, hi;
-    tqp_window64(w0 | (w1 << 16u), w2 | (w3 << 16u), 0u, S & 15u, lo, hi);
-    const vec2 v0 = tqp_pair(tqp_bits15(lo, hi, 3u*TQP_K)) * d;
-    const vec2 v1 = tqp_pair(tqp_bits15(lo, hi, 2u*TQP_K)) * d;
-    const vec2 v2 = tqp_pair(tqp_bits15(lo, hi,    TQP_K)) * d;
-    const vec2 v3 = tqp_pair(tqp_bits15(lo, hi, 0u)) * d;
-
-    const uint k_pair = row * LOAD_VEC_A / 2;
-    store_a(col, k_pair,     FLOAT_TYPEV2(v0));
-    store_a(col, k_pair + 1, FLOAT_TYPEV2(v1));
-    store_a(col, k_pair + 2, FLOAT_TYPEV2(v2));
-    store_a(col, k_pair + 3, FLOAT_TYPEV2(v3));
 #elif defined(DATA_A_NVFP4)
     const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
     const uint eff_row = (row & 3) + (row & ~3) * 2;
@@ -834,7 +635,6 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
     }
 #endif
 }
-#endif // !MM_PREFETCH
 
 #if !defined(MUL_MAT_ID)
 void load_b_to_shmem(const uint pos_b, const uint row, const uint col, const uint idx_n, const uint block, const uint end_k) {
@@ -844,10 +644,10 @@ void load_b_to_shmem(const uint pos_b, const uint row, const uint col, const uin
         const uint idx = pos_b + col * p.stride_b / LOAD_VEC_B + row;
         const uint buf_idx = col * SHMEM_STRIDE + row * LOAD_VEC_B / 2;
         FLOAT_TYPEV8 bb = FLOAT_TYPEV8(data_b[idx]);
-        buf_b[buf_idx + 0] = TO_BUF(bb[0].xy);
-        buf_b[buf_idx + 1] = TO_BUF(bb[0].zw);
-        buf_b[buf_idx + 2] = TO_BUF(bb[1].xy);
-        buf_b[buf_idx + 3] = TO_BUF(bb[1].zw);
+        buf_b[buf_idx + 0] = bb[0].xy;
+        buf_b[buf_idx + 1] = bb[0].zw;
+        buf_b[buf_idx + 2] = bb[1].xy;
+        buf_b[buf_idx + 3] = bb[1].zw;
         return;
     }
 #elif LOAD_VEC_B == 4
@@ -859,20 +659,20 @@ void load_b_to_shmem(const uint pos_b, const uint row, const uint col, const uin
 #else
         FLOAT_TYPEV4 bb = FLOAT_TYPEV4(data_b[idx]);
 #endif
-        buf_b[buf_idx + 0] = TO_BUF(bb.xy);
-        buf_b[buf_idx + 1] = TO_BUF(bb.zw);
+        buf_b[buf_idx + 0] = bb.xy;
+        buf_b[buf_idx + 1] = bb.zw;
         return;
     }
 #endif
     const uint idx = pos_b + col * p.stride_b + row * 2;
     const uint buf_idx = col * SHMEM_STRIDE + row;
     if (idx_n < p.N && block + row * 2 + 1 < end_k) {
-        buf_b[buf_idx] = TO_BUF(FLOAT_TYPEV2(TO_FLOAT_TYPE(data_b_scalar[idx]),
-                                        TO_FLOAT_TYPE(data_b_scalar[idx + 1])));
+        buf_b[buf_idx] = FLOAT_TYPEV2(TO_FLOAT_TYPE(data_b_scalar[idx]),
+                                        TO_FLOAT_TYPE(data_b_scalar[idx + 1]));
     } else if (idx_n < p.N && block + row * 2 < end_k) {
-        buf_b[buf_idx] = TO_BUF(FLOAT_TYPEV2(TO_FLOAT_TYPE(data_b_scalar[idx]), 0.0f));
+        buf_b[buf_idx] = FLOAT_TYPEV2(TO_FLOAT_TYPE(data_b_scalar[idx]), 0.0f);
     } else {
-        buf_b[buf_idx] = TO_BUF(FLOAT_TYPEV2(0.0f));
+        buf_b[buf_idx] = FLOAT_TYPEV2(0.0f);
     }
 }
 #else
@@ -884,10 +684,10 @@ void load_b_to_shmem(const uint pos_b, const uint row, const uint col, const uin
         const uint idx = pos_b + row_idx.y * p.batch_stride_b / LOAD_VEC_B + (row_idx.x % p.ne11) * p.stride_b / LOAD_VEC_B + row;
         const uint buf_idx = col * SHMEM_STRIDE + row * LOAD_VEC_B / 2;
         FLOAT_TYPEV8 bb = FLOAT_TYPEV8(data_b[idx]);
-        buf_b[buf_idx + 0] = TO_BUF(bb[0].xy);
-        buf_b[buf_idx + 1] = TO_BUF(bb[0].zw);
-        buf_b[buf_idx + 2] = TO_BUF(bb[1].xy);
-        buf_b[buf_idx + 3] = TO_BUF(bb[1].zw);
+        buf_b[buf_idx + 0] = bb[0].xy;
+        buf_b[buf_idx + 1] = bb[0].zw;
+        buf_b[buf_idx + 2] = bb[1].xy;
+        buf_b[buf_idx + 3] = bb[1].zw;
         return;
     }
 #elif LOAD_VEC_B == 4
@@ -900,8 +700,8 @@ void load_b_to_shmem(const uint pos_b, const uint row, const uint col, const uin
 #else
         FLOAT_TYPEV4 bb = FLOAT_TYPEV4(data_b[idx]);
 #endif
-        buf_b[buf_idx + 0] = TO_BUF(bb.xy);
-        buf_b[buf_idx + 1] = TO_BUF(bb.zw);
+        buf_b[buf_idx + 0] = bb.xy;
+        buf_b[buf_idx + 1] = bb.zw;
         return;
     }
 #endif
@@ -910,14 +710,14 @@ void load_b_to_shmem(const uint pos_b, const uint row, const uint col, const uin
     if (row_i < _ne1 && block + row * 2 + 1 < end_k) {
         const u16vec2 row_idx = row_ids[col];
         const uint idx = pos_b + row_idx.y * p.batch_stride_b + (row_idx.x % p.ne11) * p.stride_b + row * 2;
-        buf_b[buf_idx] = TO_BUF(FLOAT_TYPEV2(TO_FLOAT_TYPE(data_b_scalar[idx]),
-                                        TO_FLOAT_TYPE(data_b_scalar[idx + 1])));
+        buf_b[buf_idx] = FLOAT_TYPEV2(TO_FLOAT_TYPE(data_b_scalar[idx]),
+                                        TO_FLOAT_TYPE(data_b_scalar[idx + 1]));
     } else if (row_i < _ne1 && block + row * 2 < end_k) {
         const u16vec2 row_idx = row_ids[col];
         const uint idx = pos_b + row_idx.y * p.batch_stride_b + (row_idx.x % p.ne11) * p.stride_b + row * 2;
-        buf_b[buf_idx] = TO_BUF(FLOAT_TYPEV2(TO_FLOAT_TYPE(data_b_scalar[idx]), 0.0f));
+        buf_b[buf_idx] = FLOAT_TYPEV2(TO_FLOAT_TYPE(data_b_scalar[idx]), 0.0f);
     } else {
-        buf_b[buf_idx] = TO_BUF(FLOAT_TYPEV2(0.0f));
+        buf_b[buf_idx] = FLOAT_TYPEV2(0.0f);
     }
 }
 #endif

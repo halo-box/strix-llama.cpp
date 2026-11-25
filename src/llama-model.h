@@ -242,10 +242,6 @@ struct llama_layer_nextn {
     struct ggml_tensor * hc_head_norm          = nullptr;
     struct ggml_tensor * hc_head_down          = nullptr;
     struct ggml_tensor * hc_head_up            = nullptr;
-
-    // qwen4exp EXL3: eh_proj as its two parts, e_proj(e) + h_proj(h)
-    struct ggml_tensor * e_proj                = nullptr;
-    struct ggml_tensor * h_proj                = nullptr;
 };
 
 struct llama_layer_switch_lora {
@@ -770,35 +766,6 @@ struct llama_hadamard {
     llama_hadamard_rotations inv; // latent lookup table -> inverse transform
 };
 
-// EXL3 linears (see ggml/exl3/README.md): the trellis tensor stands for the weight, its scales are found here
-struct llama_exl3_linear {
-    ggml_tensor * suh;
-    ggml_tensor * svh;
-};
-
-// EXL3 row-ring table (quantized token embedding): the trellis tensor stands for the table
-struct llama_exl3_rows {
-    ggml_tensor * signs;
-    int64_t       n_out; // decoded row width
-};
-
-struct llama_exl3 {
-    std::unordered_map<const ggml_tensor *, llama_exl3_linear> linears; // trellis -> scales
-    std::unordered_map<const ggml_tensor *, llama_exl3_rows>   rows;    // row table -> signs
-};
-
-// MTP draft vocabulary subset (llama_context_params::mtp_draft_vocab): the rows of the LM head for token ids < n_keep
-// plus control and user-defined tokens. Immutable once built. Contexts that request the same n_keep share one.
-struct llama_mtp_draft_vocab {
-    int32_t n_keep = 0;
-
-    ggml_tensor * head = nullptr; // [n_embd, n_rows], same type as the LM head
-    ggml_tensor * ids  = nullptr; // [n_rows] I64, token id of each row
-
-    ggml_context_ptr        ctx;
-    ggml_backend_buffer_ptr buf;
-};
-
 struct llama_rope_params {
     int32_t n_rot      = 0; // 0 if the layer has no RoPE
     int32_t n_offs     = 0; // first rotated dim in a cached K head
@@ -829,8 +796,6 @@ struct llama_model {
     llama_prec_policy prec_policy;
 
     llama_hadamard hdmd;
-
-    llama_exl3 exl3;
 
     // see llama_model_set_attn_rot
     bool attn_rot = true;
@@ -1032,7 +997,6 @@ struct llama_model {
     uint32_t n_gpu_layers() const;
     llama_split_mode split_mode() const;
     bool no_alloc() const;
-    bool graph_depends_on_n_tokens() const;
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
 
@@ -1050,10 +1014,6 @@ struct llama_model {
 
     const struct ggml_tensor * get_tensor(const char * name) const;
 
-    // draft vocabulary subset for mtp_draft_vocab = n_keep, built on first request and freed with the last context
-    // holding it; nullptr if the subset cannot be used with this model (thread-safe)
-    // head_src: the model whose LM head a head-less (shared) draft borrows, used only when this model has no output
-    std::shared_ptr<const llama_mtp_draft_vocab> mtp_draft_vocab_get(int32_t n_keep, const llama_model * head_src = nullptr) const;
     // the RoPE of a layer, used by both the model graph and the K-shift
     virtual llama_rope_params get_rope_params(const llama_cparams & cparams, int il) const;
 
@@ -1078,11 +1038,6 @@ struct llama_model {
     virtual void load_arch_hparams(llama_model_loader & ml) = 0;
     virtual void load_arch_tensors(llama_model_loader & ml) = 0;
     virtual std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const = 0;
-
-    // work a model runs beside one llama_context::decode of the whole batch; `state` belongs to the calling context and
-    // prefetch_end runs on every exit of that decode. Nothing by default
-    virtual void prefetch_begin(std::unique_ptr<llama_model_prefetch> & /*state*/, const llama_batch & /*batch*/, uint32_t /*n_ubatch*/) const {}
-    virtual void prefetch_end(llama_model_prefetch * /*state*/) const {}
 
 protected:
     llama_model_params params;
@@ -1139,10 +1094,6 @@ struct llama_model_base : public llama_model {
 
     // helper: make the prism.hadamard rotation and sign tensors for the folded weights
     void load_tensors_hadamard();
-
-    // helper: read the exl3.* metadata, and pair each EXL3 trellis with its scales after create_tensor made them
-    void load_hparams_exl3(llama_model_loader & ml);
-    void load_tensors_exl3();
 
     // helper: read the SWA pattern as one flag per layer, or as a period expanded by set_swa_pattern
     void load_swa_pattern(llama_model_loader & ml, uint32_t n_pattern, bool dense_first = false);

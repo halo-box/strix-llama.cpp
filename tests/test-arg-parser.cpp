@@ -272,6 +272,7 @@ static void test(void) {
         const std::vector<std::string> three = {"a.gguf", "b.gguf", "c.gguf"};
         assert(parse_shards({"--shard", "a.gguf,b.gguf", "--shard", "c.gguf"}) == three);
         assert(parse_shards({"--shard", "a.gguf", "--shard", "b.gguf", "--shard", "c.gguf"}) == three);
+        assert(parse_shards({"--ple", "p.gguf"}) == parse_shards({"--shard", "p.gguf"}));
         assert(parse_shards({"--shard", "model_file.gguf,a.gguf,b.gguf,a.gguf"}) == two);
     }
 
@@ -333,13 +334,6 @@ static void test(void) {
     argv = {"binary_name", "-lm", "dio"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
     assert(params.load_mode == LLAMA_LOAD_MODE_DIRECT_IO);
-
-    {
-        common_params lazy_params;
-        argv = {"binary_name", "-m", "model_file.gguf", "--ngram-on-disk"};
-        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), lazy_params, LLAMA_EXAMPLE_COMMON));
-        assert(lazy_params.lazy_mode == LLAMA_LAZY_MODE_ON);
-    }
 
     // multi-value args (CSV)
     argv = {"binary_name", "--lora", "file1.gguf,\"file2,2.gguf\",\"file3\"\"3\"\".gguf\",file4\".gguf"};

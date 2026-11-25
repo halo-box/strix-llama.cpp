@@ -39,6 +39,85 @@ def parse_assembly(text, architecture):
     return kernels
 
 
+def base36(v):
+    digits = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ'
+    out = digits[v % 36]
+    while v >= 36:
+        v //= 36
+        out = digits[v % 36] + out
+    return out
+
+
+def without_fork_namespace(name):
+    # hooks: the fork kernels are compiled in namespace ggml_fork (hooks/ggml/cuda): _ZN9ggml_forkL<name><args>E<params>
+    # is _ZL<name><args><params> in the baseline, the substitutions of <params> one lower (the namespace was S_)
+    prefix = '_ZN9ggml_forkL'
+    if not name.startswith(prefix):
+        return name
+    s = name[len(prefix):]
+    i = 0
+    while i < len(s) and s[i].isdigit():
+        i += 1
+    if i == 0:
+        return name
+    i += int(s[:i])
+    if i < len(s) and s[i] == 'I':
+        depth = 0
+        while i < len(s):
+            c = s[i]
+            if c == 'L':
+                i = s.index('E', i) + 1
+                continue
+            if c == 'I':
+                depth += 1
+            elif c == 'E':
+                depth -= 1
+                if depth == 0:
+                    i += 1
+                    break
+            elif c.isdigit():
+                j = i
+                while s[j].isdigit():
+                    j += 1
+                i = j + int(s[i:j])
+                continue
+            elif c == 'S':
+                i = s.index('_', i) + 1
+                continue
+            i += 1
+    if i >= len(s) or s[i] != 'E':
+        return name
+    digits = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ'
+    out = []
+    j = i + 1
+    while j < len(s):
+        c = s[j]
+        if c.isdigit():  # an identifier: its length, then its characters
+            k = j
+            while s[k].isdigit():
+                k += 1
+            n = int(s[j:k])
+            out.append(s[j:k + n])
+            j = k + n
+            continue
+        if c == 'S' and j + 1 < len(s) and (s[j + 1] == '_' or s[j + 1] in digits):
+            k = j + 1
+            while s[k] != '_':
+                k += 1
+            seq = s[j + 1:k]
+            if seq == '':
+                return name  # S_ is the namespace itself
+            v = 0
+            for d in seq:
+                v = v * 36 + digits.index(d)
+            out.append('S' + base36(v - 1) + '_' if v > 0 else 'S_')
+            j = k + 1
+            continue
+        out.append(c)
+        j += 1
+    return '_ZL' + s[:i] + ''.join(out)
+
+
 def read_assembly(directory, architecture):
     kernels = {}
     units = {}
@@ -53,6 +132,7 @@ def read_assembly(directory, architecture):
                 raise ValueError(f'duplicate translation unit: {unit}')
             units[unit] = len(records)
         for name, usage in records.items():
+            name = without_fork_namespace(name)  # hooks: one name for the upstream and the fork version of a kernel
             previous = kernels.get(name, usage)
             kernels[name] = {field: max(previous[field], usage[field]) for field in FIELDS}
     return kernels, units

@@ -2,7 +2,6 @@ import pytest
 from utils import *
 import base64
 import requests
-import shutil
 import struct
 
 # sequence state file: magic(4) version(4) payload_size(4), then payload_size llama_token words
@@ -783,19 +782,12 @@ def test_slot_restore_damaged_checkpoint_appendix(swa_server, damage):
 
 # the draft blobs of the checkpoint appendix are not covered by the main payload checks,
 # so restoring into a server with another draft KV cache type must not abort
-# with --ctx-checkpoints-dir the restored checkpoints live in files, and the draft test-load must still run:
-# without it the rewind fails to load the draft state and reprocesses the whole prompt
-@pytest.mark.parametrize("ckpt_dir", [False, True], ids=["in_memory", "ckpt_dir"])
 @pytest.mark.parametrize("ctkd_restore", ["f16", "q8_0"])
-def test_slot_restore_checkpoints_draft_kv_type_change(swa_server, ctkd_restore, ckpt_dir):
+def test_slot_restore_checkpoints_draft_kv_type_change(swa_server, ctkd_restore):
     server = swa_server
     server.model_draft_hf_repo = "ggml-org-dev/tinygemma3-GGUF:Q8_0"  # same file as the target, already in the HF cache
     server.spec_type = "draft-simple"
     server.ctkd = "f16"
-    if ckpt_dir:
-        os.makedirs("./tmp/ckpt", exist_ok=True)
-        server.ctx_checkpoints_dir = "./tmp/ckpt"
-        server.ctx_checkpoints_ram = 0
     server.start()
 
     base = "The quick brown fox jumps over the lazy dog. " * 20
@@ -829,9 +821,6 @@ def test_slot_restore_checkpoints_draft_kv_type_change(swa_server, ctkd_restore,
         "filename": "ckpt_draft_slot1.bin",
     })
     assert res.status_code == 200
-    # the reported size covers every part of the file, also the checkpoints read back from --ctx-checkpoints-dir
-    n_written = res.body["n_written"]
-    assert n_written == os.path.getsize(os.path.join(server.slot_save_path, "ckpt_draft_slot1.bin"))
 
     server.stop()
     server.ctkd = ctkd_restore
@@ -841,8 +830,6 @@ def test_slot_restore_checkpoints_draft_kv_type_change(swa_server, ctkd_restore,
         "filename": "ckpt_draft_slot1.bin",
     })
     assert res.status_code == 200
-    # draft data that does not fit the new draft KV type is read and dropped, so it still counts
-    assert res.body["n_read"] == n_written
 
     res = server.make_request("POST", "/completion", data={
         "prompt": base + "But the second ending was different and sad.",
@@ -937,223 +924,3 @@ def test_prompt_cache_swa_window(swa_window_server):
 
     assert cached["cache_n"]  == direct["cache_n"]
     assert cached["prompt_n"] == direct["prompt_n"]
-
-
-# preloaded into the server: every pread of a --ctx-checkpoints-dir file fails with EIO, as on a failing disk
-CKPT_READ_FAIL_SHIM = r'''
-#define _GNU_SOURCE
-#include <dlfcn.h>
-#include <errno.h>
-#include <stdio.h>
-#include <string.h>
-#include <sys/types.h>
-#include <unistd.h>
-
-static int is_ckpt(int fd) {
-    char link[64], path[4096];
-    snprintf(link, sizeof(link), "/proc/self/fd/%d", fd);
-    const ssize_t n = readlink(link, path, sizeof(path) - 1);
-    if (n < 0) {
-        return 0;
-    }
-    path[n] = '\0';
-    return strstr(path, "/llama-ckpt-") != NULL;
-}
-
-ssize_t pread(int fd, void * buf, size_t count, off_t off) {
-    static ssize_t (*real)(int, void *, size_t, off_t);
-    if (!real) {
-        real = (ssize_t (*)(int, void *, size_t, off_t)) dlsym(RTLD_NEXT, "pread");
-    }
-    if (is_ckpt(fd)) {
-        errno = EIO;
-        return -1;
-    }
-    return real(fd, buf, count, off);
-}
-
-ssize_t pread64(int fd, void * buf, size_t count, off64_t off) {
-    static ssize_t (*real)(int, void *, size_t, off64_t);
-    if (!real) {
-        real = (ssize_t (*)(int, void *, size_t, off64_t)) dlsym(RTLD_NEXT, "pread64");
-    }
-    if (is_ckpt(fd)) {
-        errno = EIO;
-        return -1;
-    }
-    return real(fd, buf, count, off);
-}
-'''
-
-
-# a context checkpoint the server made itself, read back from --ctx-checkpoints-dir with a disk error:
-# the rewind must fall back to reprocessing the prompt, not abort the server
-@pytest.mark.skipif(not sys.platform.startswith("linux") or shutil.which("cc") is None,
-                    reason="needs Linux (/proc/self/fd) and a C compiler")
-def test_ctx_checkpoint_read_error_reprocesses(swa_server, monkeypatch):
-    shim_src = os.path.abspath("./tmp/ckpt-read-fail.c")
-    shim = os.path.abspath("./tmp/ckpt-read-fail.so")
-    with open(shim_src, "w") as f:
-        f.write(CKPT_READ_FAIL_SHIM)
-    subprocess.run(["cc", "-shared", "-fPIC", "-o", shim, shim_src, "-ldl"], check=True)
-
-    server = swa_server
-    os.makedirs("./tmp/ckpt", exist_ok=True)
-    server.ctx_checkpoints_dir = "./tmp/ckpt"
-    server.ctx_checkpoints_ram = 0
-    monkeypatch.setenv("LD_PRELOAD", shim)
-    server.start()
-    monkeypatch.delenv("LD_PRELOAD")
-
-    base = "The quick brown fox jumps over the lazy dog. " * 20
-
-    res = server.make_request("POST", "/completion", data={
-        "prompt": base + "The first ending of this story is a happy one.",
-        "id_slot": 1,
-        "cache_prompt": True,
-    })
-    assert res.status_code == 200
-
-    # the diverging prompt rewinds to a checkpoint, and reading its file fails
-    try:
-        res = server.make_request("POST", "/completion", data={
-            "prompt": base + "But the second ending was different and sad.",
-            "id_slot": 1,
-            "cache_prompt": True,
-        })
-    except requests.exceptions.ConnectionError:
-        raise AssertionError("the server died on a failed context checkpoint read")
-    assert res.status_code == 200
-    assert res.body["timings"]["cache_n"] == 0
-    assert server.make_request("GET", "/health").status_code == 200
-
-
-def _ckpt_files(server, path):
-    # the --ctx-checkpoints-dir files the server holds: unlinked, so only /proc/<pid>/fd shows them
-    prefix = os.path.abspath(path) + "/"
-    fd_dir = f"/proc/{server.process.pid}/fd"
-    n = 0
-    for fd in os.listdir(fd_dir):
-        try:
-            target = os.readlink(os.path.join(fd_dir, fd))
-        except OSError:
-            continue
-        if target.startswith(prefix) and target.endswith(" (deleted)"):
-            n += 1
-    return n
-
-
-# --ctx-checkpoints-ram: checkpoints that fit stay in memory and nothing is written; with 0 every checkpoint is
-# written. A rewind to a checkpoint works either way.
-@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="needs /proc/<pid>/fd")
-@pytest.mark.parametrize("ram,written", [(None, False), (0, True)], ids=["default", "zero"])
-def test_ctx_checkpoints_ram(swa_server, ram, written):
-    server = swa_server
-    os.makedirs("./tmp/ckpt", exist_ok=True)
-    server.ctx_checkpoints_dir = "./tmp/ckpt"
-    server.ctx_checkpoints_ram = ram
-    server.start()
-
-    base = "The quick brown fox jumps over the lazy dog. " * 20
-
-    res = server.make_request("POST", "/completion", data={
-        "prompt": base + "The first ending of this story is a happy one.",
-        "id_slot": 1,
-        "cache_prompt": True,
-    })
-    assert res.status_code == 200
-    assert (_ckpt_files(server, "./tmp/ckpt") > 0) == written
-
-    res = server.make_request("POST", "/completion", data={
-        "prompt": base + "But the second ending was different and sad.",
-        "id_slot": 1,
-        "cache_prompt": True,
-    })
-    assert res.status_code == 200
-    assert res.body["timings"]["cache_n"] > 0
-
-
-# --cache-ram counts what a prompt holds in memory: with every checkpoint in a file, a prompt is cached when its
-# state fits, although it does not fit with its checkpoints at full size (here 3.3 MiB in memory, 8.3 MiB in all)
-@pytest.mark.skipif(sys.platform == "win32", reason="--ctx-checkpoints-dir is ignored on Windows")
-def test_cache_ram_counts_checkpoints_in_memory(swa_server):
-    server = swa_server
-    os.makedirs("./tmp/ckpt", exist_ok=True)
-    server.ctx_checkpoints_dir = "./tmp/ckpt"
-    server.ctx_checkpoints_ram = 0
-    server.cache_ram = 5
-    server.start()
-
-    base = "The quick brown fox jumps over the lazy dog. " * 20
-
-    res = server.make_request("POST", "/completion", data={
-        "prompt": base + "The first ending of this story is a happy one.",
-        "id_slot": 0,
-        "cache_prompt": True,
-    })
-    assert res.status_code == 200
-
-    # a new prompt in the same slot moves the first one to the prompt cache
-    res = server.make_request("POST", "/completion", data={
-        "prompt": "Lorem ipsum dolor sit amet, consectetur adipiscing elit. " * 15,
-        "id_slot": 0,
-        "cache_prompt": True,
-    })
-    assert res.status_code == 200
-
-    # the unused slot continues the first prompt from the prompt cache (a request pinned to an empty slot skips the cache)
-    res = server.make_request("POST", "/completion", data={
-        "prompt": base + "The first ending of this story is a happy one. And then",
-        "cache_prompt": True,
-    })
-    assert res.status_code == 200
-    assert res.body["timings"]["cache_n"] > 0
-
-
-# the byte counts of a slot file that holds the draft state appendix, and the place of the appendix in the file;
-# upstream's test_slot_restore_draft_state checks that the draft state comes back, not what save and restore report
-SLOT_DRAFT_MAGIC = struct.pack("<I", 0x54464453)  # "SDFT"
-
-
-def test_slot_save_restore_draft_state_bytes(swa_server):
-    server = swa_server
-    server.model_draft_hf_repo = "ggml-org-dev/tinygemma3-GGUF:Q8_0"  # the target's own file, already in the HF cache
-    server.spec_type = "draft-simple"
-    server.start()
-
-    filename = "draft_slot1.bin"
-    res = server.make_request("POST", "/completion", data={
-        "prompt": "The quick brown fox jumps over the lazy dog. " * 20,
-        "id_slot": 1,
-        "n_predict": 16,
-        "cache_prompt": True,
-    })
-    assert res.status_code == 200
-
-    res = server.make_request("POST", "/slots/1?action=save", data={"filename": filename})
-    assert res.status_code == 200
-    n_written = res.body["n_written"]
-
-    with open(os.path.join(server.slot_save_path, filename), "rb") as f:
-        data = f.read()
-    assert n_written == len(data)
-
-    # the appendix ends the file: read it at its offset and check that it stops exactly at EOF, so a stray
-    # "SDFT" inside the state payload cannot pass for it
-    offset = data.rfind(SLOT_DRAFT_MAGIC)
-    assert offset > 0
-    pos = offset + len(SLOT_DRAFT_MAGIC)
-    version, = struct.unpack_from("<I", data, pos)
-    assert version == 1
-    pos += 4
-    for _ in range(2):  # the draft context state, then the speculative state
-        n_buf, = struct.unpack_from("<Q", data, pos)
-        pos += 8 + n_buf
-    assert pos == len(data)
-
-    res = server.make_request("POST", "/slots/1?action=erase")
-    assert res.status_code == 200
-
-    res = server.make_request("POST", "/slots/1?action=restore", data={"filename": filename})
-    assert res.status_code == 200
-    assert res.body["n_read"] == n_written

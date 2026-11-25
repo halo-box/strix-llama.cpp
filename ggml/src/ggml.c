@@ -11,10 +11,6 @@
 // FIXME: required here for quantization functions
 #include "ggml-quants.h"
 
-// ROCmFPx experimental AMD-native quant formats
-#include "../rocmfp4/rocmfp4.h"
-#include "../rocmfpx/rocmfpx.h"
-
 #ifdef GGML_USE_CPU_HBM
 #include <hbwmalloc.h>
 #endif
@@ -641,6 +637,7 @@ FILE * ggml_fopen(const char * fname, const char * mode) {
 }
 
 static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
+    GGML_HOOK_TYPE_TRAITS // HOOK(type-traits)
     [GGML_TYPE_I8] = {
         .type_name                = "i8",
         .blck_size                = 1,
@@ -701,62 +698,6 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .to_float                 = (ggml_to_float_t) dequantize_row_q2_0,
         .from_float_ref           = (ggml_from_float_t) quantize_row_q2_0_ref,
     },
-    [GGML_TYPE_PTQ1_0] = {
-        .type_name                = "ptq1_0",
-        .blck_size                = QK_PTQ1_0,
-        .type_size                = sizeof(block_ptq1_0),
-        .is_quantized             = true,
-        .to_float                 = (ggml_to_float_t) dequantize_row_ptq1_0,
-        .from_float_ref           = (ggml_from_float_t) quantize_row_ptq1_0_ref,
-    },
-    [GGML_TYPE_TQ2_T] = {
-        .type_name                = "tq2_t",
-        .blck_size                = QK_TQ2_T,
-        .type_size                = sizeof(block_tq2_t),
-        .is_quantized             = true,
-        .to_float                 = (ggml_to_float_t) dequantize_row_tq2_t,
-        .from_float_ref           = (ggml_from_float_t) quantize_row_tq2_t_ref,
-    },
-    [GGML_TYPE_TQK6] = {
-        .type_name                = "tqk6",
-        .blck_size                = QK_TQK,
-        .type_size                = sizeof(block_tqk6),
-        .is_quantized             = true,
-        .to_float                 = (ggml_to_float_t) dequantize_row_tqk6,
-        .from_float_ref           = (ggml_from_float_t) quantize_row_tqk6_ref,
-    },
-    [GGML_TYPE_TQK7] = {
-        .type_name                = "tqk7",
-        .blck_size                = QK_TQK,
-        .type_size                = sizeof(block_tqk7),
-        .is_quantized             = true,
-        .to_float                 = (ggml_to_float_t) dequantize_row_tqk7,
-        .from_float_ref           = (ggml_from_float_t) quantize_row_tqk7_ref,
-    },
-    [GGML_TYPE_TQP5] = {
-        .type_name                = "tqp5",
-        .blck_size                = QK_TQP,
-        .type_size                = sizeof(block_tqp5),
-        .is_quantized             = true,
-        .to_float                 = (ggml_to_float_t) dequantize_row_tqp5,
-        .from_float_ref           = (ggml_from_float_t) quantize_row_tqp5_ref,
-    },
-    [GGML_TYPE_TQP6] = {
-        .type_name                = "tqp6",
-        .blck_size                = QK_TQP,
-        .type_size                = sizeof(block_tqp6),
-        .is_quantized             = true,
-        .to_float                 = (ggml_to_float_t) dequantize_row_tqp6,
-        .from_float_ref           = (ggml_from_float_t) quantize_row_tqp6_ref,
-    },
-    [GGML_TYPE_TQP7] = {
-        .type_name                = "tqp7",
-        .blck_size                = QK_TQP,
-        .type_size                = sizeof(block_tqp7),
-        .is_quantized             = true,
-        .to_float                 = (ggml_to_float_t) dequantize_row_tqp7,
-        .from_float_ref           = (ggml_from_float_t) quantize_row_tqp7_ref,
-    },
     [GGML_TYPE_Q4_0] = {
         .type_name                = "q4_0",
         .blck_size                = QK4_0,
@@ -764,54 +705,6 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .is_quantized             = true,
         .to_float                 = (ggml_to_float_t) dequantize_row_q4_0,
         .from_float_ref           = (ggml_from_float_t) quantize_row_q4_0_ref,
-    },
-    [GGML_TYPE_Q4_0_ROCMFP4] = {
-        .type_name                = "q4_0_rocmfp4",
-        .blck_size                = QK_ROCMFP4,
-        .type_size                = sizeof(block_rocmfp4),
-        .is_quantized             = true,
-        .to_float                 = (ggml_to_float_t) rocmfp4_dequantize_row_q4_0,
-        .from_float_ref           = (ggml_from_float_t) rocmfp4_quantize_row_q4_0_ref,
-    },
-    [GGML_TYPE_Q4_0_ROCMFP4_FAST] = {
-        .type_name                = "q4_0_rocmfp4_fast",
-        .blck_size                = QK_ROCMFP4,
-        .type_size                = sizeof(block_rocmfp4_fast),
-        .is_quantized             = true,
-        .to_float                 = (ggml_to_float_t) rocmfp4_dequantize_row_q4_0_fast,
-        .from_float_ref           = (ggml_from_float_t) rocmfp4_quantize_row_q4_0_fast_ref,
-    },
-    [GGML_TYPE_Q3_0_ROCMFPX] = {
-        .type_name                = "q3_0_rocmfpx",
-        .blck_size                = QK_ROCMFP3,
-        .type_size                = sizeof(block_rocmfp3),
-        .is_quantized             = true,
-        .to_float                 = (ggml_to_float_t) rocmfpx_dequantize_row_fp3,
-        .from_float_ref           = (ggml_from_float_t) rocmfpx_quantize_row_fp3_ref,
-    },
-    [GGML_TYPE_Q2_0_ROCMFPX] = {
-        .type_name                = "q2_0_rocmfpx",
-        .blck_size                = QK_ROCMFP2,
-        .type_size                = sizeof(block_rocmfp2),
-        .is_quantized             = true,
-        .to_float                 = (ggml_to_float_t) rocmfpx_dequantize_row_fp2,
-        .from_float_ref           = (ggml_from_float_t) rocmfpx_quantize_row_fp2_ref,
-    },
-    [GGML_TYPE_Q6_0_ROCMFPX] = {
-        .type_name                = "q6_0_rocmfpx",
-        .blck_size                = QK_ROCMFP6,
-        .type_size                = sizeof(block_rocmfp6),
-        .is_quantized             = true,
-        .to_float                 = (ggml_to_float_t) rocmfpx_dequantize_row_fp6,
-        .from_float_ref           = (ggml_from_float_t) rocmfpx_quantize_row_fp6_ref,
-    },
-    [GGML_TYPE_Q8_0_ROCMFPX] = {
-        .type_name                = "q8_0_rocmfpx",
-        .blck_size                = QK_ROCMFP8,
-        .type_size                = sizeof(block_rocmfp8),
-        .is_quantized             = true,
-        .to_float                 = (ggml_to_float_t) rocmfpx_dequantize_row_fp8,
-        .from_float_ref           = (ggml_from_float_t) rocmfpx_quantize_row_fp8_ref,
     },
     [GGML_TYPE_Q4_1] = {
         .type_name                = "q4_1",
@@ -1220,13 +1113,9 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_SGD",
 
     "GLU",
-
-    "EXL3_MUL_MAT",
-    "EXL3_GET_ROWS",
-    "EXL3_MUL_MAT_ID",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 99, "GGML_OP_COUNT != 99");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1337,13 +1226,9 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sgd(x)",
 
     "glu(x)",
-
-    "exl3(X)*y",
-    "exl3_get_rows(x)",
-    "exl3(X)[ids]*y",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 99, "GGML_OP_COUNT != 99");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -1556,26 +1441,6 @@ enum ggml_type ggml_ftype_to_ggml_type(enum ggml_ftype ftype) {
         case GGML_FTYPE_MOSTLY_Q4_1:          wtype = GGML_TYPE_Q4_1;  break;
         case GGML_FTYPE_MOSTLY_Q1_0:          wtype = GGML_TYPE_Q1_0;  break;
         case GGML_FTYPE_MOSTLY_Q2_0:          wtype = GGML_TYPE_Q2_0;  break;
-        case GGML_FTYPE_MOSTLY_Q4_0_ROCMFP4:
-        case GGML_FTYPE_MOSTLY_Q4_0_ROCMFP4_LEAN:
-        case GGML_FTYPE_MOSTLY_Q4_0_ROCMFP4_COHERENT:
-            wtype = GGML_TYPE_Q4_0_ROCMFP4; break;
-        case GGML_FTYPE_MOSTLY_Q4_0_ROCMFP4_FAST:
-        case GGML_FTYPE_MOSTLY_Q4_0_ROCMFP4_FAST_COHERENT:
-        case GGML_FTYPE_MOSTLY_Q4_0_ROCMFP4_STRIX:
-        case GGML_FTYPE_MOSTLY_Q4_0_ROCMFP4_STRIX_LEAN:
-            wtype = GGML_TYPE_Q4_0_ROCMFP4_FAST; break;
-        case GGML_FTYPE_MOSTLY_Q3_0_ROCMFPX:  wtype = GGML_TYPE_Q3_0_ROCMFPX; break;
-        case GGML_FTYPE_MOSTLY_Q2_0_ROCMFPX:  wtype = GGML_TYPE_Q2_0_ROCMFPX; break;
-        case GGML_FTYPE_MOSTLY_Q6_0_ROCMFPX:  wtype = GGML_TYPE_Q6_0_ROCMFPX; break;
-        case GGML_FTYPE_MOSTLY_Q8_0_ROCMFPX:  wtype = GGML_TYPE_Q8_0_ROCMFPX; break;
-        case GGML_FTYPE_MOSTLY_PTQ1_0:        wtype = GGML_TYPE_PTQ1_0; break;
-        case GGML_FTYPE_MOSTLY_TQ2_T:         wtype = GGML_TYPE_TQ2_T; break;
-        case GGML_FTYPE_MOSTLY_TQK6:         wtype = GGML_TYPE_TQK6; break;
-        case GGML_FTYPE_MOSTLY_TQK7:         wtype = GGML_TYPE_TQK7; break;
-        case GGML_FTYPE_MOSTLY_TQP5:         wtype = GGML_TYPE_TQP5; break;
-        case GGML_FTYPE_MOSTLY_TQP6:         wtype = GGML_TYPE_TQP6; break;
-        case GGML_FTYPE_MOSTLY_TQP7:         wtype = GGML_TYPE_TQP7; break;
         case GGML_FTYPE_MOSTLY_Q5_0:          wtype = GGML_TYPE_Q5_0;  break;
         case GGML_FTYPE_MOSTLY_Q5_1:          wtype = GGML_TYPE_Q5_1;  break;
         case GGML_FTYPE_MOSTLY_Q8_0:          wtype = GGML_TYPE_Q8_0;  break;
@@ -5640,21 +5505,6 @@ void ggml_flash_attn_ext_set_n_kv_max(
     ggml_set_op_params_i32(a, 4, n_kv_max);
 }
 
-void ggml_flash_attn_ext_set_causal_prefix(
-        struct ggml_tensor * a,
-        bool                 causal_prefix) {
-    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
-
-    ggml_set_op_params_i32(a, 5, causal_prefix ? 1 : 0);
-}
-
-bool ggml_flash_attn_ext_get_causal_prefix(
-        const struct ggml_tensor * a) {
-    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
-
-    return ggml_get_op_params_i32(a, 5) != 0;
-}
-
 void ggml_flash_attn_ext_add_sinks(
         struct ggml_tensor * a,
         struct ggml_tensor * sinks) {
@@ -5669,22 +5519,6 @@ void ggml_flash_attn_ext_add_sinks(
     GGML_ASSERT(sinks->type == GGML_TYPE_F32);
 
     a->src[4] = sinks;
-}
-
-void ggml_flash_attn_ext_add_top_k(
-        struct ggml_tensor * a,
-        struct ggml_tensor * top_k,
-                 int64_t     n_kv_raw) {
-    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
-    // src[5] is kv_rows (ggml_flash_attn_ext_rows): the selected-key list indexes the dense K/V view, so the two do not mix
-    GGML_ASSERT(a->src[5] == NULL);
-    GGML_ASSERT(a->src[6] == NULL);
-    GGML_ASSERT(top_k->type == GGML_TYPE_I32);
-    GGML_ASSERT(top_k->ne[1] == a->src[0]->ne[1]);
-    GGML_ASSERT(n_kv_raw >= 0 && n_kv_raw <= a->src[1]->ne[1]);
-
-    a->src[6] = top_k;
-    ggml_set_op_params_i32(a, 4, (int32_t) n_kv_raw);
 }
 
 // ggml_flash_attn_back
@@ -6616,13 +6450,9 @@ static struct ggml_tensor * ggml_dsv4_hc_pre_impl(
         struct ggml_tensor  * x,
         struct ggml_tensor  * weights,
         float                 scale,
-        bool                  gated,
-        enum ggml_type        out_type) {
-    // the gated form may write an f16 mixed stream (every consumer is a matmul B operand)
-    GGML_ASSERT(out_type == GGML_TYPE_F32 || (gated && out_type == GGML_TYPE_F16));
-    // the gated form also takes an f16 x and an f16 gate (backends opt in through supports_op)
-    GGML_ASSERT(x->type == GGML_TYPE_F32 || (gated && x->type == GGML_TYPE_F16));
-    GGML_ASSERT(weights->type == GGML_TYPE_F32 || (gated && weights->type == GGML_TYPE_F16));
+        bool                  gated) {
+    GGML_ASSERT(x->type == GGML_TYPE_F32);
+    GGML_ASSERT(weights->type == GGML_TYPE_F32);
 
     const int64_t n_embd   = x->ne[0];
     const int64_t hc       = x->ne[1];
@@ -6641,7 +6471,7 @@ static struct ggml_tensor * ggml_dsv4_hc_pre_impl(
     }
     GGML_ASSERT(weights->ne[3] == 1);
 
-    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, out_type, n_embd, n_tokens);
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
 
     ggml_set_op_params_f32(result, 0, scale);
     ggml_set_op_params_i32(result, 1, gated ? 1 : 0);
@@ -6657,7 +6487,7 @@ struct ggml_tensor * ggml_dsv4_hc_pre(
         struct ggml_context * ctx,
         struct ggml_tensor  * x,
         struct ggml_tensor  * weights) {
-    return ggml_dsv4_hc_pre_impl(ctx, x, weights, 1.0f, false, GGML_TYPE_F32);
+    return ggml_dsv4_hc_pre_impl(ctx, x, weights, 1.0f, false);
 }
 
 struct ggml_tensor * ggml_dsv4_hc_pre_gated(
@@ -6665,16 +6495,7 @@ struct ggml_tensor * ggml_dsv4_hc_pre_gated(
         struct ggml_tensor  * x,
         struct ggml_tensor  * gate,
         float                 scale) {
-    return ggml_dsv4_hc_pre_impl(ctx, x, gate, scale, true, GGML_TYPE_F32);
-}
-
-struct ggml_tensor * ggml_dsv4_hc_pre_gated_ext(
-        struct ggml_context * ctx,
-        struct ggml_tensor  * x,
-        struct ggml_tensor  * gate,
-        float                 scale,
-        enum ggml_type        out_type) {
-    return ggml_dsv4_hc_pre_impl(ctx, x, gate, scale, true, out_type);
+    return ggml_dsv4_hc_pre_impl(ctx, x, gate, scale, true);
 }
 
 // ggml_dsv4_hc_post
@@ -6721,113 +6542,6 @@ struct ggml_tensor * ggml_dsv4_hc_post(
     result->src[1] = residual;
     result->src[2] = post;
     result->src[3] = comb;
-
-    return result;
-}
-
-// ggml_exl3_mul_mat
-
-struct ggml_tensor * ggml_exl3_mul_mat(
-        struct ggml_context * ctx,
-        struct ggml_tensor  * trellis,
-        struct ggml_tensor  * x,
-        struct ggml_tensor  * suh,
-        struct ggml_tensor  * svh,
-        int                   codebook) {
-    GGML_ASSERT(trellis->type == GGML_TYPE_I16 && ggml_is_contiguous(trellis) && trellis->ne[3] == 1);
-    GGML_ASSERT(suh->type == GGML_TYPE_F16 && svh->type == GGML_TYPE_F16);
-    GGML_ASSERT(x->type == GGML_TYPE_F32);
-    GGML_ASSERT(codebook >= 0 && codebook <= 2);
-
-    // tiles are 16x16 and the Hadamard blocks 128 wide
-    const int64_t k = trellis->ne[2]*16;
-    const int64_t n = trellis->ne[1]*16;
-    GGML_ASSERT(k % 128 == 0 && n % 128 == 0);
-    GGML_ASSERT(ggml_is_vector(suh) && ggml_is_contiguous(suh) && suh->ne[0] == k);
-    GGML_ASSERT(ggml_is_vector(svh) && ggml_is_contiguous(svh) && svh->ne[0] == n);
-    GGML_ASSERT(x->ne[0] == k);
-
-    const int64_t ne[4] = { n, x->ne[1], x->ne[2], x->ne[3] };
-    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
-
-    ggml_set_op_params_i32(result, 0, codebook);
-
-    result->op     = GGML_OP_EXL3_MUL_MAT;
-    result->src[0] = trellis;
-    result->src[1] = x;
-    result->src[2] = suh;
-    result->src[3] = svh;
-
-    return result;
-}
-
-// ggml_exl3_mul_mat_id
-
-struct ggml_tensor * ggml_exl3_mul_mat_id(
-        struct ggml_context * ctx,
-        struct ggml_tensor  * trellis,
-        struct ggml_tensor  * x,
-        struct ggml_tensor  * ids,
-        struct ggml_tensor  * suh,
-        struct ggml_tensor  * svh,
-        int                   codebook) {
-    GGML_ASSERT(trellis->type == GGML_TYPE_I16 && ggml_is_contiguous(trellis));
-    GGML_ASSERT(suh->type == GGML_TYPE_F16 && svh->type == GGML_TYPE_F16 && ggml_is_contiguous(suh) && ggml_is_contiguous(svh));
-    GGML_ASSERT(x->type == GGML_TYPE_F32 && x->ne[3] == 1);
-    GGML_ASSERT(ids->type == GGML_TYPE_I32 && ids->ne[2] == 1 && ids->ne[3] == 1);
-    GGML_ASSERT(codebook >= 0 && codebook <= 2);
-
-    // one EXL3 linear per expert, as ggml_exl3_mul_mat
-    const int64_t k = trellis->ne[2]*16;
-    const int64_t n = trellis->ne[1]*16;
-    const int64_t E = trellis->ne[3];
-    GGML_ASSERT(k % 128 == 0 && n % 128 == 0);
-    GGML_ASSERT(suh->ne[0] == k && suh->ne[1] == E && suh->ne[2] == 1 && suh->ne[3] == 1);
-    GGML_ASSERT(svh->ne[0] == n && svh->ne[1] == E && svh->ne[2] == 1 && svh->ne[3] == 1);
-    // as ggml_mul_mat_id: an expert list per token, x broadcast over the slots
-    GGML_ASSERT(x->ne[0] == k && ids->ne[1] == x->ne[2] && ids->ne[0] % x->ne[1] == 0);
-
-    const int64_t ne[4] = { n, ids->ne[0], x->ne[2], 1 };
-    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
-
-    ggml_set_op_params_i32(result, 0, codebook);
-
-    result->op     = GGML_OP_EXL3_MUL_MAT_ID;
-    result->src[0] = trellis;
-    result->src[1] = x;
-    result->src[2] = ids;
-    result->src[3] = suh;
-    result->src[4] = svh;
-
-    return result;
-}
-
-// ggml_exl3_get_rows
-
-struct ggml_tensor * ggml_exl3_get_rows(
-        struct ggml_context * ctx,
-        struct ggml_tensor  * table,
-        struct ggml_tensor  * ids,
-        struct ggml_tensor  * signs,
-        int64_t               n_out) {
-    GGML_ASSERT(table->type == GGML_TYPE_I16 && ggml_is_contiguous(table) && ggml_n_dims(table) <= 2);
-    GGML_ASSERT(ids->type == GGML_TYPE_I32 && ggml_is_vector(ids));
-    GGML_ASSERT(signs->type == GGML_TYPE_F16 && ggml_is_contiguous(signs) && signs->ne[0] == 256 && ggml_n_dims(signs) <= 2);
-
-    // a row is one ring of 1 + 16*K words per group of 256, K = 1..8
-    const int64_t groups = signs->ne[1];
-    const int64_t rw     = table->ne[0] % groups == 0 ? table->ne[0]/groups - 1 : 0;
-    GGML_ASSERT(rw >= 16 && rw <= 128 && rw % 16 == 0);
-    GGML_ASSERT(n_out > 0 && n_out <= groups*256);
-
-    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_out, ids->ne[0]);
-
-    ggml_set_op_params_i32(result, 0, (int32_t) n_out);
-
-    result->op     = GGML_OP_EXL3_GET_ROWS;
-    result->src[0] = table;
-    result->src[1] = ids;
-    result->src[2] = signs;
 
     return result;
 }
@@ -8316,24 +8030,6 @@ size_t ggml_quantize_chunk(
         case GGML_TYPE_Q1_0:    result = quantize_q1_0   (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q2_0:    result = quantize_q2_0   (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q4_0:    result = quantize_q4_0   (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
-        case GGML_TYPE_Q4_0_ROCMFP4:
-            result = rocmfp4_quantize_q4_0(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix);
-            break;
-        case GGML_TYPE_Q4_0_ROCMFP4_FAST:
-            result = rocmfp4_quantize_q4_0_fast(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix);
-            break;
-        case GGML_TYPE_Q3_0_ROCMFPX:
-            result = rocmfpx_quantize_fp3(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix);
-            break;
-        case GGML_TYPE_Q2_0_ROCMFPX:
-            result = rocmfpx_quantize_fp2(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix);
-            break;
-        case GGML_TYPE_Q6_0_ROCMFPX:
-            result = rocmfpx_quantize_fp6(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix);
-            break;
-        case GGML_TYPE_Q8_0_ROCMFPX:
-            result = rocmfpx_quantize_fp8(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix);
-            break;
         case GGML_TYPE_Q4_1:    result = quantize_q4_1   (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q5_0:    result = quantize_q5_0   (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q5_1:    result = quantize_q5_1   (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
@@ -8346,13 +8042,6 @@ size_t ggml_quantize_chunk(
         case GGML_TYPE_Q4_K:    result = quantize_q4_K   (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q5_K:    result = quantize_q5_K   (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q6_K:    result = quantize_q6_K   (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
-        case GGML_TYPE_PTQ1_0:  result = quantize_ptq1_0 (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
-        case GGML_TYPE_TQ2_T:   result = quantize_tq2_t  (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
-        case GGML_TYPE_TQK6:   result = quantize_tqk6  (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
-        case GGML_TYPE_TQK7:   result = quantize_tqk7  (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
-        case GGML_TYPE_TQP5:   result = quantize_tqp5  (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
-        case GGML_TYPE_TQP6:   result = quantize_tqp6  (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
-        case GGML_TYPE_TQP7:   result = quantize_tqp7  (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_TQ1_0:   result = quantize_tq1_0  (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_TQ2_0:   result = quantize_tq2_0  (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_IQ2_XXS: result = quantize_iq2_xxs(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
@@ -8383,6 +8072,7 @@ size_t ggml_quantize_chunk(
                 memcpy((uint8_t *)dst + start * elemsize, src + start, result);
             } break;
         default:
+            if (GGML_HOOK_TYPE_QUANTIZE(type, src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix, &result)) break; // HOOK(type-quantize)
             assert(false);
     }
 

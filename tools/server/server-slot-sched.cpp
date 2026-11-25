@@ -93,10 +93,9 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     }
 
     // calculate checkpoints size to see if it will fit with the prompt
-    // --cache-ram counts memory, as server_prompt_cache_state::size() does: a written checkpoint holds its state in a file
     size_t checkpoints_size = 0;
     for (const auto & ckpt : prompt.checkpoints) {
-        checkpoints_size += ckpt->size_mem();
+        checkpoints_size += ckpt->size();
     }
 
     const size_t state_size_new = state_size_tgt + state_size_dft + checkpoints_size;
@@ -159,7 +158,6 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
             /*.main =*/ std::move(state_data_tgt),
             /*.drft =*/ std::move(state_data_dft),
         },
-        /*.id     =*/ ++id_last,
     });
 
     return &states.back();
@@ -209,10 +207,11 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
             if (n != size) {
                 SRV_ERR("failed to restore state with size %zu\n", size);
 
-                id_failed = it_best->id;
-
                 return false;
             }
+
+            data.clear();
+            data.shrink_to_fit();
         }
 
         {
@@ -225,8 +224,6 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
                 const size_t n = llama_state_seq_set_data_ext(ctx_dft, data.data(), size, id_slot, 0);
                 if (n != size) {
                     SRV_WRN("failed to restore state with size %zu\n", size);
-
-                    id_failed = it_best->id;
 
                     return false;
                 }
@@ -249,12 +246,6 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
     }
 
     return true;
-}
-
-bool server_prompt_cache::contains(uint64_t id) const {
-    return std::any_of(states.begin(), states.end(), [id](const server_prompt_cache_state & state) {
-        return state.id == id;
-    });
 }
 
 void server_prompt_cache::update() {

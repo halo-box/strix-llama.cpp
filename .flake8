@@ -5,6 +5,8 @@ exclude =
     # Do not traverse examples and tools
     examples,
     tools,
+    # hooks: the copies of the fork tools and examples
+    hooks/apps,
     # Do not traverse .venv directories
     .venv*,
     # Do not include package initializers

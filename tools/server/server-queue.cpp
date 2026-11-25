@@ -22,8 +22,7 @@
 //
 
 static bool task_resets_idle_timer(server_task_type type) {
-    // polling stats endpoints must not keep the model awake
-    return type != SERVER_TASK_TYPE_METRICS && type != SERVER_TASK_TYPE_DASHBOARD;
+    return type != SERVER_TASK_TYPE_METRICS;
 }
 
 int server_queue::post(server_task && task, bool front) {
