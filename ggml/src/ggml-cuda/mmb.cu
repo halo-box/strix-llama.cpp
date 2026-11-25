@@ -3663,11 +3663,20 @@ __device__ __forceinline__ void g2_sb2(const uint4 hg, const uint4 hu, const uin
 // Q6 (down only): the G6 layout of a Q6_K down, one f16 scale per 16-K piece.
 // PL (down mode): a dense Q4_K weight [K, M] in its own layout (the G2 byte swap done in registers), activation rows
 // 0 .. T - 1 in place of routed rows, block b = (token tile b / (M / BM), column block b % (M / BM)), no descriptors.
+struct g2_pl_segs {
+    const uint8_t * w[3];
+    float * d[3];
+    uint16_t * dh[3];
+    int m[3];
+    int cbe[3];
+    int n;
+};
+
 template <int K, int TN, bool GLU, bool Q6 = false, bool PL = false, int NW = 8>
 __global__ void __launch_bounds__(NW * 32) __attribute__((amdgpu_waves_per_eu(TN <= 4 ? 8 : 1)))
 mmb_g2_kernel(const uint8_t * __restrict__ Wg, const uint8_t * __restrict__ Wu, const size_t eb, const uint16_t * __restrict__ X,
         const int32_t * __restrict__ ids_src, const int32_t * __restrict__ ids_dst, const uint4 * __restrict__ descs,
-        uint16_t * __restrict__ Dh, float * __restrict__ D, const int M, const int T) {
+        uint16_t * __restrict__ Dh, float * __restrict__ D, int M, const int T, const g2_pl_segs segs) {
 #if defined(__HIP_DEVICE_COMPILE__) && !defined(RDNA3)
     NO_DEVICE_CODE;
 #else
@@ -3683,8 +3692,10 @@ mmb_g2_kernel(const uint8_t * __restrict__ Wg, const uint8_t * __restrict__ Wu, 
     __shared__ __align__(16) _Float16 Bs[2][BSZA];
     int cnt, e, cb, r0;
     if constexpr (PL) {
-        const int n_cb = M / BM, tt = (int) blockIdx.x / n_cb;
-        e = 0; cb = (int) blockIdx.x % n_cb; r0 = tt * BN; cnt = min(BN, T - r0);
+        const int n_cb = segs.cbe[segs.n - 1], tt = (int) blockIdx.x / n_cb, cbg = (int) blockIdx.x % n_cb;
+        const int sg = cbg < segs.cbe[0] ? 0 : cbg < segs.cbe[1] ? 1 : 2;
+        Wg = Wu = segs.w[sg]; D = segs.d[sg]; Dh = segs.dh[sg]; M = segs.m[sg];
+        e = 0; cb = cbg - (sg ? segs.cbe[sg - 1] : 0); r0 = tt * BN; cnt = min(BN, T - r0);
     } else {
         const uint4 dsc = descs[blockIdx.x];
         cnt = (int) dsc.w;
@@ -4302,22 +4313,48 @@ bool ggml_cuda_mmb_g2_dense_supported(ggml_backend_cuda_context & ctx, const ggm
     return T >= 64 && T <= INT32_MAX / 4096 && ggml_nrows(dst) == T && (size_t) src0->nb[1] == (size_t) (src0->ne[0] / 256) * 144;
 }
 
-void ggml_cuda_mul_mat_g2_dense(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+void ggml_cuda_mul_mat_g2_dense_group(ggml_backend_cuda_context & ctx, const ggml_tensor * const * src0, const ggml_tensor * src1,
+        ggml_tensor * const * dst, const int n) {
+    GGML_ASSERT(n >= 1 && n <= 3);
     cudaStream_t stream = ctx.stream();
-    const int K = (int) src0->ne[0], M = (int) src0->ne[1];
+    const int K = (int) src0[0]->ne[0];
     const int T = (int) (src1->ne[1] * src1->ne[2] * src1->ne[3]);
     const uint16_t * xhp = mmb_bf16_activation(ctx, src1, (size_t) T * K, stream);
-    uint16_t * Dh = ggml_cuda_mmb_is_bf16_only(ctx, dst) ? (uint16_t *) dst->data : nullptr;
-    float * D = Dh ? nullptr : (float *) dst->data;
-    const uint8_t * W = (const uint8_t *) src0->data;
-    auto launch = [&](auto kt, auto tn) {
-        constexpr int KK = decltype(kt)::value, TN = decltype(tn)::value;
-        const int nb = (M / G2_DOWN_BM) * ((T + 16 * TN - 1) / (16 * TN));
-        mmb_g2_kernel<KK, TN, false, false, true><<<nb, 256, 0, stream>>>(W, W, 0, xhp, nullptr, nullptr, nullptr, Dh, D, M, T);
+    g2_pl_segs segs{};
+    segs.n = n;
+    for (int s = 0; s < n; ++s) {
+        GGML_ASSERT(src0[s]->ne[0] == K);
+        segs.w[s] = (const uint8_t *) src0[s]->data;
+        segs.dh[s] = ggml_cuda_mmb_is_bf16_only(ctx, dst[s]) ? (uint16_t *) dst[s]->data : nullptr;
+        segs.d[s] = segs.dh[s] ? nullptr : (float *) dst[s]->data;
+        segs.m[s] = (int) src0[s]->ne[1];
+    }
+    auto launch = [&](auto kt, auto nw) {
+        constexpr int KK = decltype(kt)::value, TN = 4, NW = decltype(nw)::value;
+        for (int s = 0; s < n; ++s) segs.cbe[s] = (s ? segs.cbe[s - 1] : 0) + segs.m[s] / (NW * 32);
+        for (int s = n; s < 3; ++s) segs.cbe[s] = segs.cbe[n - 1];
+        const int nb = segs.cbe[n - 1] * ((T + 16 * TN - 1) / (16 * TN));
+        mmb_g2_kernel<KK, TN, false, false, true, NW><<<nb, NW * 32, 0, stream>>>(nullptr, nullptr, 0, xhp, nullptr, nullptr, nullptr, nullptr, nullptr, 0, T, segs);
     };
-    if (K == 2048) launch(std::integral_constant<int, 2048>{}, std::integral_constant<int, 4>{});
-    else           launch(std::integral_constant<int, 4096>{}, std::integral_constant<int, 4>{});
+    int n_cb8 = 0;
+    for (int s = 0; s < n; ++s) n_cb8 += segs.m[s] / 256;
+    auto pick = [&](auto kt) {
+        constexpr int KK = decltype(kt)::value;
+        static const int resident = [&] {
+            int per_sm = 0;
+            CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, mmb_g2_kernel<KK, 4, false, false, true, 8>, 256, 0));
+            return std::max(1, per_sm) * ggml_cuda_info().devices[ctx.device].nsm;
+        }();
+        if ((int64_t) n_cb8 * ((T + 63) / 64) < resident) launch(kt, std::integral_constant<int, 4>{});
+        else                                              launch(kt, std::integral_constant<int, 8>{});
+    };
+    if (K == 2048) pick(std::integral_constant<int, 2048>{});
+    else           pick(std::integral_constant<int, 4096>{});
     CUDA_CHECK(cudaGetLastError());
+}
+
+void ggml_cuda_mul_mat_g2_dense(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    ggml_cuda_mul_mat_g2_dense_group(ctx, &src0, src1, &dst, 1);
 }
 
 bool ggml_cuda_mmb_down_g2_wanted(ggml_backend_cuda_context & ctx, const ggml_tensor * t) {
@@ -4361,9 +4398,9 @@ static bool mmb_down_g2_launch(ggml_backend_cuda_context & ctx, const ggml_tenso
     }
     const uint8_t * W = (const uint8_t *) src0->data;
     if (src0->type == GGML_TYPE_Q6_K) {
-        mmb_g2_kernel<G2_DOWN_K, TN, false, true><<<n_max, 256, 0, stream>>>(W, W, (size_t) src0->nb[2], xhp, ids_src1, ids_dst, desc.get(), Dh, D, M, 0);
+        mmb_g2_kernel<G2_DOWN_K, TN, false, true><<<n_max, 256, 0, stream>>>(W, W, (size_t) src0->nb[2], xhp, ids_src1, ids_dst, desc.get(), Dh, D, M, 0, g2_pl_segs{});
     } else {
-        mmb_g2_kernel<G2_DOWN_K, TN, false><<<n_max, 256, 0, stream>>>(W, W, (size_t) src0->nb[2], xhp, ids_src1, ids_dst, desc.get(), Dh, D, M, 0);
+        mmb_g2_kernel<G2_DOWN_K, TN, false><<<n_max, 256, 0, stream>>>(W, W, (size_t) src0->nb[2], xhp, ids_src1, ids_dst, desc.get(), Dh, D, M, 0, g2_pl_segs{});
     }
     CUDA_CHECK(cudaGetLastError());
     return true;
@@ -4383,7 +4420,7 @@ static void mmb_glu_r2_launch(ggml_backend_cuda_context & ctx, const ggml_tensor
     const size_t eb = gw->nb[2];
     auto launch = [&](auto kt) {
         constexpr int KK = decltype(kt)::value;
-        mmb_g2_kernel<KK, TN, true><<<n_max, 256, 0, stream>>>(Wg, Wu, eb, xhp, ids_src1, ids_dst, desc.get(), Dh, D, M, 0);
+        mmb_g2_kernel<KK, TN, true><<<n_max, 256, 0, stream>>>(Wg, Wu, eb, xhp, ids_src1, ids_dst, desc.get(), Dh, D, M, 0, g2_pl_segs{});
     };
     if (K == 2560) launch(std::integral_constant<int, 2560>{});
     else if (K == 2048) launch(std::integral_constant<int, 2048>{});

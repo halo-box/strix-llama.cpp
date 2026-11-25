@@ -84,6 +84,8 @@ bool ggml_cuda_mmb_g2_glu_gemv_ok(const ggml_tensor * gw, const ggml_tensor * uw
 // dense Q4_K [K in {2048, 4096}, M % 256 == 0] GEMM from 64 rows on the G2 decode, weights in their own layout
 bool ggml_cuda_mmb_g2_dense_supported(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst);
 void ggml_cuda_mul_mat_g2_dense(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
+void ggml_cuda_mul_mat_g2_dense_group(ggml_backend_cuda_context & ctx, const ggml_tensor * const * src0, const ggml_tensor * src1,
+        ggml_tensor * const * dst, int n);
 bool ggml_cuda_mmb_down_g2_wanted(ggml_backend_cuda_context & ctx, const ggml_tensor * mmid);
 void ggml_cuda_mmb_down_g2_prepare(ggml_backend_cuda_context & ctx, const ggml_tensor * w);
 bool ggml_cuda_mmb_down_g2_packed(const ggml_tensor * w);

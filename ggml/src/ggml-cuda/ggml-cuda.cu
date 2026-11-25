@@ -6316,6 +6316,44 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 #endif // defined(GGML_USE_HIP)
 
+    if (node->op == GGML_OP_MUL_MAT && !ggml_cuda_op_mul_mat_use_fwht(node) &&
+            ggml_cuda_mmb_g2_dense_supported(*cuda_ctx, node->src[0], node->src[1], node)) {
+        const ggml_tensor * w[3] = {node->src[0]};
+        ggml_tensor * d[3] = {node};
+        int out_nodes[3] = {i};
+        int n = 1, j_end = i;
+        for (int j = i + 1; j < cgraph->n_nodes && n < 3; ++j) {
+            ggml_tensor * t = cgraph->nodes[j];
+            if (ggml_cuda_is_view_or_noop(t)) {
+                continue;
+            }
+            if (t->op != GGML_OP_MUL_MAT || t->src[1] != node->src[1] || t->src[0]->ne[0] != node->src[0]->ne[0] ||
+                    (t->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 || ggml_cuda_op_mul_mat_use_fwht(t) ||
+                    !ggml_cuda_mmb_g2_dense_supported(*cuda_ctx, t->src[0], t->src[1], t)) {
+                break;
+            }
+            w[n] = t->src[0];
+            d[n] = t;
+            out_nodes[n++] = j;
+            j_end = j;
+        }
+        int j_next = j_end + 1;
+        while (j_next < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[j_next])) {
+            j_next++;
+        }
+        for (int k = 0; j_next < cgraph->n_nodes && k < GGML_MAX_SRC; ++k) {
+            for (int m = 0; m < n; ++m) {
+                if (cgraph->nodes[j_next]->src[k] == d[m]) {
+                    n = 0;
+                }
+            }
+        }
+        if (n >= 2 && ggml_cuda_check_fusion_memory_ranges(cgraph, i, j_end - i + 1, out_nodes, n)) {
+            ggml_cuda_mul_mat_g2_dense_group(*cuda_ctx, w, node->src[1], d, n);
+            return j_end - i;
+        }
+    }
+
     // RDNA3.5 decode: consecutive single-column K-quant MUL_MATs that read the same activation vector (attention
     // Q/K/V) share one quantization and one launch. The group starts at node i0; with rms_norm the activation is the
     // RMS_NORM -> MUL at i_first, i_first + 1, read only by the group, and the kernel computes it. Returns the index of
