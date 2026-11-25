@@ -102,7 +102,8 @@ llama_model_inkling2_loop::graph::graph(const llm_graph_params & params) : llama
                 continue;
             }
             const auto & loop = m.loop_layers[ip - start];
-            cur = build_layer(il, ip, cur, blocks, mix(bank, bank_out, loop.msg_query), &loop);
+            const std::vector<ggml_tensor *> messages = mix_split(bank, bank_out, loop.msg_query);
+            cur = build_layer(il, ip, cur, blocks, &messages, &loop);
         }
     }
 
