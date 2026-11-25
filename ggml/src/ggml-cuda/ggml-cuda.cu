@@ -963,6 +963,13 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
         topk_counter = nullptr;
     }
 
+    if (arrival_counters != nullptr) {
+        ggml_cuda_set_device(device);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        CUDA_CHECK(cudaFree(arrival_counters));
+        arrival_counters = nullptr;
+    }
+
     if (mmb) {
         // Queued work and captured graphs can still reference the MMB buffers.
         for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
@@ -5968,6 +5975,96 @@ static void ggml_cuda_gdn_widen_z16(ggml_backend_cuda_context & ctx, const ggml_
     CUDA_CHECK(cudaMemcpyAsync(zt->data, tmp.get(), (size_t) n * sizeof(float), cudaMemcpyDeviceToDevice, ctx.stream()));
 }
 
+#if defined(GGML_USE_HIP)
+// decode MoE FFN of one token at node i: gate/up MUL_MAT_IDs + SWIGLU on a G2 pair, the G2 / G6 down MUL_MAT_ID, its
+// weighted reduction and the residual ADD after it (views aside), as ggml_cuda_mmb_moe_ffn computes them
+struct ggml_cuda_moe_ffn_match {
+    ggml_tensor * glu  = nullptr;
+    ggml_tensor * down = nullptr;
+    ggml_cuda_moe_weighted_reduction_match red;
+    ggml_tensor * add      = nullptr;
+    const ggml_tensor * residual = nullptr;
+    int last = 0;   // index of the ADD
+};
+
+static bool ggml_cuda_match_moe_ffn(const ggml_cgraph * cgraph, const int i, ggml_cuda_moe_ffn_match & m) {
+    if (i + 3 >= cgraph->n_nodes || !ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_MUL_MAT_ID, GGML_OP_MUL_MAT_ID, GGML_OP_GLU }, { i + 2 })) {
+        return false;
+    }
+    ggml_tensor * glu = cgraph->nodes[i + 2];
+    const ggml_tensor * gate = glu->src[0];
+    const ggml_tensor * up   = glu->src[1];
+    if (!((gate == cgraph->nodes[i] && up == cgraph->nodes[i + 1]) || (gate == cgraph->nodes[i + 1] && up == cgraph->nodes[i]))) {
+        return false;
+    }
+    int k = i + 3;
+    while (k < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[k])) {
+        k++;
+    }
+    if (k + 1 >= cgraph->n_nodes || !ggml_node_has_n_uses(cgraph, i + 2, 1) || !ggml_node_has_n_uses(cgraph, k, 1)) {
+        return false;
+    }
+    ggml_tensor * down = cgraph->nodes[k];
+    if (!ggml_cuda_mmb_moe_ffn_ok(gate->src[0], up->src[0], up->src[1], up->src[2], glu, down)) {
+        return false;
+    }
+    ggml_cuda_moe_weighted_reduction_match red;
+    if (!ggml_cuda_match_moe_weighted_reduction(cgraph, k + 1, red) || red.experts != down ||
+            !ggml_node_has_n_uses(cgraph, k + red.node_count, 1)) {
+        return false;
+    }
+    int nadd = k + 1 + red.node_count;
+    while (nadd < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[nadd])) {
+        nadd++;
+    }
+    ggml_tensor * add = nadd < cgraph->n_nodes ? cgraph->nodes[nadd] : nullptr;
+    if (!add || add->op != GGML_OP_ADD || add->type != GGML_TYPE_F32 || !ggml_is_contiguous(add) || !ggml_are_same_shape(add, red.dst)) {
+        return false;
+    }
+    const ggml_tensor * o = add->src[0] == red.dst ? add->src[1] : (add->src[1] == red.dst ? add->src[0] : nullptr);
+    if (!o || o == red.dst || o->type != GGML_TYPE_F32 || !ggml_is_contiguous(o) || !ggml_are_same_shape(o, red.dst) ||
+            red.weights->ne[1] != down->ne[1] || ggml_nelements(red.dst) != down->ne[0]) {
+        return false;
+    }
+    m.glu = glu;
+    m.down = down;
+    m.red = red;
+    m.add = add;
+    m.residual = o;
+    m.last = nadd;
+    return true;
+}
+
+// the buffers the fused kernel writes are disjoint from each other and from what it reads (the residual may be the
+// ADD's own buffer: each element is read before it is written)
+static bool ggml_cuda_moe_ffn_buffers_ok(const ggml_cuda_moe_ffn_match & m) {
+    auto overlap = [](const ggml_tensor * a, const ggml_tensor * b) {
+        const char * a0 = (const char *) a->data, * a1 = a0 + ggml_nbytes(a);
+        const char * b0 = (const char *) b->data, * b1 = b0 + ggml_nbytes(b);
+        return a0 < b1 && b0 < a1;
+    };
+    const ggml_tensor * gate = m.glu->src[0];
+    const ggml_tensor * outs[] = { m.glu, m.down, m.add };
+    const ggml_tensor * ins[]  = { gate->src[1], gate->src[2], m.red.weights, m.red.expert_scale };
+    for (int a = 0; a < 3; ++a) {
+        for (const ggml_tensor * t : ins) {
+            if (t && overlap(outs[a], t)) {
+                return false;
+            }
+        }
+        for (int b = 0; b < a; ++b) {
+            if (overlap(outs[a], outs[b])) {
+                return false;
+            }
+        }
+        if (a < 2 && overlap(outs[a], m.residual)) {
+            return false;
+        }
+    }
+    return m.residual->data == m.add->data || !overlap(m.add, m.residual);
+}
+#endif // defined(GGML_USE_HIP)
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     if (ggml_cuda_fusion_disabled()) {
@@ -5986,6 +6083,23 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             return count > 0 ? count : GGML_CUDA_FUSED_SELF;
         }
     }
+
+#if defined(GGML_USE_HIP)
+    if (node->op == GGML_OP_MUL_MAT_ID) {
+        ggml_cuda_moe_ffn_match m;
+        if (ggml_cuda_match_moe_ffn(cgraph, i, m) && ggml_cuda_moe_ffn_buffers_ok(m) &&
+                ggml_cuda_check_fusion_memory_ranges(cgraph, i, m.last - i, &m.last, 1)) {
+            unsigned int * counters = ggml_cuda_arrival_counters(*cuda_ctx);
+            if (counters != nullptr) {
+                const ggml_tensor * gate = m.glu->src[0];
+                const ggml_tensor * up   = m.glu->src[1];
+                ggml_cuda_mmb_moe_ffn(*cuda_ctx, gate->src[0], up->src[0], up->src[1], up->src[2], m.glu, m.down,
+                    m.red.weights, m.red.expert_scale, m.residual, m.add, counters + GGML_CUDA_ARRIVAL_MOE_FFN);
+                return m.last - i;
+            }
+        }
+    }
+#endif // defined(GGML_USE_HIP)
 
     if (node->op == GGML_OP_MUL_MAT && GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc)) {
         ggml_cuda_idx_relu_sum_args args;
@@ -9395,6 +9509,17 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                 break;
             }
         }
+
+#if defined(GGML_USE_HIP)
+        // decode MoE FFN in one launch: its intermediate buffers stay apart until the residual ADD
+        for (int i = 0; i < cgraph->n_nodes; ++i) {
+            ggml_cuda_moe_ffn_match m;
+            if (cgraph->nodes[i]->op == GGML_OP_MUL_MAT_ID && ggml_cuda_match_moe_ffn(cgraph, i, m)) {
+                add_alloc_deps(i, m.last);
+                i = m.last;
+            }
+        }
+#endif // defined(GGML_USE_HIP)
 
         for (int i = 0; i < cgraph->n_nodes; ++i) {
             ggml_cuda_hc_combine_norm_args args;

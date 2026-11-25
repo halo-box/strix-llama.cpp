@@ -88,6 +88,14 @@ bool ggml_cuda_mmb_down_g2_wanted(ggml_backend_cuda_context & ctx, const ggml_te
 void ggml_cuda_mmb_down_g2_prepare(ggml_backend_cuda_context & ctx, const ggml_tensor * w);
 bool ggml_cuda_mmb_down_g2_packed(const ggml_tensor * w);
 void ggml_cuda_mul_mat_id_g2_gemv_glu(ggml_backend_cuda_context & ctx, const ggml_tensor * gw, const ggml_tensor * uw, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * glu);
+// decode MoE FFN of one token on a G2 gate/up pair and a G2 / G6 down: gate/up + SwiGLU into glu, the down into down and
+// the weighted sum of the expert outputs (+ merge when not null) into dst, in one launch. counters: the zeroed range of
+// the GGML_CUDA_ARRIVAL_MOE_FFN arrival counters, left zeroed.
+bool ggml_cuda_mmb_moe_ffn_ok(const ggml_tensor * gw, const ggml_tensor * uw, const ggml_tensor * src1, const ggml_tensor * ids,
+        const ggml_tensor * glu, const ggml_tensor * down);
+void ggml_cuda_mmb_moe_ffn(ggml_backend_cuda_context & ctx, const ggml_tensor * gw, const ggml_tensor * uw, const ggml_tensor * src1,
+        const ggml_tensor * ids, ggml_tensor * glu, ggml_tensor * down, const ggml_tensor * weights, const ggml_tensor * expert_scale,
+        const ggml_tensor * merge, ggml_tensor * dst, unsigned int * counters);
 // dense R2: dense Q8_0 weights repacked in place to the k7/k8 tile layout; every MUL_MAT on a packed tensor must go
 // through ggml_cuda_mul_mat_mmb (MMB batches), ggml_cuda_mul_mat_dq (any other T > 1) or the RDNA3.5 fused-quantize
 // matvecs (T == 1, packed-aware), never MMVQ/MMQ/cuBLAS. Buffer writes/frees drop the record (ggml_cuda_mmb_r2_forget).

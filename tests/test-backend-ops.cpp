@@ -8848,23 +8848,27 @@ struct test_moe_glu_f16 : public test_case {
 };
 
 // routed expert FFN with the experts in a weights buffer, through the scheduler (graph_optimize repacks eligible
-// experts in place, e.g. the gfx1151 G2 layouts): down(swiglu(gate(x), up(x)))
+// experts in place, e.g. the gfx1151 G2 layouts): down(swiglu(gate(x), up(x))); reduce: as build_moe_ffn, the router
+// weighted sum of the expert outputs plus a residual
 struct test_moe_ffn_weights : public test_case {
     const ggml_type type_gu, type_down;
     const int64_t n_embd, n_ff;
     const int n_expert, n_used;
     const int64_t n_tokens;
+    const bool reduce;
 
     std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "MOE_FFN_W"; }
-    std::string vars() override { return VARS_TO_STR7(type_gu, type_down, n_embd, n_ff, n_expert, n_used, n_tokens); }
+    std::string vars() override { return VARS_TO_STR8(type_gu, type_down, n_embd, n_ff, n_expert, n_used, n_tokens, reduce); }
     bool run_whole_graph() override { return true; }
     bool use_scheduler_allocation() override { return true; }
     bool use_weight_context() override { return true; }
     double max_nmse_err() override { return 5e-4; }
     uint64_t op_flops(ggml_tensor * t) override { GGML_UNUSED(t); return (uint64_t) 2 * 3 * n_embd * n_ff * n_used * n_tokens; }
 
-    test_moe_ffn_weights(ggml_type type_gu, ggml_type type_down, int64_t n_embd, int64_t n_ff, int n_expert, int n_used, int64_t n_tokens)
-        : type_gu(type_gu), type_down(type_down), n_embd(n_embd), n_ff(n_ff), n_expert(n_expert), n_used(n_used), n_tokens(n_tokens) {}
+    test_moe_ffn_weights(ggml_type type_gu, ggml_type type_down, int64_t n_embd, int64_t n_ff, int n_expert, int n_used, int64_t n_tokens,
+            bool reduce = false)
+        : type_gu(type_gu), type_down(type_down), n_embd(n_embd), n_ff(n_ff), n_expert(n_expert), n_used(n_used), n_tokens(n_tokens),
+          reduce(reduce) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override { return build_graph(ctx, ctx); }
 
@@ -8883,6 +8887,29 @@ struct test_moe_ffn_weights : public test_case {
         ggml_tensor * gate = ggml_mul_mat_id(ctx, gw, x, ids);
         ggml_tensor * up   = ggml_mul_mat_id(ctx, uw, x, ids);
         ggml_tensor * out  = ggml_mul_mat_id(ctx, dw, ggml_swiglu_split(ctx, gate, up), ids);
+        if (reduce) {
+            ggml_tensor * w = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, n_used, n_tokens);
+            ggml_set_name(w, "router_w");
+            ggml_tensor * res = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+            ggml_set_name(res, "residual");
+            out = ggml_mul(ctx, out, w);
+            ggml_tensor * v[64] = {};
+            GGML_ASSERT(n_used <= 64);
+            if (gf) {
+                ggml_build_forward_expand(gf, out);
+            }
+            for (int i = 0; i < n_used; ++i) {
+                v[i] = ggml_view_2d(ctx, out, n_embd, n_tokens, out->nb[2], i*out->nb[1]);
+                if (gf) {
+                    ggml_build_forward_expand(gf, v[i]);
+                }
+            }
+            ggml_tensor * sum = v[0];
+            for (int i = 1; i < n_used; ++i) {
+                sum = ggml_add(ctx, sum, v[i]);
+            }
+            out = ggml_add(ctx, sum, res);
+        }
         ggml_set_name(out, "out");
         return out;
     }
@@ -17889,6 +17916,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         for (int64_t nt : {1, 8, 32, 100, 512}) {
             test_cases.emplace_back(new test_moe_ffn_weights(GGML_TYPE_Q4_K, td, 2048, 768, 128, 8, nt));
         }
+        test_cases.emplace_back(new test_moe_ffn_weights(GGML_TYPE_Q4_K, td, 2048, 768, 128, 8, 1, true));
+        test_cases.emplace_back(new test_moe_ffn_weights(GGML_TYPE_Q4_K, td, 2048, 768, 128, 8, 2, true));
     }
     test_cases.emplace_back(new test_mul_mat_pair());
     // routed MUL_MAT_ID at the production MoE shapes and quant types; run with --mmb on and off to compare BF16 WMMA vs MMQ

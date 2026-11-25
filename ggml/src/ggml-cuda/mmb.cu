@@ -3922,19 +3922,12 @@ __global__ void __launch_bounds__(1024) mmb_g2_build_desc(const int32_t * __rest
 // f32 activations: GEMV over the G2 layout for every MUL_MAT_ID on a repacked tensor that the G2 WMMA kernel does
 // not take (decode, small batches). One block per (16-row tile, routed row): 16 lane groups of 16 split the 4 K
 // groups of every superblock, the activation row is staged in LDS. GLU: gate and up tiles, dst = silu(gate) * up.
+// g2_gemv_tile: the 16 rows of tile ct of expert e for the activation xs in LDS, the result of row threadIdx.x for
+// threadIdx.x < 16 (the decode MoE FFN kernel computes its tiles with it too)
 template <bool GLU>
-__global__ void __launch_bounds__(256)
-mmb_g2_gemv_kernel(const uint8_t * __restrict__ Wg, const uint8_t * __restrict__ Wu, const size_t eb, const char * __restrict__ x,
-        const size_t nb11, const size_t nb12, const int ne11, const char * __restrict__ ids, const size_t ids_nb0, const size_t ids_nb1,
-        char * __restrict__ dst, const size_t nb1, const size_t nb2, const int M, const int E, const int K) {
-    extern __shared__ float g2_xs[];
+__device__ __forceinline__ float g2_gemv_tile(const uint8_t * __restrict__ Wg, const uint8_t * __restrict__ Wu, const size_t eb,
+        const int e, const int ct, const float * xs, const int K) {
     __shared__ float red[2][16][17];
-    const int ct = blockIdx.x, i = blockIdx.y, t = blockIdx.z;
-    const float * xr = (const float *) (x + (size_t) t * nb12 + (size_t) (i % ne11) * nb11);
-    for (int k = threadIdx.x; k < K; k += blockDim.x) g2_xs[k] = xr[k];
-    __syncthreads();
-    const int e = *(const int32_t *) (ids + (size_t) t * ids_nb1 + (size_t) i * ids_nb0);
-    if (e < 0 || e >= E) return;
     const int r = threadIdx.x & 15, q = threadIdx.x >> 4;
     const int NSB = K / 256, NU = NSB * 4;
     const size_t aoff = (size_t) e * eb + (size_t) ct * NSB * G2_TILE + r * 16;
@@ -3943,7 +3936,7 @@ mmb_g2_gemv_kernel(const uint8_t * __restrict__ Wg, const uint8_t * __restrict__
         const uint4 c0 = *(const uint4 *) (base + 256 + g * 512), c1 = *(const uint4 *) (base + 512 + g * 512);
         const float d = (float) __builtin_bit_cast(_Float16, (uint16_t) (h.x & 0xffffu));
         const float dm = (float) __builtin_bit_cast(_Float16, (uint16_t) (h.x >> 16));
-        const float * xb = g2_xs + s * 256 + g * 64;
+        const float * xb = xs + s * 256 + g * 64;
         float sl = 0.0f, sh = 0.0f, xl = 0.0f, xh = 0.0f;
         auto word = [&](const uint32_t w, const int b0) {
 #pragma unroll
@@ -3969,27 +3962,36 @@ mmb_g2_gemv_kernel(const uint8_t * __restrict__ Wg, const uint8_t * __restrict__
     }
     red[0][q][r] = accg; red[1][q][r] = accu;
     __syncthreads();
+    float a = 0.0f, b = 0.0f;
     if (threadIdx.x < 16) {
-        float a = 0.0f, b = 0.0f;
 #pragma unroll
         for (int j = 0; j < 16; ++j) { a += red[0][j][r]; b += red[1][j][r]; }
-        *(float *) (dst + (size_t) t * nb2 + (size_t) i * nb1 + (size_t) (ct * 16 + r) * sizeof(float)) = GLU ? ggml_cuda_op_silu_single(a) * b : a;
     }
+    return GLU ? ggml_cuda_op_silu_single(a) * b : a;
 }
 
-// f32 GEMV over the G6 layout (Q6_K down outside the G2 WMMA kernel): mmb_g2_gemv_kernel<false> with the G6 decode
+template <bool GLU>
 __global__ void __launch_bounds__(256)
-mmb_g6_gemv_kernel(const uint8_t * __restrict__ W, const size_t eb, const char * __restrict__ x,
+mmb_g2_gemv_kernel(const uint8_t * __restrict__ Wg, const uint8_t * __restrict__ Wu, const size_t eb, const char * __restrict__ x,
         const size_t nb11, const size_t nb12, const int ne11, const char * __restrict__ ids, const size_t ids_nb0, const size_t ids_nb1,
         char * __restrict__ dst, const size_t nb1, const size_t nb2, const int M, const int E, const int K) {
     extern __shared__ float g2_xs[];
-    __shared__ float red[16][17];
     const int ct = blockIdx.x, i = blockIdx.y, t = blockIdx.z;
     const float * xr = (const float *) (x + (size_t) t * nb12 + (size_t) (i % ne11) * nb11);
     for (int k = threadIdx.x; k < K; k += blockDim.x) g2_xs[k] = xr[k];
     __syncthreads();
     const int e = *(const int32_t *) (ids + (size_t) t * ids_nb1 + (size_t) i * ids_nb0);
     if (e < 0 || e >= E) return;
+    const float v = g2_gemv_tile<GLU>(Wg, Wu, eb, e, ct, g2_xs, K);
+    if (threadIdx.x < 16) {
+        *(float *) (dst + (size_t) t * nb2 + (size_t) i * nb1 + (size_t) (ct * 16 + threadIdx.x) * sizeof(float)) = v;
+    }
+}
+
+// f32 GEMV over the G6 layout (Q6_K down outside the G2 WMMA kernel): g2_gemv_tile<false> with the G6 decode
+__device__ __forceinline__ float g6_gemv_tile(const uint8_t * __restrict__ W, const size_t eb, const int e, const int ct,
+        const float * xs, const int K) {
+    __shared__ float red[16][17];
     const int r = threadIdx.x & 15, q = threadIdx.x >> 4;
     const int NSB = K / 256, NU = NSB * 4;
     float acc = 0.0f;
@@ -3999,7 +4001,7 @@ mmb_g6_gemv_kernel(const uint8_t * __restrict__ W, const size_t eb, const char *
         const uint4 sc = *(const uint4 *) (base + r * 16);
         const uint32_t w = g == 0 ? sc.x : g == 1 ? sc.y : g == 2 ? sc.z : sc.w;
         const uint16_t d = *(const uint16_t *) (base + G6_D + r * 2);
-        const float * xb = g2_xs + sb * 256 + g * 64;
+        const float * xb = xs + sb * 256 + g * 64;
 #pragma unroll
         for (int pp = 0; pp < 2; ++pp) {
             const uint4 c = *(const uint4 *) (base + G6_NIB + (g * 2 + pp) * 256 + r * 16);
@@ -4024,11 +4026,28 @@ mmb_g6_gemv_kernel(const uint8_t * __restrict__ W, const size_t eb, const char *
     }
     red[q][r] = acc;
     __syncthreads();
+    float a = 0.0f;
     if (threadIdx.x < 16) {
-        float a = 0.0f;
 #pragma unroll
         for (int j = 0; j < 16; ++j) a += red[j][r];
-        *(float *) (dst + (size_t) t * nb2 + (size_t) i * nb1 + (size_t) (ct * 16 + r) * sizeof(float)) = a;
+    }
+    return a;
+}
+
+__global__ void __launch_bounds__(256)
+mmb_g6_gemv_kernel(const uint8_t * __restrict__ W, const size_t eb, const char * __restrict__ x,
+        const size_t nb11, const size_t nb12, const int ne11, const char * __restrict__ ids, const size_t ids_nb0, const size_t ids_nb1,
+        char * __restrict__ dst, const size_t nb1, const size_t nb2, const int M, const int E, const int K) {
+    extern __shared__ float g2_xs[];
+    const int ct = blockIdx.x, i = blockIdx.y, t = blockIdx.z;
+    const float * xr = (const float *) (x + (size_t) t * nb12 + (size_t) (i % ne11) * nb11);
+    for (int k = threadIdx.x; k < K; k += blockDim.x) g2_xs[k] = xr[k];
+    __syncthreads();
+    const int e = *(const int32_t *) (ids + (size_t) t * ids_nb1 + (size_t) i * ids_nb0);
+    if (e < 0 || e >= E) return;
+    const float v = g6_gemv_tile(W, eb, e, ct, g2_xs, K);
+    if (threadIdx.x < 16) {
+        *(float *) (dst + (size_t) t * nb2 + (size_t) i * nb1 + (size_t) (ct * 16 + threadIdx.x) * sizeof(float)) = v;
     }
 }
 
@@ -4412,6 +4431,119 @@ static void mmb_g2_gemv_launch(ggml_backend_cuda_context & ctx, const ggml_tenso
     else    mmb_g2_gemv_kernel<false><<<grid, 256, shm, ctx.stream()>>>((const uint8_t *) gw->data, (const uint8_t *) gw->data, gw->nb[2],
         (const char *) src1->data, src1->nb[1], src1->nb[2], (int) src1->ne[1], (const char *) ids->data, ids->nb[0], ids->nb[1],
         (char *) dst->data, dst->nb[1], dst->nb[2], M, E, K);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+// Decode MoE FFN of one token in one launch: G2 gate/up + SwiGLU, G2 / G6 down and the weighted sum of the expert
+// outputs (+ residual). A block takes a ticket in start order: the first n_used * F/16 tickets compute a GLU tile as
+// mmb_g2_gemv_kernel<true>, the others a down tile as mmb_g2_gemv_kernel<false> / mmb_g6_gemv_kernel once all GLU
+// tiles of their expert are stored (a ticket holder waits only for lower tickets, which run or have finished). The last
+// down tile of a row tile to finish computes the sum of moe_weighted_reduction_f32_v4 for its rows. The last block
+// resets the counters, so every launch starts from zero.
+struct mmb_moe_ffn_args {
+    const uint8_t * wg; const uint8_t * wu; size_t eb_gu;
+    const uint8_t * wd; size_t eb_d;
+    const float * x; const int32_t * ids;
+    float * glu; size_t glu_s1;
+    float * down; size_t down_s1;
+    const float * weights; const float * expert_scale; const float * merge; float * dst;
+    unsigned int * cnt;
+    int K, F, E, n_used;
+};
+
+template <bool Q6>
+__global__ void __launch_bounds__(256) mmb_g2_moe_ffn_kernel(const mmb_moe_ffn_args a) {
+    extern __shared__ float g2_xs[];
+    __shared__ unsigned int s_vid;
+    __shared__ bool s_last;
+    if (threadIdx.x == 0) s_vid = atomicAdd(&a.cnt[0], 1u);
+    __syncthreads();
+    const int vid = (int) s_vid;
+    const int n_ft = a.F / 16, n_mt = a.K / 16, n_glu = n_ft * a.n_used;
+    unsigned int * glu_done = a.cnt + 2, * tile_done = a.cnt + 2 + a.n_used;
+    if (vid < n_glu) {
+        const int i = vid / n_ft, ct = vid % n_ft;
+        for (int k = threadIdx.x; k < a.K; k += blockDim.x) g2_xs[k] = a.x[k];
+        __syncthreads();
+        const int e = a.ids[i];
+        if (e >= 0 && e < a.E) {
+            const float v = g2_gemv_tile<true>(a.wg, a.wu, a.eb_gu, e, ct, g2_xs, a.K);
+            if (threadIdx.x < 16) a.glu[(size_t) i * a.glu_s1 + ct * 16 + threadIdx.x] = v;
+        }
+        __threadfence();
+        __syncthreads();
+        if (threadIdx.x == 0) atomicAdd(&glu_done[i], 1u);
+    } else {
+        const int v2 = vid - n_glu, i = v2 / n_mt, ct = v2 % n_mt;
+        if (threadIdx.x == 0) {
+            while (__hip_atomic_load(&glu_done[i], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) < (unsigned int) n_ft) __builtin_amdgcn_s_sleep(1);
+        }
+        __syncthreads();
+        __threadfence();
+        for (int k = threadIdx.x; k < a.F; k += blockDim.x) g2_xs[k] = a.glu[(size_t) i * a.glu_s1 + k];
+        __syncthreads();
+        const int e = a.ids[i];
+        if (e >= 0 && e < a.E) {
+            const float v = Q6 ? g6_gemv_tile(a.wd, a.eb_d, e, ct, g2_xs, a.F) : g2_gemv_tile<false>(a.wd, a.wd, a.eb_d, e, ct, g2_xs, a.F);
+            if (threadIdx.x < 16) a.down[(size_t) i * a.down_s1 + ct * 16 + threadIdx.x] = v;
+        }
+        __threadfence();
+        __syncthreads();
+        if (threadIdx.x == 0) s_last = atomicAdd(&tile_done[ct], 1u) == (unsigned int) a.n_used - 1;
+        __syncthreads();
+        if (s_last) {
+            __threadfence();
+            if (threadIdx.x < 16) {
+                const int col = ct * 16 + threadIdx.x;
+                const float first_scale = a.expert_scale != nullptr ? a.expert_scale[0] : 1.0f;
+                float sum = (a.down[col] * first_scale) * a.weights[0];
+                for (int expert = 1; expert < a.n_used; ++expert) {
+                    const float scale = a.expert_scale != nullptr ? a.expert_scale[expert] : 1.0f;
+                    sum += (a.down[(size_t) expert * a.down_s1 + col] * scale) * a.weights[expert];
+                }
+                if (a.merge) sum += a.merge[col];
+                a.dst[col] = sum;
+            }
+            if (threadIdx.x == 0) tile_done[ct] = 0;
+        }
+    }
+    if (threadIdx.x == 0 && atomicAdd(&a.cnt[1], 1u) == gridDim.x - 1) {
+        for (int k = 0; k < a.n_used; ++k) glu_done[k] = 0;
+        a.cnt[0] = 0;
+        a.cnt[1] = 0;
+    }
+}
+
+bool ggml_cuda_mmb_moe_ffn_ok(const ggml_tensor * gw, const ggml_tensor * uw, const ggml_tensor * src1, const ggml_tensor * ids,
+        const ggml_tensor * glu, const ggml_tensor * down) {
+    if (!ggml_cuda_mmb_g2_glu_gemv_ok(gw, uw, src1, ids, glu) || ids->ne[1] != 1 || src1->ne[1] != 1 || !ggml_is_contiguous(src1)) return false;
+    const ggml_tensor * wd = down->src[0];
+    if (down->op != GGML_OP_MUL_MAT_ID || down->src[1] != glu || down->src[2] != ids || !ggml_cuda_mmb_down_g2_packed(wd)) return false;
+    const int64_t K = gw->ne[0], F = gw->ne[1], n_used = ids->ne[0];
+    return wd->ne[0] == F && wd->ne[1] == K && wd->ne[2] == gw->ne[2] && K % 256 == 0 && F % 256 == 0 &&
+        down->type == GGML_TYPE_F32 && down->nb[0] == sizeof(float) && down->ne[0] == K && down->ne[1] == n_used && down->ne[2] == 1 &&
+        glu->nb[0] == sizeof(float) && glu->ne[1] == n_used && n_used >= 1 && n_used <= 64 &&
+        2 + n_used + K / 16 <= GGML_CUDA_ARRIVAL_COUNTERS - GGML_CUDA_ARRIVAL_MOE_FFN && n_used * (F / 16 + K / 16) <= INT32_MAX / 2;
+}
+
+void ggml_cuda_mmb_moe_ffn(ggml_backend_cuda_context & ctx, const ggml_tensor * gw, const ggml_tensor * uw, const ggml_tensor * src1,
+        const ggml_tensor * ids, ggml_tensor * glu, ggml_tensor * down, const ggml_tensor * weights, const ggml_tensor * expert_scale,
+        const ggml_tensor * merge, ggml_tensor * dst, unsigned int * counters) {
+    const ggml_tensor * wd = down->src[0];
+    mmb_moe_ffn_args a;
+    a.wg = (const uint8_t *) gw->data; a.wu = (const uint8_t *) uw->data; a.eb_gu = gw->nb[2];
+    a.wd = (const uint8_t *) wd->data; a.eb_d = wd->nb[2];
+    a.x = (const float *) src1->data; a.ids = (const int32_t *) ids->data;
+    a.glu = (float *) glu->data; a.glu_s1 = glu->nb[1] / sizeof(float);
+    a.down = (float *) down->data; a.down_s1 = down->nb[1] / sizeof(float);
+    a.weights = (const float *) weights->data; a.expert_scale = expert_scale ? (const float *) expert_scale->data : nullptr;
+    a.merge = merge ? (const float *) merge->data : nullptr; a.dst = (float *) dst->data;
+    a.cnt = counters;
+    a.K = (int) gw->ne[0]; a.F = (int) gw->ne[1]; a.E = (int) gw->ne[2]; a.n_used = (int) ids->ne[0];
+    const int nblocks = a.n_used * (a.F / 16 + a.K / 16);
+    const size_t shm = (size_t) std::max(a.K, a.F) * sizeof(float);
+    if (wd->type == GGML_TYPE_Q6_K) mmb_g2_moe_ffn_kernel<true><<<nblocks, 256, shm, ctx.stream()>>>(a);
+    else                            mmb_g2_moe_ffn_kernel<false><<<nblocks, 256, shm, ctx.stream()>>>(a);
     CUDA_CHECK(cudaGetLastError());
 }
 

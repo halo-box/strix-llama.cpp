@@ -1532,6 +1532,7 @@ struct ggml_backend_cuda_context {
     cudaEvent_t ovl_ev[2]  = { nullptr, nullptr };
 
     unsigned int * topk_counter = nullptr;   // arrival counter of the fused router + top-k kernel, allocated on first use
+    unsigned int * arrival_counters = nullptr;   // see ggml_cuda_arrival_counters
 
     ggml_cuda_mmb_context * mmb = nullptr;
     bool mmb_opt_in = false; // set by ggml_backend_cuda_set_mmb_enabled, before the first graph
@@ -1627,6 +1628,25 @@ struct ggml_backend_cuda_context {
         return pool(device);
     }
 };
+
+// Counters of the RDNA3.5 decode kernels whose blocks wait for or finish the work of other blocks (the fused MoE FFN).
+// Each kernel has its own range and leaves it at zero. They are allocated outside of a graph capture (the first graph
+// of a context runs uncaptured): nullptr when the first use is in a capture, and the caller takes its unfused path.
+#define GGML_CUDA_ARRIVAL_COUNTERS  1024
+#define GGML_CUDA_ARRIVAL_MOE_FFN   0
+
+static inline unsigned int * ggml_cuda_arrival_counters(ggml_backend_cuda_context & ctx) {
+    if (ctx.arrival_counters == nullptr) {
+        cudaStreamCaptureStatus status;
+        CUDA_CHECK(cudaStreamIsCapturing(ctx.stream(), &status));
+        if (status != cudaStreamCaptureStatusNone) {
+            return nullptr;
+        }
+        CUDA_CHECK(cudaMalloc((void **) &ctx.arrival_counters, GGML_CUDA_ARRIVAL_COUNTERS*sizeof(unsigned int)));
+        CUDA_CHECK(cudaMemsetAsync(ctx.arrival_counters, 0, GGML_CUDA_ARRIVAL_COUNTERS*sizeof(unsigned int), ctx.stream()));
+    }
+    return ctx.arrival_counters;
+}
 
 // join the open intra-graph concurrency side stream into the main stream (no-op when none is open)
 static inline void ggml_cuda_ovl_join(ggml_backend_cuda_context & ctx) {
