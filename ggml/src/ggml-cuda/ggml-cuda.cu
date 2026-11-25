@@ -10891,8 +10891,21 @@ static void ggml_backend_cuda_set_mmb_small_batch(ggml_backend_t backend, bool e
     ((ggml_backend_cuda_context *) backend->context)->mmb_small_batch = enable;
 }
 
+static bool ggml_backend_cuda_dev_is_gfx1151(ggml_backend_dev_t dev) {
+#if defined(GGML_USE_HIP)
+    const auto * ctx = (const ggml_backend_cuda_device_context *) dev->context;
+    return ggml_cuda_info().devices[ctx->device].cc == GGML_CUDA_CC_OFFSET_AMD + 0x1151;
+#else
+    GGML_UNUSED(dev);
+    return false;
+#endif // defined(GGML_USE_HIP)
+}
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
+    if (strcmp(name, "ggml_backend_cuda_dev_is_gfx1151") == 0) {
+        return (void *)ggml_backend_cuda_dev_is_gfx1151;
+    }
     if (strcmp(name, "ggml_backend_cuda_set_mmb_enabled") == 0) {
         return (void *)ggml_backend_cuda_set_mmb_enabled;
     }

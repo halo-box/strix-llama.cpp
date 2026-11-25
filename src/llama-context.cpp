@@ -219,6 +219,21 @@ static const llm_fused_op_probe llm_fused_op_top_k_mask_probe = {
     /*.n_tokens_per_seq =*/ 1,
 };
 
+static uint32_t llama_n_ubatch_for_device(const llama_model & model) {
+    const auto & hp = model.hparams;
+    if (model.arch != LLM_ARCH_QWEN3MOE || hp.n_expert != 128 || hp.n_expert_used() != 8 || hp.n_ff_exp() != 768) {
+        return 0;
+    }
+    for (const auto & dev : model.devices) {
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev.dev);
+        auto * is_gfx1151 = reg ? (bool (*)(ggml_backend_dev_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_dev_is_gfx1151") : nullptr;
+        if (is_gfx1151 && is_gfx1151(dev.dev)) {
+            return 1024;
+        }
+    }
+    return 0;
+}
+
 llama_context::llama_context(
         const llama_model & model,
               llama_context_params params) :
@@ -435,6 +450,13 @@ llama_context::llama_context(
     cparams.n_batch = cparams.causal_attn ? std::min(cparams.n_ctx, params.n_batch) : params.n_batch;
 
     cparams.n_ubatch = std::min(cparams.n_batch, params.n_ubatch == 0 ? params.n_batch : params.n_ubatch);
+    if (params.n_ubatch_auto && !cparams.embeddings) {
+        const uint32_t n_ubatch_dev = llama_n_ubatch_for_device(model);
+        if (n_ubatch_dev > cparams.n_ubatch) {
+            cparams.n_ubatch = std::min(cparams.n_batch, n_ubatch_dev);
+            LLAMA_LOG_INFO("%s: default n_ubatch raised to %u for this model on this device\n", __func__, cparams.n_ubatch);
+        }
+    }
 
     cparams.n_outputs_max = params.n_outputs_max == 0 || llama_model_has_encoder(&model) ? cparams.n_batch : params.n_outputs_max;
     cparams.n_outputs_max_per_seq = params.n_outputs_max_per_seq == 0 ?
@@ -5209,6 +5231,7 @@ llama_context_params llama_context_default_params() {
         /*.op_offload                  =*/ true,
         /*.swa_full                    =*/ true,
         /*.kv_unified                  =*/ false,
+        /*.n_ubatch_auto               =*/ false,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,
