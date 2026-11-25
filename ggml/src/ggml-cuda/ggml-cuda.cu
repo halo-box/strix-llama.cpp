@@ -9251,10 +9251,13 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                     if (xi < 0) continue;
                     if (!ggml_cuda_mmb_supported_mmid(*cuda_ctx, ex->src[0], ex->src[1], ex->src[2], const_cast<ggml_tensor *>(ex))) continue;
                     if (ex->src[0]->type != GGML_TYPE_IQ4_NL) {   // IQ4_NL validated; Q5_1/Q8_0 down experts keep BF16 outputs (f16-precision path, gufo parity)
-                        if (ex->src[0]->type != GGML_TYPE_Q5_1 && ex->src[0]->type != GGML_TYPE_Q8_0) continue;
+                        if (ex->src[0]->type != GGML_TYPE_Q5_1 && ex->src[0]->type != GGML_TYPE_Q8_0 && !ggml_cuda_mmb_down_g2_packed(ex->src[0])) continue;
                     }
                     if (!ggml_node_has_n_uses(cgraph, xi, 1)) continue;
-                    if (ggml_cuda_marks_readers_local(cgraph, ex)) ggml_cuda_mmb_mark_bf16_only(*cuda_ctx, ex);
+                    if (ggml_cuda_marks_readers_local(cgraph, ex)) {
+                        ggml_cuda_mmb_mark_bf16_only(*cuda_ctx, ex);
+                        if (ggml_cuda_mmb_down_g2_packed(ex->src[0])) ggml_cuda_mmb_mark_f16(*cuda_ctx, ex, MMB_F16_OUT);
+                    }
                 }
             }
             if (ggml_cuda_mmb_res16()) {   // 16-bit residual stream: producer and consumer on different buffers

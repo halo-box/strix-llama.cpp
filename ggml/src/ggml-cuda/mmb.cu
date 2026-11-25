@@ -3670,6 +3670,7 @@ struct g2_pl_segs {
     int m[3];
     int cbe[3];
     int n;
+    bool dh_f16;
 };
 
 template <int K, int TN, bool GLU, bool Q6 = false, bool PL = false, int NW = 8>
@@ -3830,7 +3831,15 @@ mmb_g2_kernel(const uint8_t * __restrict__ Wg, const uint8_t * __restrict__ Wu, 
                 const float4 v = *(const float4 *) (stg + (idx / (BM / 4)) * FST + part * 4);
                 const size_t o = (size_t) dr * M + cb * BM + part * 4;
                 if (D) *(float4 *) (D + o) = v;
-                if (Dh) *(uint2 *) (Dh + o) = make_uint2(mmb_pack2(v.x, v.y), mmb_pack2(v.z, v.w));
+                if (Dh) {
+                    if (segs.dh_f16) {
+                        *(uint2 *) (Dh + o) = make_uint2(
+                            __builtin_bit_cast(uint32_t, g6_h2{(_Float16) (v.x * 0.0625f), (_Float16) (v.y * 0.0625f)}),
+                            __builtin_bit_cast(uint32_t, g6_h2{(_Float16) (v.z * 0.0625f), (_Float16) (v.w * 0.0625f)}));
+                    } else {
+                        *(uint2 *) (Dh + o) = make_uint2(mmb_pack2(v.x, v.y), mmb_pack2(v.z, v.w));
+                    }
+                }
             }
         }
         return;
@@ -4381,7 +4390,7 @@ bool ggml_cuda_mmb_down_g2_packed(const ggml_tensor * w) {
 // G2 routed down (MMB path). Returns false (nothing launched) for a tensor that is not repacked.
 static bool mmb_down_g2_launch(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const uint16_t * xhp, uint16_t * Dh, float * D,
         const int32_t * ids_src1, const int32_t * ids_dst, const int32_t * bounds, const int E, const int M, const int K,
-        const int n_rows, cudaStream_t prep_stream, const bool xp) {
+        const int n_rows, cudaStream_t prep_stream, const bool xp, const bool h16) {
     if (!ggml_cuda_mmb_down_g2_packed(src0)) return false;
     GGML_ASSERT(K == G2_DOWN_K && M % G2_DOWN_BM == 0 && E <= 1024 && (Dh || D));
     constexpr int TN = 4;
@@ -4397,10 +4406,12 @@ static bool mmb_down_g2_launch(ggml_backend_cuda_context & ctx, const ggml_tenso
         stream = ctx.stream();
     }
     const uint8_t * W = (const uint8_t *) src0->data;
+    g2_pl_segs dsegs{};
+    dsegs.dh_f16 = h16;
     if (src0->type == GGML_TYPE_Q6_K) {
-        mmb_g2_kernel<G2_DOWN_K, TN, false, true><<<n_max, 256, 0, stream>>>(W, W, (size_t) src0->nb[2], xhp, ids_src1, ids_dst, desc.get(), Dh, D, M, 0, g2_pl_segs{});
+        mmb_g2_kernel<G2_DOWN_K, TN, false, true><<<n_max, 256, 0, stream>>>(W, W, (size_t) src0->nb[2], xhp, ids_src1, ids_dst, desc.get(), Dh, D, M, 0, dsegs);
     } else {
-        mmb_g2_kernel<G2_DOWN_K, TN, false><<<n_max, 256, 0, stream>>>(W, W, (size_t) src0->nb[2], xhp, ids_src1, ids_dst, desc.get(), Dh, D, M, 0, g2_pl_segs{});
+        mmb_g2_kernel<G2_DOWN_K, TN, false><<<n_max, 256, 0, stream>>>(W, W, (size_t) src0->nb[2], xhp, ids_src1, ids_dst, desc.get(), Dh, D, M, 0, dsegs);
     }
     CUDA_CHECK(cudaGetLastError());
     return true;
@@ -4503,7 +4514,8 @@ void ggml_cuda_mul_mat_id_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor
     {   // down R2: Q5_1 down experts with a repacked shadow -> one interleaved launch (no big/small tier split)
         uint16_t * Dh_r2 = ggml_cuda_mmb_is_bf16_only(ctx, dst) ? (uint16_t *) dst->data : nullptr;
         if (mmb_down_r2_launch(ctx, src0, xhp, Dh_r2, Dh_r2 ? nullptr : (float *) dst->data, ids_src1_p, ids_dst_p, bounds_p, E, M, K, n_rows, stream, xp) ||
-            mmb_down_g2_launch(ctx, src0, xhp, Dh_r2, Dh_r2 ? nullptr : (float *) dst->data, ids_src1_p, ids_dst_p, bounds_p, E, M, K, n_rows, stream, xp)) {
+            mmb_down_g2_launch(ctx, src0, xhp, Dh_r2, Dh_r2 ? nullptr : (float *) dst->data, ids_src1_p, ids_dst_p, bounds_p, E, M, K, n_rows, stream, xp,
+                    Dh_r2 && (ggml_cuda_mmb_f16_marks(ctx, dst) & MMB_F16_OUT))) {
             mmb_join_pending(ctx);   // the pending side (small GLU tier) must be joined before the reduction
             mmb_hold_release(ctx);
             return;

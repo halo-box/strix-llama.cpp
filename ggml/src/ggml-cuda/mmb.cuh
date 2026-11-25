@@ -44,6 +44,7 @@ bool ggml_cuda_mmb_is_bf16_only(ggml_backend_cuda_context & ctx, const ggml_tens
 // HC xn (graph_optimize): every GEMM that reads it has F16 weights (the F16 cuBLAS path), and no reader takes the
 // BF16 or int8 copy. Its combine + norm writes the BLAS staging copy in their place.
 #define MMB_F16_BLAS 4
+#define MMB_F16_OUT 8
 void ggml_cuda_mmb_mark_f16(ggml_backend_cuda_context & ctx, const ggml_tensor * t, int bits);
 int  ggml_cuda_mmb_f16_marks(ggml_backend_cuda_context & ctx, const ggml_tensor * t);
 // reader kind of MUL_MAT node n for the dense F16 copies: 1 = dense-r2 GEMM, 0 = none

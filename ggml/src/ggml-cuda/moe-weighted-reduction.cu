@@ -4,6 +4,9 @@
 #include <algorithm>
 
 __device__ __forceinline__ float moe_bf2f(const uint16_t h) { return __uint_as_float(((uint32_t) h) << 16); }
+template <bool H16> __device__ __forceinline__ float moe_h2f(const uint16_t h) {
+    return H16 ? (float) __builtin_bit_cast(_Float16, h) * 16.0f : moe_bf2f(h);
+}
 
 
 static __global__ void moe_weighted_reduction_f32(const float * __restrict__ experts,
@@ -63,6 +66,7 @@ static __global__ void moe_weighted_reduction_f32_v4(const float * __restrict__ 
 }
 
 // BF16 expert outputs: identical arithmetic, the inputs are the BF16-rounded down-GEMM results
+template <bool H16>
 static __global__ void moe_weighted_reduction_bf16_v4(const uint16_t * __restrict__ experts,
                                                       const float * __restrict__ expert_scale,
                                                       const float * __restrict__ weights,
@@ -77,15 +81,15 @@ static __global__ void moe_weighted_reduction_bf16_v4(const uint16_t * __restric
     const float first_scale = expert_scale != nullptr ? expert_scale[first_row] : 1.0f;
     const float w0 = weights[first_row];
     const ushort4 h0 = *(const ushort4 *)(experts + first_row * n_embd + col4);
-    float4 sum; sum.x = (moe_bf2f(h0.x) * first_scale) * w0; sum.y = (moe_bf2f(h0.y) * first_scale) * w0;
-    sum.z = (moe_bf2f(h0.z) * first_scale) * w0; sum.w = (moe_bf2f(h0.w) * first_scale) * w0;
+    float4 sum; sum.x = (moe_h2f<H16>(h0.x) * first_scale) * w0; sum.y = (moe_h2f<H16>(h0.y) * first_scale) * w0;
+    sum.z = (moe_h2f<H16>(h0.z) * first_scale) * w0; sum.w = (moe_h2f<H16>(h0.w) * first_scale) * w0;
     for (int expert = 1; expert < n_expert_used; ++expert) {
         const uint64_t row = first_row + expert;
         const float scale = expert_scale != nullptr ? expert_scale[row] : 1.0f;
         const float w = weights[row];
         const ushort4 h = *(const ushort4 *)(experts + row * n_embd + col4);
-        sum.x += (moe_bf2f(h.x) * scale) * w; sum.y += (moe_bf2f(h.y) * scale) * w;
-        sum.z += (moe_bf2f(h.z) * scale) * w; sum.w += (moe_bf2f(h.w) * scale) * w;
+        sum.x += (moe_h2f<H16>(h.x) * scale) * w; sum.y += (moe_h2f<H16>(h.y) * scale) * w;
+        sum.z += (moe_h2f<H16>(h.z) * scale) * w; sum.w += (moe_h2f<H16>(h.w) * scale) * w;
     }
     if (merge) { const float4 m = *(const float4 *)(merge + token * n_embd + col4); sum.x += m.x; sum.y += m.y; sum.z += m.z; sum.w += m.w; }
     *(float4 *)(dst + token * n_embd + col4) = sum;
@@ -192,6 +196,7 @@ void ggml_cuda_op_moe_weighted_reduction(ggml_backend_cuda_context & ctx,
     if (ggml_cuda_mmb_blk16() && ggml_cuda_mmb_is_bf16_only(ctx, dst)) {
         GGML_ASSERT(n_embd % 4 == 0);
         const bool ein = ggml_cuda_mmb_is_bf16_only(ctx, experts);
+        GGML_ASSERT(!(ggml_cuda_mmb_f16_marks(ctx, experts) & MMB_F16_OUT));
         constexpr int threads = 256;
         const dim3 blocks(n_tokens, (n_embd / 4 + threads - 1) / threads, 1);
         if (ein) moe_weighted_reduction_bf16_v4_out<<<blocks, threads, 0, stream>>>((const uint16_t *) experts->data,
@@ -208,7 +213,8 @@ void ggml_cuda_op_moe_weighted_reduction(ggml_backend_cuda_context & ctx,
         GGML_ASSERT(n_embd % 4 == 0 && ((uintptr_t) experts->data % 16) == 0 && ((uintptr_t) dst->data % 16) == 0 && ((uintptr_t) mrg % 16) == 0);
         constexpr int threads = 256;
         const dim3 blocks(n_tokens, (n_embd / 4 + threads - 1) / threads, 1);
-        moe_weighted_reduction_bf16_v4<<<blocks, threads, 0, stream>>>((const uint16_t *) experts->data,
+        auto kern = (ggml_cuda_mmb_f16_marks(ctx, experts) & MMB_F16_OUT) ? moe_weighted_reduction_bf16_v4<true> : moe_weighted_reduction_bf16_v4<false>;
+        kern<<<blocks, threads, 0, stream>>>((const uint16_t *) experts->data,
             expert_scale ? (const float *) expert_scale->data : nullptr, (const float *) weights->data,
             (float *) dst->data, mrg, n_embd, (int) n_expert_used);
         CUDA_CHECK(cudaGetLastError());
