@@ -1271,7 +1271,7 @@ static __device__ __forceinline__ u4 deq8(const uint2 q, const uint16_t d) {
 template <int G, bool Q8 = false>
 __global__ void __launch_bounds__(NTH, 1) fa_kernel(const float * __restrict__ Q, const _Float16 * __restrict__ K,
         const _Float16 * __restrict__ V, const _Float16 * __restrict__ M, const int * __restrict__ kv_max, float * __restrict__ O,
-        float * __restrict__ Op, float2 * __restrict__ ML, const int ns,
+        _Float16 * __restrict__ Op, float2 * __restrict__ ML, const int ns,
         const float scale_log2, const int T, const int n_kv, const int ntb, const int HQ,
         const int64_t sq1, const int64_t sq2, const int64_t sk1, const int64_t sk2, const int64_t sv1, const int64_t sv2,
         const int64_t sm1, const int m_rows) {
@@ -1456,11 +1456,12 @@ __global__ void __launch_bounds__(NTH, 1) fa_kernel(const float * __restrict__ Q
     lsum += fa7::xch(lsum);
     if (ns > 1 && tok < T) {
         const int64_t r = ((int64_t) split * T + tok) * HQ + hq;
-        float * orow = Op + r * D;
+        const float inv = lsum > 0.f ? 1.f / lsum : 0.f;
+        _Float16 * orow = Op + r * D;
 #pragma unroll
         for (int db = 0; db < DB; ++db)
 #pragma unroll
-            for (int v = 0; v < 8; ++v) orow[db * 16 + 2 * v + hi] = o[db][v];
+            for (int v = 0; v < 8; ++v) orow[db * 16 + 2 * v + hi] = (_Float16) (o[db][v] * inv);
         if (hi == 0) ML[r] = make_float2(m, lsum);
     } else if (tok < T) {
         const float inv = 1.f / lsum;
@@ -1476,7 +1477,7 @@ __global__ void __launch_bounds__(NTH, 1) fa_kernel(const float * __restrict__ Q
 #endif
 }
 
-__global__ void __launch_bounds__(D) combine(const float * __restrict__ Op, const float2 * __restrict__ ML, float * __restrict__ O, const int ns, const int64_t rows) {
+__global__ void __launch_bounds__(D) combine(const _Float16 * __restrict__ Op, const float2 * __restrict__ ML, float * __restrict__ O, const int ns, const int64_t rows) {
     const int64_t r = blockIdx.x;
     const int d = threadIdx.x;
     float mx = -INFINITY;
@@ -1485,7 +1486,7 @@ __global__ void __launch_bounds__(D) combine(const float * __restrict__ Op, cons
     for (int s = 0; s < ns; ++s) {
         const float2 ml = ML[s * rows + r];
         const float wgt = exp2f(ml.x - mx);
-        num += wgt * Op[(s * rows + r) * D + d];
+        num += wgt * ml.y * (float) Op[(s * rows + r) * D + d];
         den += wgt * ml.y;
     }
     O[r * D + d] = num / den;
@@ -1556,7 +1557,7 @@ static void ggml_cuda_fakv(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
             n_kv / FATTN_KQ_STRIDE, mask->nb[1] / sizeof(half2), mask->nb[3] / sizeof(half2));
     }
     const int64_t rows = (int64_t) T * HQ;
-    ggml_cuda_pool_alloc<float> op(ctx.pool());
+    ggml_cuda_pool_alloc<_Float16> op(ctx.pool());
     ggml_cuda_pool_alloc<float2> ml(ctx.pool());
     if (ns > 1) {
         op.alloc(ns * rows * fakv::D);
