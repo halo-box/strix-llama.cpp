@@ -167,7 +167,7 @@ static int test_speculative_rejection_sampling(common_params & params, int n_tri
 
 // Tests the backend verification (dist_spec): the first output token must follow the target distribution, and each
 // trial must give the token of a host implementation of the same step that uses the same random stream.
-static int test_speculative_rejection_backend(common_params & params, int n_trials) {
+static int test_speculative_rejection_backend(common_params & params, int n_trials, int top_k) {
     params.sampling.backend_sampling = false;
     auto llama_init = common_init_from_params(params);
 
@@ -199,9 +199,15 @@ static int test_speculative_rejection_backend(common_params & params, int n_tria
         for (int i = 1; i < n_vocab; ++i) {
             max_l = std::max(max_l, (double) logits[i]);
         }
+        double cutoff = -INFINITY;
+        if (top_k > 0 && top_k < n_vocab) {
+            std::vector<float> sorted(logits, logits + n_vocab);
+            std::nth_element(sorted.begin(), sorted.begin() + top_k - 1, sorted.end(), std::greater<float>());
+            cutoff = sorted[top_k - 1];
+        }
         double sum = 0.0;
         for (int i = 0; i < n_vocab; ++i) {
-            p_ref[i] = std::exp(logits[i] - max_l);
+            p_ref[i] = logits[i] >= cutoff ? std::exp(logits[i] - max_l) : 0.0;
             sum += p_ref[i];
         }
         for (auto & p : p_ref) {
@@ -221,6 +227,10 @@ static int test_speculative_rejection_backend(common_params & params, int n_tria
     common_params_sampling sampling;
     sampling.seed             = 18;
     sampling.samplers         = { COMMON_SAMPLER_TYPE_TEMPERATURE };
+    if (top_k > 0) {
+        sampling.top_k = top_k;
+        sampling.samplers = { COMMON_SAMPLER_TYPE_TOP_K, COMMON_SAMPLER_TYPE_TOP_K, COMMON_SAMPLER_TYPE_TEMPERATURE };
+    }
     sampling.temp             = 1.0f;
     sampling.backend_sampling = true;
     sampling.spec_verify      = true;
@@ -310,7 +320,7 @@ static int test_speculative_rejection_backend(common_params & params, int n_tria
             return 1;
         }
 
-        const std::vector<llama_token> result = common_sampler_sample_and_accept_n(smpl.get(), ctx_be.get(), { 0, 1 }, { d });
+        const std::vector<llama_token> result = common_sampler_sample_and_accept_n(smpl.get(), ctx_be.get(), { 0, 1 }, llama_tokens{ d });
         counts[result[0]]++;
         n_accepted += result[0] == d;
 
@@ -426,7 +436,10 @@ int main(int argc, char ** argv) {
 
     int result = test_speculative_rejection_sampling(params, parsed->n_trials);
     if (result == 0) {
-        result = test_speculative_rejection_backend(params, parsed->n_trials);
+        result = test_speculative_rejection_backend(params, parsed->n_trials, 0);
+    }
+    if (result == 0) {
+        result = test_speculative_rejection_backend(params, parsed->n_trials, 5);
     }
     if (result == 0) {
         LOG("\nAll tests passed.\n");

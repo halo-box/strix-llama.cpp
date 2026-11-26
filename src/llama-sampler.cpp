@@ -1531,7 +1531,8 @@ static void llama_sampler_dist_spec_backend_apply(
     if (data->candidates != nullptr) {
         n = sctx->n_vocab;
         ggml_tensor * zero = ggml_fill(ctx, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, n), 0.0f);
-        p = ggml_set_rows(ctx, zero, ggml_reshape_2d(ctx, p, 1, ggml_nelements(p)), data->candidates);
+        ggml_tensor * ids = ggml_reshape_1d(ctx, data->candidates, ggml_nelements(p));
+        p = ggml_set_rows(ctx, zero, ggml_reshape_2d(ctx, p, 1, ggml_nelements(p)), ids);
     }
     ggml_tensor * pv = ggml_reshape_2d(ctx, p, 1, n);
     ggml_set_name(pv, "spec_p");

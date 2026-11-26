@@ -2317,7 +2317,8 @@ private:
             use_backend_sampling &= !need_pre_sample_logits;
 
             // the backend sampler returns only tokens and verifies a probabilistic draft (see common_sampler_spec_set_draft)
-            task.params.sampling.spec_verify = spec && task.params.sampling.temp > 0.0f && task.params.sampling.n_probs == 0;
+            task.params.sampling.spec_verify = spec && params_base.speculative.draft.probabilistic &&
+                    !params_base.speculative.has_synth() && task.params.sampling.temp > 0.0f && task.params.sampling.n_probs == 0;
 
             // TODO: check verify if this actually works with TTS
             use_backend_sampling &= task.type != SERVER_TASK_TYPE_TTS;
