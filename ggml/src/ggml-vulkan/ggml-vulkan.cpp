@@ -7064,7 +7064,7 @@ void ggml_vk_init(ggml_backend_vk_context * ctx, size_t idx) {
     ctx->fa_dequant_gate_logged = false;
     memset(ctx->fa_union_est_ratio, 0, sizeof(ctx->fa_union_est_ratio));
     ctx->fa_union_declines = 0;
-    // Fixed size of 1KB, for deterministic behavior
+    // initial size: graph_compute grows it to fit the graph before the build, never after a run (see ggml-org#17514)
     ctx->prealloc_size_add_rms_partials = 1024;
 
     ctx->fence = ctx->device->device.createFence({});
@@ -17055,6 +17055,9 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
             if (ctx->prealloc_size_add_rms_partials_offset + size <= ctx->prealloc_size_add_rms_partials) {
                 ctx->do_add_rms_partials = true;
                 ggml_vk_count_fusion(ctx->device, "ADD_RMS_NORM_PARTIALS");
+                ggml_vk_path_census_add("ADD_RMS_NORM_PARTIALS");
+            } else {
+                ggml_vk_path_census_add("ADD_RMS_NORM_PARTIALS_NO_ROOM");
             }
         }
     }
@@ -20148,6 +20151,9 @@ static const char * ggml_backend_vk_dispatch_census_skip(ggml_backend_t backend,
     if (dev->disable_fusion) {
         return "fusion disabled (GGML_VK_DISABLE_FUSION)";
     }
+    if (l == "ADD_RMS_NORM_PARTIALS" && !dev->add_rms_fusion) {
+        return "no add + rms_norm partials fusion (needs subgroup arithmetic; off on Intel)";
+    }
     if (l == "MULTI_ADD" && !dev->multi_add) {
         return "no multi_add (needs RTE f16 rounding and the push-constant size; GGML_VK_DISABLE_MULTI_ADD)";
     }
@@ -20800,6 +20806,23 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     ctx->do_add_rms_partials = false;
     ctx->do_add_rms_partials_offset_calculation = false;
     ctx->ssm_conv_direct_matches.clear();
+
+    // every fused single-row ADD -> RMS_NORM pair takes its own partials slice until the offset resets here: size the
+    // buffer for all single-row f32 RMS_NORMs of the graph (an upper bound on the pairs), or the last pairs run unfused
+    if (ctx->device->add_rms_fusion && !ctx->device->disable_fusion) {
+        size_t partials_size = 0;
+        for (int i = 0; i < cgraph->n_nodes; ++i) {
+            const ggml_tensor * node = cgraph->nodes[i];
+            if (node->op == GGML_OP_RMS_NORM && ggml_nrows(node) == 1 && node->src[0]->type == GGML_TYPE_F32) {
+                partials_size += ggml_vk_rms_partials_size(ctx, node);
+            }
+        }
+        if (partials_size > ctx->prealloc_size_add_rms_partials) {
+            // the previous graph may still read the buffer that is about to be replaced
+            ggml_vk_synchronize(ctx);
+            ctx->prealloc_size_add_rms_partials = partials_size;
+        }
+    }
 
     int last_node = cgraph->n_nodes - 1;
 

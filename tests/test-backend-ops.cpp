@@ -5907,6 +5907,66 @@ struct test_add_rms_norm : public test_case {
     }
 };
 
+// A chain of single-row ADD -> RMS_NORM pairs in one graph, as in a decode step (a residual add before every norm). Every pair
+// that takes the fused path needs its own slice of the backend's partials buffer. With GGML_VK_TEST_REQUIRE_ADD_RMS_PARTIALS=1
+// the case fails when a pair fell back to the unfused RMS_NORM because that buffer was full.
+struct test_add_rms_norm_chain : public test_case {
+    const int64_t n;
+    const int n_pairs;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "ADD_RMS_NORM_CHAIN";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR2(n, n_pairs);
+    }
+
+    // a case holds at most 128 tensors: n_pairs <= 62
+    test_add_rms_norm_chain(int64_t n = 2304, int n_pairs = 60)
+        : n(n), n_pairs(n_pairs) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n);
+        ggml_set_name(x, "x");
+        ggml_tensor * d = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n);
+        ggml_set_name(d, "d");
+
+        for (int i = 0; i < n_pairs; ++i) {
+            x = ggml_add(ctx, x, d);
+            x = ggml_rms_norm(ctx, x, 1e-6f);
+        }
+        ggml_set_name(x, "out");
+
+        return x;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t, -10.f, 10.f);
+        }
+    }
+
+    bool checks_engagement() override { return true; }
+    bool verify_engagement(ggml_backend_t backend, std::string & msg) override {
+        if (!engagement_required(backend, "GGML_VK_TEST_REQUIRE_ADD_RMS_PARTIALS", "ADD_RMS_NORM_PARTIALS")) {
+            return true;
+        }
+        // counted over every run of the graph since the reset (the compare and the determinism runs)
+        const int64_t fused   = dispatch_census_count(backend, "path:ADD_RMS_NORM_PARTIALS");
+        const int64_t no_room = dispatch_census_count(backend, "path:ADD_RMS_NORM_PARTIALS_NO_ROOM");
+        if (fused <= 0 || no_room != 0) {
+            msg = "ADD_RMS_NORM_PARTIALS: " + std::to_string(fused) + " pairs fused, " + std::to_string(no_room) +
+                  " unfused with the partials buffer full";
+            return false;
+        }
+        return true;
+    }
+};
+
 // GGML_OP_UNARY(RELU) + GGML_OP_SQR (fused operation)
 struct test_relu_sqr : public test_case {
     const ggml_type type;
@@ -16715,6 +16775,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
         test_cases.emplace_back(new test_add_rms_norm(GGML_TYPE_F32, {n, 1, 1, 1}, 1e-6f, false));
     }
+    // single-row ADD -> RMS_NORM pairs in one graph: a few, then more than a 1 KiB partials buffer holds (Inkling 2 Mini
+    // decodes 96 such pairs at width 2304, one graph since its SCALE runs on the GPU)
+    test_cases.emplace_back(new test_add_rms_norm_chain(64, 4));
+    test_cases.emplace_back(new test_add_rms_norm_chain(2304, 60));
+    test_cases.emplace_back(new test_add_rms_norm_chain(8192, 32));
     for (uint32_t n : {64, 1025}) {
         test_cases.emplace_back(new test_add_add(GGML_TYPE_F32, GGML_TYPE_F32, { n, 5, 4, 3 }, false, false));
         test_cases.emplace_back(new test_add_add(GGML_TYPE_F32, GGML_TYPE_F32, { n, 5, 4, 3 }, true, false));
