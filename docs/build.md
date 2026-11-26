@@ -459,13 +459,7 @@ scripts/serve-inkling2-dspark-hrx.sh \
     "$models/dspark-Inkling-2-Mini-Q8_0.gguf" --port 8080
 ```
 
-The launcher selects HRX0 for both models and pins the target token embedding and draft mask embedding there. It uses greedy decoding and proposes up to three tokens per verification step. Pass extra server options after the draft path. Set `LLAMA_SERVER` when the binary is outside `build/bin`.
-
-Set `GGML_HRX_INKLING_BF16_CTRL=1` to use BF16 WMMA for the Inkling 2 Mini loop controller on gfx1151. This rounds the projection inputs to BF16 and accumulates in F32. It applies to supported controller batches of 64 to 8192 tokens in multiples of 64. Other batches use the regular controller. The flag is off by default, and `GGML_HRX_DISABLE_GATED_MMA` disables both WMMA controller paths.
-
-Set `GGML_HRX_INKLING_NATIVE_CTRL=1` to test the Loom-style controller on gfx1151. It normalizes live input rows into F16, uses BF16-rounded weights and keeps the down-projection result in F32 until the gate projection. This mode runs on batches of 128 to 8192 tokens in multiples of 128. If both switches are set, it takes priority on the shapes it supports.
-
-For the optional XDNA2 prefill path, set `GGML_HRX_NPU=1 GGML_HRX_NPU_SPLIT=0` before starting the launcher. DSpark still proposes tokens on HRX0. The target checks each proposal. The `/completion` response reports proposed and accepted counts in `timings.draft_n` and `timings.draft_n_accepted`.
+An HRX-enabled build prefers HRX for `inkling2_loop`. An explicit `--device` selection takes precedence. The launcher uses greedy DSpark decoding with up to three draft tokens. Add `--hrx-npu` to offload eligible prefill matrix multiplications to XDNA2. See the [HRX build and run guide](backend/HRX.md) for the release build and the million-token configuration.
 
 ## Vulkan
 

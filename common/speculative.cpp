@@ -3511,6 +3511,13 @@ common_speculative_init_result::common_speculative_init_result(
                                     params.speculative.types.end(),
                                     COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
 
+    if (model_tgt && params.devices.empty() && llama_model_n_devices(model_tgt) == 1 &&
+            std::find(params.speculative.types.begin(), params.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK) != params.speculative.types.end()) {
+        auto * dev = llama_model_get_device(model_tgt, 0);
+        if (strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev)), "HRX") == 0) {
+            params.devices = { dev, nullptr };
+        }
+    }
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
 

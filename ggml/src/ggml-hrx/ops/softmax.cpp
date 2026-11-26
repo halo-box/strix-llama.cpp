@@ -7,7 +7,7 @@
 // Rows without a mask up to this length use 16 to 64 work items for each row. Other rows use one workgroup for each row.
 static constexpr int64_t GGML_HRX_SOFT_MAX_ROWS_MAX_NE0 = 1024;
 // Rows from this length use 1024 lanes. SOFT_MAX [200058, 1] took 520 us with 256 lanes and 142 us with 1024 lanes
-// (gfx1151, GGML_HRX_PROFILE_OPS, llama-server decode with backend sampling).
+// (gfx1151, the op profiler, llama-server decode with backend sampling).
 static constexpr int64_t GGML_HRX_SOFT_MAX_WIDE_NE0 = 16384;
 static constexpr int64_t GGML_HRX_SOFT_MAX_SPLIT_CHUNK = 4096;
 

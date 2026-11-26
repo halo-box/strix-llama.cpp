@@ -629,8 +629,7 @@ int ggml_hrx_fuse_flash_attn_bias_sub(ggml_backend_hrx_context * ctx, const ggml
 
 // The MUL_MAT fusion below reads w and r of the table MUL_MAT when the FLASH_ATTN_EXT runs. Thus they stay allocated until then.
 void ggml_hrx_flash_attn_alloc_deps(ggml_cgraph * cgraph, ggml_backend_graph_optimize_params * params) {
-    static const bool disabled = getenv("GGML_HRX_DISABLE_FUSION") != nullptr;
-    if (disabled || params == nullptr || params->add_alloc_dep == nullptr) {
+    if (params == nullptr || params->add_alloc_dep == nullptr) {
         return;
     }
     for (int i = 0; i < cgraph->n_nodes; ++i) {

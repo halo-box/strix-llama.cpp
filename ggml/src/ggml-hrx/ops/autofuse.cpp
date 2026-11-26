@@ -217,7 +217,7 @@ struct af_builder {
     // REPEAT nodes whose only reader is the next node, a GET_ROWS. That one reads the source (a broadcast).
     std::vector<std::pair<const ggml_tensor *, const ggml_tensor *>> rep;
     int                               n_absorbed = 0; // absorbed nodes that a region node reads
-    const char *                      stop    = "";  // why the region ends, for GGML_HRX_AUTOFUSE_LOG
+    const char *                      stop    = "";  // why the region ends, for the fusion trace
 
     int find(const ggml_tensor * t) const {
         for (size_t k = 0; k < tensors.size(); ++k) {
@@ -3451,17 +3451,6 @@ static bool af_scalars(const af_builder & b, const std::vector<af_odata> & od, c
     return true;
 }
 
-static bool af_disabled() {
-    static const bool disabled = getenv("GGML_HRX_DISABLE_AUTOFUSION") != nullptr;
-    return disabled;
-}
-
-// GGML_HRX_AUTOFUSE_LOG=1 prints the regions and why each one ends, 2 also prints the generated sources, 3 also the nodes.
-static int af_log_level() {
-    static const int level = getenv("GGML_HRX_AUTOFUSE_LOG") != nullptr ? atoi(getenv("GGML_HRX_AUTOFUSE_LOG")) : 0;
-    return level;
-}
-
 static ggml_hrx_kernel * af_kernel(ggml_backend_hrx_context * ctx, const af_spec & spec) {
     ggml_hrx_autofuse * af  = ctx->autofuse;
     const std::string   sig = spec.key();
@@ -3482,7 +3471,7 @@ static ggml_hrx_kernel * af_kernel(ggml_backend_hrx_context * ctx, const af_spec
     ggml_hrx_kernel * kernel = ggml_hrx_get_kernel(ctx->device, desc);
     if (kernel == nullptr) {
         GGML_LOG_WARN("ggml_hrx: auto-fusion kernel %s does not compile, the region runs unfused:\n%s\n", sym, source.c_str());
-    } else if (af_log_level() > 1) {
+    } else if (ctx->trace) {
         fprintf(stderr, "%s\n", source.c_str());
     }
     af->kernels[sig] = kernel;
@@ -3524,7 +3513,7 @@ struct af_part {
 // Builds the longest region that starts at node i, with at least one op.
 static bool af_make_part(ggml_backend_hrx_context * ctx, const ggml_cgraph * cgraph, int i, af_part & p) {
     const ggml_hrx_tune * tune = ctx->device->tune;
-    const bool            log  = af_log_level() > 0;
+    const bool            log  = ctx->trace;
     static thread_local af_builder b;
     std::vector<af_odata> od;
     // A region stops before the nodes of a fusion (ops/fuse.cpp).
@@ -3696,7 +3685,7 @@ static ggml_hrx_kernel * af_kernel_parts(ggml_backend_hrx_context * ctx, const s
     ggml_hrx_kernel * kernel = ggml_hrx_get_kernel(ctx->device, desc);
     if (kernel == nullptr) {
         GGML_LOG_WARN("ggml_hrx: auto-fusion kernel %s does not compile, the parts run alone:\n%s\n", sym, source.c_str());
-    } else if (af_log_level() > 1) {
+    } else if (ctx->trace) {
         fprintf(stderr, "%s\n", source.c_str());
     }
     af->kernels[key] = kernel;
@@ -3766,7 +3755,7 @@ void ggml_hrx_autofuse_plan(ggml_backend_hrx_context * ctx, const ggml_cgraph * 
     }
     ggml_hrx_autofuse * af = ctx->autofuse;
     af->cur = nullptr;
-    if (af_disabled() || cgraph->n_nodes == 0) {
+    if (cgraph->n_nodes == 0) {
         return;
     }
     static thread_local std::vector<uint8_t> fp;
@@ -3785,7 +3774,7 @@ void ggml_hrx_autofuse_plan(ggml_backend_hrx_context * ctx, const ggml_cgraph * 
     plan.start.assign(cgraph->n_nodes, -1);
     plan.regions.clear();
     af->cur = &plan;
-    if (af_log_level() > 2) {
+    if (ctx->trace) {
         af_dump_nodes(cgraph);
     }
 

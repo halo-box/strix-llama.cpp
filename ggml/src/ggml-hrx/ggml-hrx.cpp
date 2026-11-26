@@ -497,9 +497,9 @@ bool ggml_hrx_dispatch(ggml_backend_hrx_context * ctx, ggml_hrx_kernel * kernel,
         { launch.workgroup_size[0],  launch.workgroup_size[1],  launch.workgroup_size[2] },
         launch.subgroup_size,
     };
-    if (ctx->dispatch_log != nullptr) {
+    if (ctx->trace) {
         const ggml_tensor * n = ctx->cur_node;
-        fprintf(ctx->dispatch_log, "%" PRId64 "\t%s\t%s\t%s\t%u,%u,%u\n", ctx->n_graphs_seen, n != nullptr ? n->name : "-",
+        fprintf(stderr, "%" PRId64 "\t%s\t%s\t%s\t%u,%u,%u\n", ctx->n_graphs_seen, n != nullptr ? n->name : "-",
                 n != nullptr ? ggml_op_desc(n) : "-", kernel->symbol.c_str(), launch.workgroup_count[0], launch.workgroup_count[1],
                 launch.workgroup_count[2]);
     }
@@ -616,9 +616,6 @@ static void ggml_backend_hrx_free(ggml_backend_t backend) {
     GGML_HRX_CHECK(hrx_stream_synchronize(ctx->stream));
     if (ctx->prof != nullptr) {
         ggml_hrx_profile_print(ctx);
-    }
-    if (ctx->dispatch_log != nullptr) {
-        fclose(ctx->dispatch_log);
     }
     ggml_hrx_autofuse_free(ctx->autofuse);
     ggml_hrx_fuse_free(ctx->fuse);
@@ -838,7 +835,6 @@ static bool ggml_hrx_run_nodes(ggml_backend_hrx_context * ctx, const ggml_cgraph
     // The GPU starts work while the host records the next nodes. A short first interval starts a small graph sooner.
     int                   n_submit  = tune->nodes_first_submit;
     size_t                n_timed   = 0;
-    int                   n_profiled = 0;
 
     if (ggml_hrx_npu_plan(ctx, cgraph) && capture) {
         ggml_hrx_npu_record_begin(ctx);
@@ -890,14 +886,6 @@ static bool ggml_hrx_run_nodes(ggml_backend_hrx_context * ctx, const ggml_cgraph
                                        fused != nullptr      ? std::string("FUSED ") + fused + " " + ggml_hrx_profile_key(cgraph->nodes[i]) :
                                                                ggml_hrx_profile_key(node);
             if (!ggml_hrx_profile_record(ctx, ++n_timed)) {
-                return false;
-            }
-        }
-        // The device profiler keeps a bounded record ring per queue. A synchronization drains it.
-        static const bool hrx_profile = getenv("HRX_PROFILE_FILE") != nullptr;
-        if (hrx_profile && !capture && ++n_profiled >= 512) {
-            n_profiled = 0;
-            if (!GGML_HRX_CHECK(hrx_stream_synchronize(ctx->stream))) {
                 return false;
             }
         }
@@ -989,7 +977,6 @@ static enum ggml_status ggml_backend_hrx_graph_compute(ggml_backend_t backend, g
         return GGML_STATUS_FAILED;
     }
 
-    static const bool no_graphs = getenv("GGML_HRX_DISABLE_GRAPHS") != nullptr;
     bool              replay    = false;
     if (ctx->device->npu && ctx->weight_version != ctx->device->weight_version.load()) {
         for (auto & entry : ctx->graphs) {
@@ -997,7 +984,7 @@ static enum ggml_status ggml_backend_hrx_graph_compute(ggml_backend_t backend, g
         }
         ctx->weight_version = ctx->device->weight_version.load();
     }
-    if (!no_graphs && ctx->prof == nullptr && !ctx->graphs_failed && cgraph->n_nodes > 0) {
+    if (ctx->prof == nullptr && !ctx->graphs_failed && cgraph->n_nodes > 0) {
         // A small cache. Graphs of other shapes take new keys, so drop all of them when it fills.
         if (ctx->graphs.size() >= 16 && ctx->graphs.find(cgraph->nodes[0]) == ctx->graphs.end()) {
             for (auto & kv : ctx->graphs) {
@@ -1101,7 +1088,6 @@ static void ggml_backend_hrx_device_get_props(ggml_backend_dev_t dev, ggml_backe
 }
 
 static ggml_backend_t ggml_backend_hrx_device_init_backend(ggml_backend_dev_t dev, const char * params) {
-    GGML_UNUSED(params);
     ggml_hrx_device_context * dev_ctx = ggml_hrx_dev_ctx(dev);
 
     hrx_stream_t stream = nullptr;
@@ -1112,12 +1098,10 @@ static ggml_backend_t ggml_backend_hrx_device_init_backend(ggml_backend_dev_t de
     ctx->device  = dev_ctx;
     ctx->stream  = stream;
     ctx->name    = dev_ctx->name;
-    if (getenv("GGML_HRX_PROFILE_OPS") != nullptr) {
+    if (params && strcmp(params, "profile") == 0) {
         ctx->prof = new ggml_hrx_op_profile;
     }
-    if (const char * path = getenv("GGML_HRX_DISPATCH_LOG")) {
-        ctx->dispatch_log = fopen(path, "w");
-    }
+    ctx->trace = params && strcmp(params, "trace") == 0;
     return new ggml_backend{ ggml_backend_hrx_guid(), ggml_backend_hrx_interface, dev, ctx };
 }
 
@@ -1317,7 +1301,7 @@ static std::unique_ptr<ggml_hrx_device_context> ggml_hrx_init_device(hrx_device_
     return ctx;
 }
 
-static void ggml_hrx_discover(ggml_hrx_reg_context * reg) {
+static void ggml_hrx_discover(ggml_hrx_reg_context * reg, ggml_backend_reg_t backend_reg, bool with_npu) {
     hrx_runtime_options_t      options   = {};
     const hrx_host_allocator_t allocator = hrx_host_allocator_system();
     if (!GGML_HRX_CHECK(hrx_runtime_create(&options, allocator, &reg->runtime))) {
@@ -1329,35 +1313,25 @@ static void ggml_hrx_discover(ggml_hrx_reg_context * reg) {
     if (!GGML_HRX_CHECK(hrx_runtime_query_available_devices(reg->runtime, "amdgpu", allocator, &count, &infos))) {
         return;
     }
-    // GGML_HRX_NPU=1: an XDNA NPU joins the group of the first GPU, with all 8 columns of its array (the NPU GEMM uses 32 cores).
     std::string npu_uri;
-    {
-        const char *        env    = getenv("GGML_HRX_NPU");
+    if (with_npu) {
         size_t              n_npu  = 0;
         hrx_device_info_t * npus   = nullptr;
-        if (env != nullptr && std::strcmp(env, "1") == 0 &&
-            hrx_status_is_ok(hrx_runtime_query_available_devices(reg->runtime, "xdna", allocator, &n_npu, &npus)) && n_npu > 0) {
+        if (GGML_HRX_CHECK(hrx_runtime_query_available_devices(reg->runtime, "xdna", allocator, &n_npu, &npus)) && n_npu > 0) {
             npu_uri = std::string(npus[0].uri) + "?columns=8";
         }
         hrx_host_allocator_free(allocator, npus);
+        if (npu_uri.empty()) {
+            hrx_host_allocator_free(allocator, infos);
+            return;
+        }
     }
 
     // One group per device.
     for (size_t i = 0; i < count; ++i) {
         hrx_device_create_params_t params[2] = { { infos[i].uri, HRX_WAIT_FLAG_NONE }, { npu_uri.c_str(), HRX_WAIT_FLAG_NONE } };
         hrx_device_group_t group = nullptr;
-        bool               npu   = !npu_uri.empty();
-        if (npu) {
-            hrx_status_t status = hrx_device_group_create(reg->runtime, 2, params, &group);
-            if (!hrx_status_is_ok(status)) {
-                GGML_LOG_INFO("ggml_hrx: the NPU is not usable, the GPU runs alone\n");
-                hrx_status_ignore(status);
-                group = nullptr;
-                npu   = false;
-            }
-            npu_uri.clear();
-        }
-        if (group == nullptr && !GGML_HRX_CHECK(hrx_device_group_create(reg->runtime, 1, params, &group))) {
+        if (!GGML_HRX_CHECK(hrx_device_group_create(reg->runtime, with_npu ? 2 : 1, params, &group))) {
             continue;
         }
         hrx_device_t device = hrx_device_group_get_device(group, 0);
@@ -1372,13 +1346,23 @@ static void ggml_hrx_discover(ggml_hrx_reg_context * reg) {
             hrx_device_group_release(group);
             continue;
         }
-        if (npu) {
+        if (with_npu) {
+            ctx->name += "+XDNA";
             ctx->npu = ggml_hrx_npu_create(ctx.get(), hrx_device_group_get_device(group, 1));
         }
         reg->groups.push_back(group);
         reg->contexts.push_back(std::move(ctx));
+        if (with_npu) {
+            break;
+        }
     }
     hrx_host_allocator_free(allocator, infos);
+
+    reg->devices.reserve(reg->contexts.size());
+    for (auto & ctx : reg->contexts) {
+        reg->devices.push_back({ ggml_backend_hrx_device_interface, backend_reg, ctx.get() });
+        ctx->buft = { ggml_backend_hrx_buffer_type_interface, &reg->devices.back(), ctx.get() };
+    }
 }
 
 static const char * ggml_backend_hrx_reg_get_name(ggml_backend_reg_t reg) {
@@ -1467,8 +1451,13 @@ static bool ggml_backend_hrx_set_relative_positions(ggml_tensor * dst, const int
            GGML_HRX_CHECK(hrx_stream_barrier(upload.stream, nullptr));
 }
 
+static ggml_backend_dev_t ggml_backend_hrx_npu_device();
+
 static void * ggml_backend_hrx_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
+    if (strcmp(name, "ggml_backend_hrx_npu_device") == 0) {
+        return reinterpret_cast<void *>(ggml_backend_hrx_npu_device);
+    }
     if (strcmp(name, "ggml_backend_hrx_set_relative_positions") == 0) {
         return reinterpret_cast<void *>(ggml_backend_hrx_set_relative_positions);
     }
@@ -1485,20 +1474,24 @@ static const ggml_backend_reg_i ggml_backend_hrx_reg_interface = {
 ggml_backend_reg_t ggml_backend_hrx_reg(void) {
     static ggml_hrx_reg_context reg_ctx;
     static ggml_backend_reg     reg = { GGML_BACKEND_API_VERSION, ggml_backend_hrx_reg_interface, &reg_ctx };
-
     static std::once_flag once;
-    std::call_once(once, [] {
-        ggml_hrx_discover(&reg_ctx);
-        reg_ctx.devices.reserve(reg_ctx.contexts.size());
-        for (auto & ctx : reg_ctx.contexts) {
-            reg_ctx.devices.push_back({ ggml_backend_hrx_device_interface, &reg, ctx.get() });
-        }
-        for (size_t i = 0; i < reg_ctx.contexts.size(); ++i) {
-            ggml_hrx_device_context * ctx = reg_ctx.contexts[i].get();
-            ctx->buft = { ggml_backend_hrx_buffer_type_interface, &reg_ctx.devices[i], ctx };
-        }
-    });
+    std::call_once(once, [] { ggml_hrx_discover(&reg_ctx, &reg, false); });
     return &reg;
+}
+
+static ggml_backend_dev_t ggml_backend_hrx_npu_device() {
+    static std::mutex mutex;
+    static std::unique_ptr<ggml_hrx_reg_context> paired;
+    std::lock_guard<std::mutex> lock(mutex);
+    if (!paired) {
+        auto ctx = std::make_unique<ggml_hrx_reg_context>();
+        ggml_hrx_discover(ctx.get(), ggml_backend_hrx_reg(), true);
+        if (ctx->devices.empty() || !ctx->contexts.front()->npu) {
+            return nullptr;
+        }
+        paired = std::move(ctx);
+    }
+    return &paired->devices.front();
 }
 
 ggml_backend_t ggml_backend_hrx_init(size_t device) {

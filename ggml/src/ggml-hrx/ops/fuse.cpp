@@ -33,7 +33,6 @@ struct ggml_hrx_fusion_plan {
 };
 
 void ggml_hrx_fuse_plan(ggml_backend_hrx_context * ctx, const ggml_cgraph * cgraph) {
-    static const bool disabled = getenv("GGML_HRX_DISABLE_FUSION") != nullptr;
     if (ctx->fuse == nullptr) {
         ctx->fuse = new ggml_hrx_fusion_plan;
     }
@@ -44,9 +43,6 @@ void ggml_hrx_fuse_plan(ggml_backend_hrx_context * ctx, const ggml_cgraph * cgra
     p.absorbs.assign(n, 0);
     p.state.assign(n, 0);
     p.next.assign(n + 1, n);
-    if (disabled) {
-        return;
-    }
     std::vector<int> absorbed;
     for (int i = 0; i < n; ++i) {
         for (int f = 0; f < GGML_HRX_N_FUSIONS; ++f) {

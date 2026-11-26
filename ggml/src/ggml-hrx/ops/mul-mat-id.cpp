@@ -245,8 +245,8 @@ bool ggml_hrx_op_mul_mat_id(ggml_backend_hrx_context * ctx, const ggml_tensor * 
     const bool grouped = w->ne[2] < 1024;
 
     if (grouped && ggml_hrx_mul_mat_id_use_wmma(ctx, node)) {
-        static const bool wmma128_off = getenv("GGML_HRX_DISABLE_MMID128") != nullptr;
-        if (!wmma128_off && ggml_hrx_mul_mat_id_use_wmma128(ctx, node)) {
+
+        if (ggml_hrx_mul_mat_id_use_wmma128(ctx, node)) {
             ggml_hrx_mmid128_scratch sc;
             return ggml_hrx_mmid128_prepare(ctx, node, 0, sc) && ggml_hrx_mmid128_run(ctx, node, w, x->ne[1], sc, sc.xh_off, nullptr, -1);
         }
@@ -602,10 +602,10 @@ static bool ggml_hrx_moe_glu_match_at(ggml_backend_hrx_context * ctx, const ggml
 }
 
 int ggml_hrx_fuse_moe_glu(ggml_backend_hrx_context * ctx, const ggml_cgraph * cgraph, int i, std::vector<int> * absorbed) {
-    static const bool disabled = getenv("GGML_HRX_DISABLE_MMID128") != nullptr;
+
     std::vector<int>       own;
     ggml_hrx_moe_glu_match mt;
-    if (disabled || !ggml_hrx_moe_glu_match_at(ctx, cgraph, i, own, mt)) {
+    if (!ggml_hrx_moe_glu_match_at(ctx, cgraph, i, own, mt)) {
         return -1;
     }
     if (absorbed != nullptr) {
@@ -625,21 +625,20 @@ int ggml_hrx_fuse_moe_glu(ggml_backend_hrx_context * ctx, const ggml_cgraph * cg
     // With the combine the down rows are f16, as the activations: each weighted route row is rounded to f16 before the sum, and
     // the combine reads half the bytes. gfx1151, Inkling 2 Mini, 4096 tokens (model graph, device timestamps): combine 903 us
     // against 1642 us, down 128-route kernel about -1 %.
-    static const bool   dn_f16  = getenv("GGML_HRX_DISABLE_MOE_F16") == nullptr;
-    const int64_t       dn_len  = mt.out != nullptr ? (dn_f16 ? 1 : 2) * n_embd * n_ids * ids->ne[1] : 0;
+    const int64_t       dn_len  = mt.out != nullptr ? n_embd * n_ids * ids->ne[1] : 0;
     ggml_hrx_mmid128_scratch sc;
     bool ok = ggml_hrx_mmid128_prepare(ctx, mt.gu, act_len + dn_len, sc) && sc.xh_off + x_len + act_len + dn_len < INT_MAX;
     const int64_t act_off = sc.xh_off + x_len;
-    const int64_t dn_off  = dn_f16 ? act_off + act_len : (act_off + act_len) / 2;
+    const int64_t dn_off  = act_off + act_len;
     // With the combine the down kernel applies the down expert scale and the routing weights.
     ok = ok && ggml_hrx_mmid128_run(ctx, mt.gu, mt.gu->src[0], x->ne[1], sc, sc.xh_off, &mt.glu, act_off) &&
          ggml_hrx_mmid128_run(ctx, mt.down, mt.down->src[0], n_ids, sc, act_off, nullptr, mt.out != nullptr ? dn_off : -1, mt.es_down, mt.weights,
-                              mt.out != nullptr && dn_f16);
+                              mt.out != nullptr);
     if (ok && mt.out != nullptr) {
         ggml_hrx_kernel_desc desc;
         desc.file   = "matmul/mul_mat_id_wmma.loom";
         desc.symbol = "ggml_moe_combine";
-        desc.config = { { "ggml.mul_mat_id.d_f16", dn_f16 ? "1" : "0" } };
+        desc.config = { { "ggml.mul_mat_id.d_f16", "1" } };
         const int64_t n_items = n_embd / 4 * ids->ne[1];
         ok = ggml_hrx_dispatch(ctx, ggml_hrx_get_kernel(ctx->device, desc), { n_items },
             { n_items, n_embd / 4, n_ids, dn_off, dn_off + n_embd * n_ids * ids->ne[1], (int64_t) (mt.out->nb[1] / 4), (int64_t) (ggml_nbytes(mt.out) / 4) },

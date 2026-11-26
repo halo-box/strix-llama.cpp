@@ -19,21 +19,15 @@
 // the Q8_0 weights at first use, and int8 activations with one scale for each token. The GPU quantizes the NPU rows
 // (kernels/npu/npu_i8.loom), computes the other rows as usual and later scales the int32 sums into the output.
 //
-// Two kinds of nodes use the NPU:
-// - ahead: the first use of the output is far away (graph_order moves the node next to its input). The NPU takes all
-//   rows it can and runs while the GPU computes the nodes in between.
-// - split: the output is used soon. The NPU takes a part of the rows and runs while the GPU computes the rest.
 // The NPU runs one GEMM at a time, so a node uses the NPU only if no other NPU result is in flight.
 // A recorded graph with NPU work is a list of HRX graphs with NPU dispatches and waits between them.
-// GGML_HRX_NPU=1 turns it on. On Inkling 2 Mini prefill it gave no measured gain (2026-11-24): the GPU loses ~7 % of its
+// On Inkling 2 Mini prefill it gave no measured gain (2026-11-24): the GPU loses ~7 % of its
 // speed while the NPU streams DRAM, and the quantize and scale passes cost most of the GPU time that the NPU saves.
 
 // Strix Halo, NPU alone (npu_gemm, 2026-11-24): M=2048 [2304,3072] 2.09 ms, [3072,2304] 1.98 ms, M=1024 1.29 / 1.22 ms;
-// the GPU needs 0.95 and 1.92 ms for M=2048. The split share balances the two devices on [3072,2304].
+// The GPU needs 0.95 and 1.92 ms for M=2048. Only offload nodes with independent GPU work before the first use.
 static constexpr int64_t GGML_HRX_NPU_MIN_ROWS   = 512;            // smaller batches stay on the GPU
 static constexpr int64_t GGML_HRX_NPU_MIN_WEIGHT = 2304 * 2304;    // smaller weights stay on the GPU
-static constexpr float   GGML_HRX_NPU_AHEAD      = 1.0f;           // share of the rows for an ahead node
-static constexpr float   GGML_HRX_NPU_SPLIT      = 0.5f;           // share of the rows for a split node
 static constexpr int     GGML_HRX_NPU_AHEAD_DIST = 8;              // nodes between a node and its first use for ahead
 static constexpr int     GGML_HRX_NPU_SLOTS      = 2;              // exchange buffers in flight
 static constexpr int64_t GGML_HRX_NPU_MAX_N      = 16384;          // the int8 copy of a larger weight (an output head) costs too much memory
@@ -57,12 +51,11 @@ struct ggml_hrx_npu {
     uint64_t                  value  = 0;
     hrx_mem_pool_t            pool   = nullptr;
     std::string               arch;
-    float                     ahead  = GGML_HRX_NPU_AHEAD;
-    float                     split  = GGML_HRX_NPU_SPLIT;
 
     std::mutex                                       mutex;
     std::map<std::string, std::pair<hrx_executable_t, uint32_t>> kernels; // by kernel config, nullptr if the build failed
     std::map<std::tuple<hrx_buffer_t, size_t, int64_t, int64_t, uint64_t>, ggml_hrx_npu_weight> weights; // by buffer, offset, K, N
+    uint64_t                                         submissions = 0;
     size_t                                           active_contexts = 0;
     std::vector<hrx_buffer_t>                        allocations;
 };
@@ -100,21 +93,11 @@ struct ggml_hrx_npu_state {
     ggml_hrx_npu_slot             slots[GGML_HRX_NPU_SLOTS] = {};
     int                           next_slot = 0;
     std::vector<ggml_backend_buffer_t> retired;
-    std::vector<float>            share; // by node index, 0 for the GPU only
+    std::vector<int64_t>          rows; // by node index, 0 for the GPU only
     std::vector<ggml_hrx_npu_job> jobs;
     bool                          completing = false;
     ggml_hrx_npu_replay *         replay     = nullptr; // the recording that takes the NPU work while a graph is recorded
 };
-
-static float ggml_hrx_npu_env_float(const char * name, float def) {
-    const char * v = getenv(name);
-    if (v == nullptr) {
-        return def;
-    }
-    char * end;
-    const float f = std::strtof(v, &end);
-    return end != v && *end == '\0' && std::isfinite(f) ? std::clamp(f, 0.0f, 1.0f) : def;
-}
 
 static hrx_queue_t ggml_hrx_npu_find_queue(hrx_device_t device, hrx_queue_role_flags_t roles) {
     for (size_t i = 0; i < hrx_device_queue_family_count(device); ++i) {
@@ -160,8 +143,6 @@ ggml_hrx_npu * ggml_hrx_npu_create(ggml_hrx_device_context * dev, hrx_device_t n
         hrx_semaphore_release(npu->sem);
         return nullptr;
     }
-    npu->ahead = ggml_hrx_npu_env_float("GGML_HRX_NPU_AHEAD", GGML_HRX_NPU_AHEAD);
-    npu->split = ggml_hrx_npu_env_float("GGML_HRX_NPU_SPLIT", GGML_HRX_NPU_SPLIT);
     GGML_LOG_INFO("ggml_hrx: %s uses the NPU (%s) for large Q8_0 MUL_MATs\n", dev->name.c_str(), arch);
     return npu.release();
 }
@@ -198,6 +179,7 @@ void ggml_hrx_npu_free(ggml_hrx_npu * npu) {
             hrx_executable_release(kv.second.first);
         }
     }
+    GGML_LOG_INFO("ggml_hrx: submitted %" PRIu64 " matrix multiplications to XDNA2\n", npu->submissions);
     hrx_mem_pool_release(npu->pool);
     hrx_semaphore_release(npu->sem);
     delete npu;
@@ -475,16 +457,11 @@ static bool ggml_hrx_npu_eligible(const ggml_tensor * node) {
            w->op == GGML_OP_NONE && w->view_src == nullptr && ggml_backend_buffer_get_usage(w->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
            w->ne[0] % 128 == 0 && w->ne[2] == 1 && w->ne[3] == 1 && x->ne[2] == 1 && x->ne[3] == 1 && ggml_is_contiguous(w) &&
            x->nb[0] == sizeof(float) && node->nb[0] == sizeof(float) && x->ne[1] >= GGML_HRX_NPU_MIN_ROWS &&
-           w->ne[0] * w->ne[1] >= GGML_HRX_NPU_MIN_WEIGHT && ggml_hrx_npu_source(w->ne[0], 1) != nullptr &&
-           ggml_hrx_npu_source(w->ne[0], 2) != nullptr && w->ne[1] % 128 == 0 && w->ne[1] <= GGML_HRX_NPU_MAX_N &&
+           ggml_hrx_npu_source(w->ne[0], 1) != nullptr &&
+           ggml_hrx_npu_source(w->ne[0], 2) != nullptr && w->ne[1] % 128 == 0 && w->ne[1] >= 256 && w->ne[1] <= GGML_HRX_NPU_MAX_N &&
+           w->ne[0] * w->ne[1] >= GGML_HRX_NPU_MIN_WEIGHT &&
            ggml_prec_get_acc(node) == GGML_PREC_UNDEFINED && ggml_prec_get_src(node, 1) == GGML_PREC_UNDEFINED &&
            ggml_get_op_params_i32(node, 1) != GGML_HINT_EXACT_BATCH;
-}
-
-// NPU rows m: a multiple of 512 rows up to share * rows.
-static bool ggml_hrx_npu_shape(int64_t rows, int64_t n, float share, int64_t * m) {
-    *m = std::min((int64_t) (share * (float) rows), rows) / 512 * 512;
-    return *m >= 512 && n / 128 >= 2;
 }
 
 static bool ggml_hrx_npu_reads(const ggml_tensor * node, const ggml_tensor * t) {
@@ -541,7 +518,7 @@ bool ggml_hrx_npu_plan(ggml_backend_hrx_context * ctx, const ggml_cgraph * cgrap
         ++npu->active_contexts;
     }
     ggml_hrx_npu_state * st = ctx->npu;
-    st->share.assign(cgraph->n_nodes, 0.0f);
+    st->rows.assign(cgraph->n_nodes, 0);
     bool any  = false;
     int  busy = -1; // node index until which the NPU has a result in flight
     for (int i = 0; i < cgraph->n_nodes; ++i) {
@@ -557,13 +534,11 @@ bool ggml_hrx_npu_plan(ggml_backend_hrx_context * ctx, const ggml_cgraph * cgrap
             }
         }
         // An output that no later node reads is done at the end of the graph.
-        const float share = first - i > GGML_HRX_NPU_AHEAD_DIST || first == cgraph->n_nodes ? npu->ahead : npu->split;
-        int64_t m = 0;
-        if (share <= 0.0f || !ggml_hrx_npu_shape(node->src[1]->ne[1], node->src[0]->ne[1], share, &m)) {
+        if (first != cgraph->n_nodes && first - i <= GGML_HRX_NPU_AHEAD_DIST) {
             continue;
         }
-        st->share[i] = share;
-        busy         = first;
+        st->rows[i] = node->src[1]->ne[1] / 512 * 512;
+        busy = first;
         any          = true;
     }
     return any;
@@ -638,6 +613,7 @@ static bool ggml_hrx_npu_submit(ggml_backend_hrx_context * ctx, const ggml_hrx_n
     if (!GGML_HRX_CHECK(hrx_queue_dispatch(npu->queue, &waits, &signals, op.exe, op.ordinal, &config, nullptr, 0, op.bindings, 3, nullptr, 0))) {
         return false;
     }
+    ++npu->submissions;
     npu->value = value;
     *out_value = value;
     return true;
@@ -713,8 +689,8 @@ static bool ggml_hrx_npu_complete_at(ggml_backend_hrx_context * ctx, size_t k) {
 
 bool ggml_hrx_npu_gate(ggml_backend_hrx_context * ctx, const ggml_cgraph * graph, int i, bool * ok) {
     ggml_hrx_npu_state * st = ctx->npu;
-    static const bool disabled = getenv("GGML_HRX_DISABLE_FUSION") != nullptr;
-    if (disabled || st == nullptr || st->jobs.size() != 1 || i + 1 >= graph->n_nodes || ggml_hrx_fuse_next(ctx, i) <= i + 1) {
+
+    if (st == nullptr || st->jobs.size() != 1 || i + 1 >= graph->n_nodes || ggml_hrx_fuse_next(ctx, i) <= i + 1) {
         return false;
     }
     const ggml_hrx_npu_job job = st->jobs.back();
@@ -791,7 +767,7 @@ void ggml_hrx_npu_state_free(ggml_hrx_npu_state * st) {
 
 bool ggml_hrx_npu_run(ggml_backend_hrx_context * ctx, int i, bool * ok) {
     ggml_hrx_npu_state * st = ctx->npu;
-    if (st == nullptr || i >= (int) st->share.size() || st->share[i] <= 0.0f || (ctx->rec != nullptr && st->replay == nullptr)) {
+    if (st == nullptr || i >= (int) st->rows.size() || st->rows[i] == 0 || (ctx->rec != nullptr && st->replay == nullptr)) {
         return false;
     }
     ggml_hrx_npu *      npu  = ctx->device->npu;
@@ -800,16 +776,13 @@ bool ggml_hrx_npu_run(ggml_backend_hrx_context * ctx, int i, bool * ok) {
     const ggml_tensor * x    = node->src[1];
     const int64_t       K    = w->ne[0];
     const int64_t       N    = w->ne[1];
-    int64_t m = 0;
-    if (!ggml_hrx_npu_shape(x->ne[1], N, st->share[i], &m)) {
-        return false;
-    }
+    const int64_t       m    = st->rows[i];
     *ok = false;
     std::lock_guard<std::mutex> lock(npu->mutex);
     const auto [exe, ordinal] = ggml_hrx_npu_kernel(npu, m, N, K);
     const ggml_hrx_npu_weight * weight = exe != nullptr ? ggml_hrx_npu_weight_get(npu, ctx->stream, w) : nullptr;
     if (weight == nullptr) {
-        st->share[i] = 0.0f;
+        st->rows[i] = 0;
         return false;
     }
 

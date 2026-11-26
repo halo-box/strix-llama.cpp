@@ -14,6 +14,7 @@
 #include <cassert>
 #include <stdexcept>
 #include <cinttypes>
+#include <cstring>
 #include <set>
 #include <string>
 #include <vector>
@@ -314,8 +315,14 @@ static void common_params_fit_impl(
 
             dmds_t measured;
             try {
+                auto draft_params = *extra->mparams;
+                ggml_backend_dev_t devices[] = { devs.size() == 1 ? devs.front() : nullptr, nullptr };
+                if (extra->dspark && !draft_params.devices && devices[0] &&
+                        strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(devices[0])), "HRX") == 0) {
+                    draft_params.devices = devices;
+                }
                 measured = common_get_device_memory_data_impl(
-                    extra->paths_model, extra->mparams, extra->cparams, devs_extra, ngl_extra, nsk_extra, nct_extra, nex_extra, log_level);
+                    extra->paths_model, &draft_params, extra->cparams, devs_extra, ngl_extra, nsk_extra, nct_extra, nex_extra, log_level);
             } catch (const std::runtime_error & e) {
                 // the extra model is optional, fit the main model alone rather than giving up
                 LOG_WRN("%s: failed to measure the memory of the extra model, fitting without it: %s\n", __func__, e.what());

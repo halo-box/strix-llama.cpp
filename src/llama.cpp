@@ -156,8 +156,15 @@ int64_t llama_time_us(void) {
 
 // returns true on success
 static bool llama_prepare_model_devices(const llama_model_params & params, llama_model * model) {
-    // create list of devices to use with this model
-    if (params.devices) {
+    ggml_backend_reg_t hrx = nullptr;
+    if (!params.devices && model->arch == LLM_ARCH_INKLING2_LOOP && params.split_mode != LLAMA_SPLIT_MODE_TENSOR) {
+        hrx = ggml_backend_reg_by_name("HRX");
+    }
+    if (hrx && ggml_backend_reg_dev_count(hrx) > 0) {
+        for (size_t i = 0; i < ggml_backend_reg_dev_count(hrx); ++i) {
+            model->devices.push_back({false, ggml_backend_reg_dev_get(hrx, i)});
+        }
+    } else if (params.devices) {
         if (params.split_mode == LLAMA_SPLIT_MODE_TENSOR) {
             size_t n_devs = 0;
             while (params.devices[n_devs]) {

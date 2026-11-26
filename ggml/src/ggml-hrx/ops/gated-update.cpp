@@ -193,11 +193,10 @@ static int64_t ggml_hrx_gated_bits(float v) {
 }
 
 static bool ggml_hrx_gated_use_mma(const ggml_backend_hrx_context * ctx, const ggml_hrx_gated_match & mt) {
-    static const bool disabled = getenv("GGML_HRX_DISABLE_GATED_MMA") != nullptr;
     const ggml_hrx_device_context * dev = ctx->device;
     // The down kernel loads 4 values at a time.
     auto rows16 = [](const ggml_tensor * t) { return (uintptr_t) t->data % 16 == 0 && t->nb[1] % 16 == 0; };
-    return !disabled && mt.n_t >= GGML_HRX_GATED_MMA_MIN_TOKENS && dev->arch->matrix_op == GGML_HRX_MATRIX_OP_WMMA_GFX11 &&
+    return mt.n_t >= GGML_HRX_GATED_MMA_MIN_TOKENS && dev->arch->matrix_op == GGML_HRX_MATRIX_OP_WMMA_GFX11 &&
            dev->arch->wave32 && mt.e % 64 == 0 && rows16(mt.x.t) && rows16(mt.m.t) && rows16(mt.y);
 }
 
@@ -255,22 +254,14 @@ static bool ggml_hrx_gated_inkling_shape(const ggml_backend_hrx_context * ctx, c
            strstr(mt.wd->name, ".loop_") != nullptr && strstr(mt.wd->name, "_ctrl_down.weight") != nullptr;
 }
 
-static bool ggml_hrx_gated_opt_in(const char * name) {
-    const char * env = getenv(name);
-    return env != nullptr && strcmp(env, "1") == 0;
-}
-
-static bool ggml_hrx_gated_run_packed(ggml_backend_hrx_context * ctx, const ggml_hrx_gated_match & mt, bool native) {
+static bool ggml_hrx_gated_run_packed(ggml_backend_hrx_context * ctx, const ggml_hrx_gated_match & mt) {
     ggml_hrx_kernel_desc desc;
-    desc.file = native ? "fused/gated_update_native.loom" : "fused/gated_update_bf16.loom";
-    if (!native) {
-        desc.libs = { "fused/gated_update_mma.loom" };
-    }
-    desc.symbol = native ? "ggml_inkling_ctrl_prepare_native" : "ggml_inkling_ctrl_prepare_bf16";
+    desc.file = "fused/gated_update_native.loom";
+    desc.symbol = "ggml_inkling_ctrl_prepare_native";
     ggml_hrx_kernel * prepare = ggml_hrx_get_kernel(ctx->device, desc);
-    desc.symbol = native ? "ggml_inkling_ctrl_down_native" : "ggml_inkling_ctrl_down_bf16";
+    desc.symbol = "ggml_inkling_ctrl_down_native";
     ggml_hrx_kernel * down = ggml_hrx_get_kernel(ctx->device, desc);
-    desc.symbol = native ? "ggml_inkling_ctrl_apply_native" : "ggml_inkling_ctrl_apply_bf16";
+    desc.symbol = "ggml_inkling_ctrl_apply_native";
     ggml_hrx_kernel * apply = ggml_hrx_get_kernel(ctx->device, desc);
     if (prepare == nullptr || down == nullptr || apply == nullptr) {
         return ggml_hrx_gated_run_mma(ctx, mt);
@@ -278,7 +269,7 @@ static bool ggml_hrx_gated_run_packed(ggml_backend_hrx_context * ctx, const ggml
 
     // Scratch holds normalized x and m, z, then the packed down, forget and gain weights.
     const int64_t n = mt.n_t;
-    const size_t elements = n * (2 * mt.e + GGML_HRX_GATED_RANK * (native ? 2 : 1)) +
+    const size_t elements = n * (2 * mt.e + GGML_HRX_GATED_RANK * 2) +
                             ggml_nelements(mt.wd) + ggml_nelements(mt.wf) + ggml_nelements(mt.wg);
     const ggml_tensor * scratch = ggml_hrx_scratch(ctx, elements * sizeof(ggml_bf16_t));
     if (scratch == nullptr) {
@@ -296,15 +287,8 @@ static bool ggml_hrx_gated_run_packed(ggml_backend_hrx_context * ctx, const ggml
 
 static bool ggml_hrx_gated_run(ggml_backend_hrx_context * ctx, const ggml_hrx_gated_match & mt) {
     if (ggml_hrx_gated_use_mma(ctx, mt)) {
-        static const bool native = ggml_hrx_gated_opt_in("GGML_HRX_INKLING_NATIVE_CTRL");
-        static const bool bf16 = ggml_hrx_gated_opt_in("GGML_HRX_INKLING_BF16_CTRL");
-        if ((native || bf16) && ggml_hrx_gated_inkling_shape(ctx, mt)) {
-            if (native && mt.n_t % 128 == 0) {
-                return ggml_hrx_gated_run_packed(ctx, mt, true);
-            }
-            if (bf16 && mt.n_t % 64 == 0) {
-                return ggml_hrx_gated_run_packed(ctx, mt, false);
-            }
+        if (mt.n_t % 128 == 0 && ggml_hrx_gated_inkling_shape(ctx, mt)) {
+            return ggml_hrx_gated_run_packed(ctx, mt);
         }
         return ggml_hrx_gated_run_mma(ctx, mt);
     }

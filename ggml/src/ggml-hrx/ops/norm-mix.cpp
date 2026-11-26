@@ -72,9 +72,8 @@ static bool ggml_hrx_norm_mix_overlap(const ggml_tensor * a, const ggml_tensor *
 }
 
 static bool ggml_hrx_norm_mix_match(const ggml_cgraph * g, int i, ggml_hrx_norm_mix & m) {
-    static const bool disabled = getenv("GGML_HRX_DISABLE_NORM_MIX") != nullptr;
     const ggml_tensor * t = g->nodes[i];
-    if (disabled || (t->op != GGML_OP_CONCAT && t->op != GGML_OP_RMS_NORM)) {
+    if (t->op != GGML_OP_CONCAT && t->op != GGML_OP_RMS_NORM) {
         return false;
     }
     const ggml_tensor * first = t->op == GGML_OP_CONCAT ? t->src[1] : t->src[0];

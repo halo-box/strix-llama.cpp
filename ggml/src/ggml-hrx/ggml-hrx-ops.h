@@ -82,7 +82,7 @@ bool ggml_hrx_op_mul_mat_id(ggml_backend_hrx_context * ctx, const ggml_tensor * 
 int  ggml_hrx_fuse_moe_glu(ggml_backend_hrx_context * ctx, const ggml_cgraph * cgraph, int i, std::vector<int> * absorbed);
 
 // ops/npu.cpp: a part of large Q8_0 MUL_MATs runs as an int8 GEMM on an XDNA NPU in the same device group.
-// GGML_HRX_NPU=1 turns it on. The NPU result reaches the node output before the first dispatch that uses it.
+// The NPU result reaches the node output before the first dispatch that uses it.
 struct ggml_hrx_npu * ggml_hrx_npu_create(ggml_hrx_device_context * dev, hrx_device_t npu_device);
 void ggml_hrx_npu_free(struct ggml_hrx_npu * npu);
 // Drops the NPU weights derived from tensors in this buffer. Call it before the buffer is freed.
@@ -116,13 +116,12 @@ int  ggml_hrx_fuse_gated_update(ggml_backend_hrx_context * ctx, const ggml_cgrap
 // With absorbed != nullptr it only matches and adds the earlier nodes that it computes itself (they have no other
 // readers and do not run). Else it runs the range and sets ctx->dispatch_writes to all tensors that it writes.
 // A fusion without absorbed nodes can return -1 in the run (its nodes then run one by one). A failed dispatch after a
-// match is fatal (GGML_ABORT). ops/fuse.cpp holds the list; GGML_HRX_DISABLE_FUSION=1 turns
-// all of them off.
+// match is fatal (GGML_ABORT). ops/fuse.cpp holds the list.
 typedef int (*ggml_hrx_fuse_fn)(ggml_backend_hrx_context * ctx, const ggml_cgraph * cgraph, int i, std::vector<int> * absorbed);
 
 // Matches the fusions of cgraph. Call it before ggml_hrx_autofuse_plan.
 void ggml_hrx_fuse_plan(ggml_backend_hrx_context * ctx, const ggml_cgraph * cgraph);
-// If a fusion starts at node i, runs it and returns its last node. name is the label for GGML_HRX_PROFILE_OPS.
+// If a fusion starts at node i, runs it and returns its last node. name is the label for the op profiler.
 int  ggml_hrx_fuse(ggml_backend_hrx_context * ctx, const ggml_cgraph * cgraph, int i, const char ** name);
 // True if a later fusion computes node i. Then node i does not run.
 bool ggml_hrx_fuse_absorbed(const ggml_backend_hrx_context * ctx, int i);

@@ -139,14 +139,13 @@ struct ggml_backend_hrx_context {
     int64_t                             n_recorded    = 0;
     int64_t                             n_direct      = 0;
 
-    struct ggml_hrx_op_profile * prof = nullptr; // GGML_HRX_PROFILE_OPS: device time of each node, by op.
+    struct ggml_hrx_op_profile * prof = nullptr; // device time of each node, by op.
 
     struct ggml_hrx_autofuse * autofuse = nullptr; // Region plan of the graph that runs, see ops/autofuse.h.
     struct ggml_hrx_npu_state * npu      = nullptr; // NPU plan and results in flight of the graph that runs, see ops/npu.cpp.
     struct ggml_hrx_fusion_plan * fuse   = nullptr; // Fusions of the graph that runs, see ops/fuse.cpp.
 
-    // GGML_HRX_DISPATCH_LOG=<file>: one line for each dispatch, to join with device profiles by order.
-    FILE *              dispatch_log  = nullptr;
+    bool                trace = false;
     const ggml_tensor * cur_node      = nullptr;
     int64_t             n_graphs_seen = 0;
 };

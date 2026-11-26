@@ -1818,8 +1818,14 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     };
 
     // assign the input layer
-    // there is very little benefit to offloading the input layer, so always keep it on the CPU
     pimpl->dev_input = { cpu_dev, &pimpl->cpu_buft_list };
+    if (act_gpu_layers > 0 && (arch == LLM_ARCH_INKLING2_LOOP ||
+            (arch == LLM_ARCH_DFLASH && ml.get_tensor_meta("mask_embd.weight")))) {
+        const auto first = get_layer_buft_list(i_gpu_start);
+        if (strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(first.dev)), "HRX") == 0) {
+            pimpl->dev_input = first;
+        }
+    }
 
     // assign the repeating layers to the devices according to the splits
     pimpl->dev_layer.resize(n_layer_all);

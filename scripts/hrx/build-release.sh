@@ -30,7 +30,7 @@ cmake -S "$src" -B "$build" -G Ninja -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON '-DCMAKE_INSTALL_RPATH=$ORIGIN'
 bin="$build/bin"
 cp -a "$sdk"/lib/lib{hrx,loomc}.so* "$bin/"
-programs=(llama-server llama-bench llama-perplexity test-backend-ops test-flash-attn-indexed-bias)
+programs=(llama-server llama-bench llama-perplexity test-backend-ops test-flash-attn-indexed-bias test-llama-archs)
 cmake --build "$build" --target "${programs[@]}"
 
 stage=$(mktemp -d "$out/package.XXXXXXXX")

@@ -1181,6 +1181,18 @@ static std::vector<ggml_backend_dev_t> parse_device_list(const std::string & val
     return devices;
 }
 
+ggml_backend_dev_t common_hrx_npu_device() {
+    ggml_backend_load_all();
+    auto * reg = ggml_backend_reg_by_name("HRX");
+    using get_device_t = ggml_backend_dev_t (*)();
+    auto get_device = reg ? reinterpret_cast<get_device_t>(ggml_backend_reg_get_proc_address(reg, "ggml_backend_hrx_npu_device")) : nullptr;
+    auto * dev = get_device ? get_device() : nullptr;
+    if (!dev) {
+        throw std::invalid_argument("--hrx-npu requires an HRX GPU and an available XDNA2 NPU");
+    }
+    return dev;
+}
+
 void common_print_available_devices() {
     constexpr size_t MiB = 1024 * 1024;
     std::vector<ggml_backend_dev_t> devices;
@@ -2769,6 +2781,11 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.devices = parse_device_list(value);
         }
     ).set_env("LLAMA_ARG_DEVICE"));
+    add_opt(common_arg(
+        {"--hrx-npu"},
+        "use the HRX GPU with XDNA2 for eligible prefill matrix multiplications",
+        [](common_params & params) { params.devices = { common_hrx_npu_device(), nullptr }; }
+    ));
     add_opt(common_arg(
         {"--list-devices"},
         "print list of available devices and exit",

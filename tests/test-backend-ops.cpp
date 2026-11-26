@@ -22064,7 +22064,7 @@ static bool test_case_selected(const test_mode mode, const char * op_names_filte
 }
 
 static bool test_backend(ggml_backend_t backend, ggml_backend_dev_t dev, test_mode mode, const char * op_names_filter, const char * params_filter,
-                         printer * output_printer, const char * test_file_path, int parallel_workers, const bool must_run, bool mmb) {
+                         printer * output_printer, const char * test_file_path, int parallel_workers, const bool must_run, bool mmb, const char * backend_params) {
     if (mode == MODE_CENSUS) {
         return test_census(backend, dev, params_filter);
     }
@@ -22134,7 +22134,7 @@ static bool test_backend(ggml_backend_t backend, ggml_backend_dev_t dev, test_mo
             std::atomic<size_t> workers_started = 0;
 
             const auto & eval_worker = [&]() {
-                ggml_backend_ptr b(ggml_backend_dev_init(dev, NULL));
+                ggml_backend_ptr b(ggml_backend_dev_init(dev, backend_params));
                 if (b == NULL) {
                     return;
                 }
@@ -22319,6 +22319,7 @@ static void usage(char ** argv) {
     printf("  -o <op|regex,..>            comma separated list of exact op names (as given by ggml_op_desc()),\n");
     printf("                              full test case strings, and/or regexes matched against the op name\n");
     printf("  -b <backend>                run tests on the given backend (e.g. CPU, MTL0, CUDA0)\n");
+    printf("  --backend-params <string>   initialization parameters for the device selected with -b\n");
     printf("  -p <params regex>           filter test cases by a regex matched against their params\n");
     printf("  --output <console|sql|csv>  output format (default: console)\n");
     printf("  --list-ops                  list all available GGML operations\n");
@@ -22340,6 +22341,7 @@ int main(int argc, char ** argv) {
     output_formats output_format = CONSOLE;
     const char * op_names_filter = nullptr;
     const char * backend_filter = nullptr;
+    const char * backend_params = nullptr;
     const char * params_filter = nullptr;
     const char * test_file_path = nullptr;
     int parallel_workers = test_parallel_workers(1);
@@ -22363,6 +22365,8 @@ int main(int argc, char ** argv) {
                 usage(argv);
                 return 1;
             }
+        } else if (strcmp(argv[i], "--backend-params") == 0 && i + 1 < argc) {
+            backend_params = argv[++i];
         } else if (strcmp(argv[i], "-b") == 0) {
             if (i + 1 < argc) {
                 backend_filter = argv[++i];
@@ -22424,6 +22428,10 @@ int main(int argc, char ** argv) {
         }
     }
 
+    if (backend_params && !backend_filter) {
+        fprintf(stderr, "--backend-params requires -b\n");
+        return 1;
+    }
     // load and enumerate backends
     ggml_backend_load_all();
 
@@ -22475,7 +22483,7 @@ int main(int argc, char ** argv) {
             continue;
         }
 
-        ggml_backend_ptr backend(ggml_backend_dev_init(dev, NULL));
+        ggml_backend_ptr backend(ggml_backend_dev_init(dev, backend_params));
         GGML_ASSERT(backend != NULL);
         set_mmb(backend.get(), mmb);
 
@@ -22491,7 +22499,7 @@ int main(int argc, char ** argv) {
                                                              false, "", ggml_backend_dev_description(dev),
                                                              total / 1024 / 1024, free / 1024 / 1024, true));
 
-        bool ok = test_backend(backend.get(), dev, mode, op_names_filter, params_filter, output_printer.get(), test_file_path, parallel_workers, backend_filter != NULL, mmb);
+        bool ok = test_backend(backend.get(), dev, mode, op_names_filter, params_filter, output_printer.get(), test_file_path, parallel_workers, backend_filter != NULL, mmb, backend_params);
 
         if (ok) { n_ok++; }
         output_printer->print_backend_status(backend_status_info(ggml_backend_name(backend.get()), ok ? test_status_t::OK : test_status_t::FAIL));

@@ -444,10 +444,6 @@ static bool ggml_hrx_mul_mat_group_member(const ggml_hrx_device_context * dev, c
 }
 
 void ggml_hrx_mul_mat_group_order(const ggml_hrx_device_context * dev, ggml_cgraph * cgraph) {
-    static const bool disabled = getenv("GGML_HRX_DISABLE_FUSION") != nullptr;
-    if (disabled) {
-        return;
-    }
     auto is_weight = [](const ggml_tensor * t) {
         return t->op == GGML_OP_NONE && t->view_src == nullptr && t->buffer != nullptr &&
                ggml_backend_buffer_get_usage(t->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS;

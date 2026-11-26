@@ -153,23 +153,20 @@ void ggml_hrx_graph_rec_dispatch(ggml_hrx_graph_rec * rec, const ggml_hrx_kernel
 }
 
 bool ggml_hrx_graph_rec_build(ggml_hrx_graph_rec * rec, hrx_graph_t graph) {
-    static const bool linear = getenv("GGML_HRX_GRAPH_LINEAR") != nullptr;
-    const int32_t     n      = (int32_t) rec->dispatches.size();
+    const int32_t n = (int32_t) rec->dispatches.size();
 
     // Order the dispatches by dependency depth. Then one barrier separates each depth from the next.
     // Decode of a 4065-dispatch graph on gfx1151: 4061 -> 2521 barriers; device time 29.9 -> 27.1 ms at depth 0
     // and 38.3 -> 34.8 ms at depth 8192 (replays of the two recordings alternated in one process).
     std::vector<int32_t> order(n);
     std::iota(order.begin(), order.end(), 0);
-    if (!linear) {
-        std::vector<int32_t> level(n, 0);
-        for (int32_t i = 0; i < n; ++i) {
-            for (int32_t id : rec->dispatches[i].deps) {
-                level[i] = std::max(level[i], level[id] + 1);
-            }
+    std::vector<int32_t> level(n, 0);
+    for (int32_t i = 0; i < n; ++i) {
+        for (int32_t id : rec->dispatches[i].deps) {
+            level[i] = std::max(level[i], level[id] + 1);
         }
-        std::stable_sort(order.begin(), order.end(), [&](int32_t a, int32_t b) { return level[a] < level[b]; });
     }
+    std::stable_sort(order.begin(), order.end(), [&](int32_t a, int32_t b) { return level[a] < level[b]; });
     std::vector<int32_t> pos(n);
     for (int32_t p = 0; p < n; ++p) {
         pos[order[p]] = p;
@@ -187,22 +184,15 @@ bool ggml_hrx_graph_rec_build(ggml_hrx_graph_rec * rec, hrx_graph_t graph) {
         }
         deps.clear();
         int32_t last_dep = -1;
-        if (linear) {
-            if (p > 0) {
-                deps.push_back(nodes[p - 1]);
-                last_dep = p - 1;
-            }
-        } else {
-            for (int32_t id : d.deps) {
-                deps.push_back(nodes[pos[id]]);
-                last_dep = std::max(last_dep, pos[id]);
-            }
-            // Keep one workstream per partition: tie the node to the first node of its partition.
-            if (last_dep < start && p - start >= GGML_HRX_GRAPH_MIN_STREAM_OFFSET) {
-                deps.push_back(nodes[start]);
-                last_dep = start;
-                n_anchors++;
-            }
+        for (int32_t id : d.deps) {
+            deps.push_back(nodes[pos[id]]);
+            last_dep = std::max(last_dep, pos[id]);
+        }
+        // Keep one workstream per partition: tie the node to the first node of its partition.
+        if (last_dep < start && p - start >= GGML_HRX_GRAPH_MIN_STREAM_OFFSET) {
+            deps.push_back(nodes[start]);
+            last_dep = start;
+            n_anchors++;
         }
         // libhrx puts a barrier before a node if a dependency comes after the last barrier.
         if (last_dep >= last_barrier) {
@@ -223,7 +213,7 @@ bool ggml_hrx_graph_rec_build(ggml_hrx_graph_rec * rec, hrx_graph_t graph) {
             return false;
         }
     }
-    GGML_LOG_DEBUG("%s: %d dispatches, %" PRId64 " edges, %" PRId64 " barriers, %" PRId64 " anchors%s\n", __func__, n, n_edges,
-                   n_barriers, n_anchors, linear ? " (linear)" : "");
+    GGML_LOG_DEBUG("%s: %d dispatches, %" PRId64 " edges, %" PRId64 " barriers, %" PRId64 " anchors\n", __func__, n, n_edges,
+                   n_barriers, n_anchors);
     return true;
 }

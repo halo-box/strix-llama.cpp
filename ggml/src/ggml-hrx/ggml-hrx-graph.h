@@ -5,7 +5,6 @@
 // Records the dispatches of one graph run and builds an HRX graph from them. A dispatch depends only on the earlier
 // dispatches that access the same bytes (read after write, write after read, write after write). The graph orders
 // the dispatches by dependency depth, so libhrx puts no barrier between independent dispatches.
-// GGML_HRX_GRAPH_LINEAR=1 keeps the ggml order and makes each dispatch depend on the one before it.
 
 struct ggml_hrx_graph_rec;
 

@@ -1269,6 +1269,7 @@ void common_fit_apply(common_params & params, llama_model_params & mparams, llam
         /*.mparams      =*/ &mparams_dft,
         /*.cparams      =*/ &cparams_dft,
         /*.shares_model =*/ !has_draft, // an MTP context runs on the weights of the main model
+        /*.dspark       =*/ std::find(params.speculative.types.begin(), params.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK) != params.speculative.types.end(),
     };
 
     common_fit_params(params.model.get_paths(), &mparams, &cparams,
