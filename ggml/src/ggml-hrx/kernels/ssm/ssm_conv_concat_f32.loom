@@ -1,0 +1,377 @@
+// ssm_conv of a concat: x = CONCAT(past, b, dim 0) with b[t, c, s] = cur[c, t, s], and
+//   dst[c, t, s] = sum over k < nc of x[t + k, c, s] * w[k, c], k in increasing order.
+// With dyn, then for each lag l < nc: + x[t + nc - 1 - l, c, s] * dyn[d_base + l + (c / d_div) d_s1 + (s T + t) d_s2], as
+// MUL then ADD. With res 1: dst[c, t, s] = (cur[c, t, s] + that sum) * scale + bias, as ADD then SCALE. With res 2 also
+// + res[c, t, s] (row stride r_s1 in elements, rows t + s T).
+// Three kernels with the same arguments. tail: x columns [0, p) from past and [x_first, x_w) (other nodes read them).
+// halo: for each tile of tokens, its first p inputs (x columns t0 .. t0 + p - 1) into halo [S, n_tt, p, C]. conv: dst
+// from the halo and cur only. A lane reads cur only at the tokens that it writes. Thus dst can be cur itself.
+// p = nc - 1. cur has stride 1 along c. dst, x and halo are contiguous. Strides are in elements. C is a multiple of 4.
+
+config.decl @ggml.sconv.nc : %value: index where [range(%value, 2, 8)]
+config.decl @ggml.sconv.lanes : %value: index where [range(%value, 64, 256), multiple_of(%value, 64)]
+config.decl @ggml.sconv.tokens : %value: index where [range(%value, 1, 64)]
+config.decl @ggml.sconv.res : %value: index where [range(%value, 0, 2)]
+config.decl @ggml.sconv.dyn : %value: index where [range(%value, 0, 1)]
+
+target.decl @ggml_wave64
+
+func.def inline @ggml_sconv_f32_from_bits(%bits: index) -> (f32) {
+  %i = index.cast %bits : index to i32
+  %v = vector.from_elements %i : vector<1xi32>
+  %f = vector.bitcast %v : vector<1xi32> to vector<1xf32>
+  %r = vector.extract %f[0] : vector<1xf32> -> f32
+  func.return %r : f32
+}
+
+func.def inline @ggml_sconv_load1(%src: buffer, %span: index, %idx: index) -> (f32) {
+  %zero = index.constant 0 : offset
+  %f0 = scalar.constant 0.0 : f32
+  %view = buffer.view %src[%zero] : buffer -> view<[%span]xf32>
+  %off = index.assume %idx [range(%idx, 0, 2147483646)] : index
+  %ok = index.cmp ult, %off, %span : index
+  %v = scf.if %ok -> (f32) {
+    %x = view.load %view[%off] : view<[%span]xf32> -> f32
+    scf.yield %x : f32
+  } else {
+    scf.yield %f0 : f32
+  }
+  func.return %v : f32
+}
+
+func.def inline @ggml_sconv_load4(%src: buffer, %span: index, %idx: index) -> (vector<4xf32>) {
+  %zero = index.constant 0 : offset
+  %c3 = index.constant 3 : index
+  %zero4 = vector.splatf 0.0 : vector<4xf32>
+  %view = buffer.view %src[%zero] : buffer -> view<[%span]xf32>
+  %off = index.assume %idx [range(%idx, 0, 2147483640)] : index
+  %end = index.add %off, %c3 : index
+  %ok = index.cmp ult, %end, %span : index
+  %v = scf.if %ok -> (vector<4xf32>) {
+    %x = vector.load %view[%off] : view<[%span]xf32> -> vector<4xf32>
+    scf.yield %x : vector<4xf32>
+  } else {
+    scf.yield %zero4 : vector<4xf32>
+  }
+  func.return %v : vector<4xf32>
+}
+
+func.def inline @ggml_sconv_store4(%dst: buffer, %span: index, %idx: index, %v: vector<4xf32>) {
+  %zero = index.constant 0 : offset
+  %c3 = index.constant 3 : index
+  %view = buffer.view %dst[%zero] : buffer -> view<[%span]xf32>
+  %off = index.assume %idx [range(%idx, 0, 2147483640)] : index
+  %end = index.add %off, %c3 : index
+  %ok = index.cmp ult, %end, %span : index
+  scf.if %ok {
+    vector.store %v, %view[%off] : vector<4xf32>, view<[%span]xf32>
+  }
+  func.return
+}
+
+// Elements (j, c + i, s) of a strided tensor for i < 4.
+func.def inline @ggml_sconv_gather4(%src: buffer, %span: index, %j: index, %c: index, %s: index, %s0: index, %s1: index, %s2: index) -> (vector<4xf32>) {
+  %o0 = index.mul %j, %s0 : index
+  %o2 = index.mul %s, %s2 : index
+  %base = index.add %o0, %o2 : index
+  %i0 = index.madd %c, %s1, %base : index
+  %i1 = index.add %i0, %s1 : index
+  %i2 = index.add %i1, %s1 : index
+  %i3 = index.add %i2, %s1 : index
+  %v0 = func.call @ggml_sconv_load1(%src, %span, %i0) : (buffer, index, index) -> (f32)
+  %v1 = func.call @ggml_sconv_load1(%src, %span, %i1) : (buffer, index, index) -> (f32)
+  %v2 = func.call @ggml_sconv_load1(%src, %span, %i2) : (buffer, index, index) -> (f32)
+  %v3 = func.call @ggml_sconv_load1(%src, %span, %i3) : (buffer, index, index) -> (f32)
+  %v = vector.from_elements %v0, %v1, %v2, %v3 : vector<4xf32>
+  func.return %v : vector<4xf32>
+}
+
+// Elements (j, c + i, s) of the contiguous x for i < 4.
+func.def inline @ggml_sconv_scatter4(%x: buffer, %span: index, %x_w: index, %j: index, %c: index, %s: index, %channels: index, %v: vector<4xf32>) {
+  %zero = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c4 = index.constant 4 : index
+  %view = buffer.view %x[%zero] : buffer -> view<[%span]xf32>
+  %row0 = index.madd %s, %channels, %c : index
+  scf.for %i = [%c0 to %c4 step %c1] unroll {
+    %row = index.add %row0, %i : index
+    %xi = index.madd %row, %x_w, %j : index
+    %off = index.assume %xi [range(%xi, 0, 2147483646)] : index
+    %ok = index.cmp ult, %off, %span : index
+    scf.if %ok {
+      %e = vector.extract %v[%i] : vector<4xf32> -> f32
+      view.store %e, %view[%off] : f32, view<[%span]xf32>
+    }
+  }
+  func.return
+}
+
+// Input column j for the 4 channels from c on: column j of src (strides s0, s1, s2) for j < p, else token j - p of cur.
+func.def inline @ggml_sconv_input(%j: index, %p: index, %c: index, %s: index, %src: buffer, %span: index, %s0: index, %s1: index, %s2: index, %cur: buffer, %c_span: index, %c_s0: index, %c_s2: index) -> (vector<4xf32>) {
+  %in_src = index.cmp ult, %j, %p : index
+  %v = scf.if %in_src -> (vector<4xf32>) {
+    %pv = func.call @ggml_sconv_gather4(%src, %span, %j, %c, %s, %s0, %s1, %s2) : (buffer, index, index, index, index, index, index, index) -> (vector<4xf32>)
+    scf.yield %pv : vector<4xf32>
+  } else {
+    %t = index.sub %j, %p : index
+    %o0 = index.mul %t, %c_s0 : index
+    %o2 = index.madd %s, %c_s2, %o0 : index
+    %idx = index.add %o2, %c : index
+    %cv = func.call @ggml_sconv_load4(%cur, %c_span, %idx) : (buffer, index, index) -> (vector<4xf32>)
+    scf.yield %cv : vector<4xf32>
+  }
+  func.return %v : vector<4xf32>
+}
+
+// tail: one lane for 4 channels of one sequence.
+kernel.def target(@ggml_wave64) export("ggml_ssm_conv_concat_tail_f32") @ggml_ssm_conv_concat_tail_f32(%groups: index) {
+  %one = index.constant 1 : index
+  %lanes = config.get @ggml.sconv.lanes : index
+  kernel.launch.config workgroups(%groups, %one, %one) workgroup_size(%lanes, %one, %one) : index
+} launch(%channels_in: index, %n_t_in: index, %n_cg_in: index, %n_tt_in: index, %p_s0_in: index, %p_s1_in: index, %p_s2_in: index, %p_span_in: index, %c_s0_in: index, %c_s2_in: index, %c_span_in: index, %w_s0_in: index, %w_s1_in: index, %w_span_in: index, %d_span_in: index, %x_w_in: index, %x_first_in: index, %x_span_in: index, %h_span_in: index, %r_s1_in: index, %r_span_in: index, %d_base_in: index, %d_div_in: index, %d_s1_in: index, %d_s2_in: index, %dy_span_in: index, %scale_bits: index, %bias_bits: index, %past: buffer, %cur: buffer, %w: buffer, %dst: buffer, %x: buffer, %halo: buffer, %resid: buffer, %dyn: buffer) {
+  // The caller checks these ranges.
+  %channels = index.assume %channels_in [range(%channels_in, 4, 2147483647)] : index
+  %n_cg = index.assume %n_cg_in [range(%n_cg_in, 1, 2147483647)] : index
+  %p_s0 = index.assume %p_s0_in [range(%p_s0_in, 0, 2147483647)] : index
+  %p_s1 = index.assume %p_s1_in [range(%p_s1_in, 0, 2147483647)] : index
+  %p_s2 = index.assume %p_s2_in [range(%p_s2_in, 0, 2147483647)] : index
+  %p_span = index.assume %p_span_in [range(%p_span_in, 1, 2147483647)] : index
+  %c_s0 = index.assume %c_s0_in [range(%c_s0_in, 0, 2147483647)] : index
+  %c_s2 = index.assume %c_s2_in [range(%c_s2_in, 0, 2147483647)] : index
+  %c_span = index.assume %c_span_in [range(%c_span_in, 4, 2147483647)] : index
+  %x_w = index.assume %x_w_in [range(%x_w_in, 1, 2147483647)] : index
+  %x_first = index.assume %x_first_in [range(%x_first_in, 0, 2147483647)] : index
+  %x_span = index.assume %x_span_in [range(%x_span_in, 1, 2147483647)] : index
+  %nc = config.get @ggml.sconv.nc : index
+  %lanes = config.get @ggml.sconv.lanes : index
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c4 = index.constant 4 : index
+  %p = index.sub %nc, %c1 : index
+  %group = kernel.workgroup.id<x> : index
+  %lane = kernel.workitem.id<x> : index
+  %cg = index.rem %group, %n_cg : index
+  %s = index.div %group, %n_cg : index
+  %chunk = index.madd %cg, %lanes, %lane : index
+  %c = index.mul %chunk, %c4 : index
+  %valid = index.cmp ult, %c, %channels : index
+  scf.if %valid {
+    scf.for %j = [%c0 to %p step %c1] {
+      %v = func.call @ggml_sconv_gather4(%past, %p_span, %j, %c, %s, %p_s0, %p_s1, %p_s2) : (buffer, index, index, index, index, index, index, index) -> (vector<4xf32>)
+      func.call @ggml_sconv_scatter4(%x, %x_span, %x_w, %j, %c, %s, %channels, %v) : (buffer, index, index, index, index, index, index, vector<4xf32>)
+    }
+    %j0 = index.max %x_first, %p : index
+    scf.for %j = [%j0 to %x_w step %c1] {
+      %v = func.call @ggml_sconv_input(%j, %p, %c, %s, %past, %p_span, %p_s0, %p_s1, %p_s2, %cur, %c_span, %c_s0, %c_s2) : (index, index, index, index, buffer, index, index, index, index, buffer, index, index, index) -> (vector<4xf32>)
+      func.call @ggml_sconv_scatter4(%x, %x_span, %x_w, %j, %c, %s, %channels, %v) : (buffer, index, index, index, index, index, index, vector<4xf32>)
+    }
+  }
+  kernel.return
+}
+
+// halo: one lane for 4 channels of one tile of tokens of one sequence.
+kernel.def target(@ggml_wave64) export("ggml_ssm_conv_concat_halo_f32") @ggml_ssm_conv_concat_halo_f32(%groups: index) {
+  %one = index.constant 1 : index
+  %lanes = config.get @ggml.sconv.lanes : index
+  kernel.launch.config workgroups(%groups, %one, %one) workgroup_size(%lanes, %one, %one) : index
+} launch(%channels_in: index, %n_t_in: index, %n_cg_in: index, %n_tt_in: index, %p_s0_in: index, %p_s1_in: index, %p_s2_in: index, %p_span_in: index, %c_s0_in: index, %c_s2_in: index, %c_span_in: index, %w_s0_in: index, %w_s1_in: index, %w_span_in: index, %d_span_in: index, %x_w_in: index, %x_first_in: index, %x_span_in: index, %h_span_in: index, %r_s1_in: index, %r_span_in: index, %d_base_in: index, %d_div_in: index, %d_s1_in: index, %d_s2_in: index, %dy_span_in: index, %scale_bits: index, %bias_bits: index, %past: buffer, %cur: buffer, %w: buffer, %dst: buffer, %x: buffer, %halo: buffer, %resid: buffer, %dyn: buffer) {
+  %channels = index.assume %channels_in [range(%channels_in, 4, 2147483647)] : index
+  %n_cg = index.assume %n_cg_in [range(%n_cg_in, 1, 2147483647)] : index
+  %n_tt = index.assume %n_tt_in [range(%n_tt_in, 1, 2147483647)] : index
+  %c_s0 = index.assume %c_s0_in [range(%c_s0_in, 0, 2147483647)] : index
+  %c_s2 = index.assume %c_s2_in [range(%c_s2_in, 0, 2147483647)] : index
+  %c_span = index.assume %c_span_in [range(%c_span_in, 4, 2147483647)] : index
+  %x_w = index.assume %x_w_in [range(%x_w_in, 1, 2147483647)] : index
+  %x_span = index.assume %x_span_in [range(%x_span_in, 1, 2147483647)] : index
+  %h_span = index.assume %h_span_in [range(%h_span_in, 4, 2147483647)] : index
+  %nc = config.get @ggml.sconv.nc : index
+  %lanes = config.get @ggml.sconv.lanes : index
+  %tokens = config.get @ggml.sconv.tokens : index
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c4 = index.constant 4 : index
+  %p = index.sub %nc, %c1 : index
+  %xs2 = index.mul %channels, %x_w : index
+  %group = kernel.workgroup.id<x> : index
+  %lane = kernel.workitem.id<x> : index
+  %cg = index.rem %group, %n_cg : index
+  %g1 = index.div %group, %n_cg : index
+  %tt = index.rem %g1, %n_tt : index
+  %s = index.div %g1, %n_tt : index
+  %chunk = index.madd %cg, %lanes, %lane : index
+  %c = index.mul %chunk, %c4 : index
+  %valid = index.cmp ult, %c, %channels : index
+  scf.if %valid {
+    %t0 = index.mul %tt, %tokens : index
+    %st = index.madd %s, %n_tt, %tt : index
+    %h0 = index.mul %st, %p : index
+    scf.for %k = [%c0 to %p step %c1] {
+      %j = index.add %t0, %k : index
+      %v = func.call @ggml_sconv_input(%j, %p, %c, %s, %x, %x_span, %c1, %x_w, %xs2, %cur, %c_span, %c_s0, %c_s2) : (index, index, index, index, buffer, index, index, index, index, buffer, index, index, index) -> (vector<4xf32>)
+      %hr = index.add %h0, %k : index
+      %hi = index.madd %hr, %channels, %c : index
+      func.call @ggml_sconv_store4(%halo, %h_span, %hi, %v) : (buffer, index, index, vector<4xf32>)
+    }
+  }
+  kernel.return
+}
+
+// conv: one workgroup for lanes x 4 channels of one tile of tokens of one sequence. Each lane keeps the last p inputs.
+kernel.def target(@ggml_wave64) export("ggml_ssm_conv_concat_f32") @ggml_ssm_conv_concat_f32(%groups: index) {
+  %one = index.constant 1 : index
+  %lanes = config.get @ggml.sconv.lanes : index
+  kernel.launch.config workgroups(%groups, %one, %one) workgroup_size(%lanes, %one, %one) : index
+} launch(%channels_in: index, %n_t_in: index, %n_cg_in: index, %n_tt_in: index, %p_s0_in: index, %p_s1_in: index, %p_s2_in: index, %p_span_in: index, %c_s0_in: index, %c_s2_in: index, %c_span_in: index, %w_s0_in: index, %w_s1_in: index, %w_span_in: index, %d_span_in: index, %x_w_in: index, %x_first_in: index, %x_span_in: index, %h_span_in: index, %r_s1_in: index, %r_span_in: index, %d_base_in: index, %d_div_in: index, %d_s1_in: index, %d_s2_in: index, %dy_span_in: index, %scale_bits: index, %bias_bits: index, %past: buffer, %cur: buffer, %w: buffer, %dst: buffer, %x: buffer, %halo: buffer, %resid: buffer, %dyn: buffer) {
+  %channels = index.assume %channels_in [range(%channels_in, 4, 2147483647)] : index
+  %n_t = index.assume %n_t_in [range(%n_t_in, 1, 2147483647)] : index
+  %n_cg = index.assume %n_cg_in [range(%n_cg_in, 1, 2147483647)] : index
+  %n_tt = index.assume %n_tt_in [range(%n_tt_in, 1, 2147483647)] : index
+  %c_s0 = index.assume %c_s0_in [range(%c_s0_in, 0, 2147483647)] : index
+  %c_s2 = index.assume %c_s2_in [range(%c_s2_in, 0, 2147483647)] : index
+  %c_span = index.assume %c_span_in [range(%c_span_in, 4, 2147483647)] : index
+  %w_s0 = index.assume %w_s0_in [range(%w_s0_in, 0, 2147483647)] : index
+  %w_s1 = index.assume %w_s1_in [range(%w_s1_in, 0, 2147483647)] : index
+  %w_span = index.assume %w_span_in [range(%w_span_in, 1, 2147483647)] : index
+  %d_span = index.assume %d_span_in [range(%d_span_in, 4, 2147483647)] : index
+  %h_span = index.assume %h_span_in [range(%h_span_in, 4, 2147483647)] : index
+  %r_s1 = index.assume %r_s1_in [range(%r_s1_in, 0, 2147483647)] : index
+  %r_span = index.assume %r_span_in [range(%r_span_in, 4, 2147483647)] : index
+  %d_base = index.assume %d_base_in [range(%d_base_in, 0, 2147483647)] : index
+  %d_div = index.assume %d_div_in [range(%d_div_in, 4, 2147483647)] : index
+  %d_s1 = index.assume %d_s1_in [range(%d_s1_in, 0, 2147483647)] : index
+  %d_s2 = index.assume %d_s2_in [range(%d_s2_in, 0, 2147483647)] : index
+  %dy_span = index.assume %dy_span_in [range(%dy_span_in, 1, 2147483647)] : index
+  %dyn_cfg = config.get @ggml.sconv.dyn : index
+  %nc = config.get @ggml.sconv.nc : index
+  %lanes = config.get @ggml.sconv.lanes : index
+  %tokens = config.get @ggml.sconv.tokens : index
+  %res_cfg = config.get @ggml.sconv.res : index
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c4 = index.constant 4 : index
+  %zero4 = vector.splatf 0.0 : vector<4xf32>
+  %c2 = index.constant 2 : index
+  %res = index.cmp ne, %res_cfg, %c0 : index
+  %res2 = index.cmp eq, %res_cfg, %c2 : index
+  %p = index.sub %nc, %c1 : index
+  %scale_f = func.call @ggml_sconv_f32_from_bits(%scale_bits) : (index) -> (f32)
+  %bias_f = func.call @ggml_sconv_f32_from_bits(%bias_bits) : (index) -> (f32)
+  %scale = vector.splat %scale_f : vector<4xf32>
+  %bias = vector.splat %bias_f : vector<4xf32>
+
+  %group = kernel.workgroup.id<x> : index
+  %lane = kernel.workitem.id<x> : index
+  %cg = index.rem %group, %n_cg : index
+  %g1 = index.div %group, %n_cg : index
+  %tt = index.rem %g1, %n_tt : index
+  %s = index.div %g1, %n_tt : index
+  %chunk = index.madd %cg, %lanes, %lane : index
+  %c = index.mul %chunk, %c4 : index
+  %valid = index.cmp ult, %c, %channels : index
+  scf.if %valid {
+    // The weights of tap k for the 4 channels.
+    %wb0 = vector.splatf 0.0 : vector<8x4xf32>
+    %wbank = scf.for %k = [%c0 to %nc step %c1](%wb = %wb0 : vector<8x4xf32>) -> (vector<8x4xf32>) unroll {
+      %wv = func.call @ggml_sconv_gather4(%w, %w_span, %k, %c, %c0, %w_s0, %w_s1, %c0) : (buffer, index, index, index, index, index, index, index) -> (vector<4xf32>)
+      %wb_next = vector.insert %wv into %wb[%k] : vector<4xf32>, vector<8x4xf32>
+      scf.yield %wb_next : vector<8x4xf32>
+    }
+
+    // The window: input columns t0 .. t0 + p - 1, from the halo.
+    %st = index.madd %s, %n_tt, %tt : index
+    %h0 = index.mul %st, %p : index
+    %win0 = scf.for %k = [%c0 to %p step %c1](%wn = %wb0 : vector<8x4xf32>) -> (vector<8x4xf32>) unroll {
+      %hr = index.add %h0, %k : index
+      %hi = index.madd %hr, %channels, %c : index
+      %v = func.call @ggml_sconv_load4(%halo, %h_span, %hi) : (buffer, index, index) -> (vector<4xf32>)
+      %wn_next = vector.insert %v into %wn[%k] : vector<4xf32>, vector<8x4xf32>
+      scf.yield %wn_next : vector<8x4xf32>
+    }
+
+    %t0 = index.mul %tt, %tokens : index
+    %rest = index.sub %n_t, %t0 : index
+    %count = index.min %rest, %tokens : index
+    %d_seq = index.mul %s, %n_t : index
+    %use_dyn = index.cmp ne, %dyn_cfg, %c0 : index
+    %head = index.div %c, %d_div : index
+    %d_head = index.madd %head, %d_s1, %d_base : index
+    %win_end = scf.for %ti = [%c0 to %count step %c1](%win = %win0 : vector<8x4xf32>) -> (vector<8x4xf32>) {
+      %t = index.add %t0, %ti : index
+      %co0 = index.mul %t, %c_s0 : index
+      %co2 = index.madd %s, %c_s2, %co0 : index
+      %ci = index.add %co2, %c : index
+      %xn = func.call @ggml_sconv_load4(%cur, %c_span, %ci) : (buffer, index, index) -> (vector<4xf32>)
+      // The same order as the ssm_conv kernels: 0 + x0 w0 + x1 w1 + ...
+      %acc_p = scf.for %k = [%c0 to %p step %c1](%a = %zero4 : vector<4xf32>) -> (vector<4xf32>) unroll {
+        %xv = vector.extract %win[%k] : vector<8x4xf32> -> vector<4xf32>
+        %wv = vector.extract %wbank[%k] : vector<8x4xf32> -> vector<4xf32>
+        %pr = vector.mulf %xv, %wv : vector<4xf32>
+        %a_next = vector.addf %a, %pr : vector<4xf32>
+        scf.yield %a_next : vector<4xf32>
+      }
+      %wl = vector.extract %wbank[%p] : vector<8x4xf32> -> vector<4xf32>
+      %pl = vector.mulf %xn, %wl : vector<4xf32>
+      %acc_s = vector.addf %acc_p, %pl : vector<4xf32>
+      // The per-token taps: lag l reads input column t + p - l.
+      %acc = scf.if %use_dyn -> (vector<4xf32>) {
+        %dt0 = index.add %d_seq, %t : index
+        %d_tok = index.madd %dt0, %d_s2, %d_head : index
+        %ad = scf.for %l = [%c0 to %nc step %c1](%a = %acc_s : vector<4xf32>) -> (vector<4xf32>) unroll {
+          %l0 = index.cmp eq, %l, %c0 : index
+          %xv = scf.if %l0 -> (vector<4xf32>) {
+            scf.yield %xn : vector<4xf32>
+          } else {
+            %wi = index.sub %p, %l : index
+            %wv = vector.extract %win[%wi] : vector<8x4xf32> -> vector<4xf32>
+            scf.yield %wv : vector<4xf32>
+          }
+          %di = index.add %d_tok, %l : index
+          %dv = func.call @ggml_sconv_load1(%dyn, %dy_span, %di) : (buffer, index, index) -> (f32)
+          %dv4 = vector.splat %dv : vector<4xf32>
+          %term = vector.mulf %xv, %dv4 : vector<4xf32>
+          %a_next = vector.addf %a, %term : vector<4xf32>
+          scf.yield %a_next : vector<4xf32>
+        }
+        scf.yield %ad : vector<4xf32>
+      } else {
+        scf.yield %acc_s : vector<4xf32>
+      }
+      %y = scf.if %res -> (vector<4xf32>) {
+        %sum = vector.addf %xn, %acc : vector<4xf32>
+        %m = vector.mulf %sum, %scale : vector<4xf32>
+        %yb = vector.addf %m, %bias : vector<4xf32>
+        %yr = scf.if %res2 -> (vector<4xf32>) {
+          %rt = index.add %d_seq, %t : index
+          %ri = index.madd %rt, %r_s1, %c : index
+          %rv = func.call @ggml_sconv_load4(%resid, %r_span, %ri) : (buffer, index, index) -> (vector<4xf32>)
+          %ys = vector.addf %rv, %yb : vector<4xf32>
+          scf.yield %ys : vector<4xf32>
+        } else {
+          scf.yield %yb : vector<4xf32>
+        }
+        scf.yield %yr : vector<4xf32>
+      } else {
+        scf.yield %acc : vector<4xf32>
+      }
+      %dt = index.add %d_seq, %t : index
+      %di = index.madd %dt, %channels, %c : index
+      func.call @ggml_sconv_store4(%dst, %d_span, %di, %y) : (buffer, index, index, vector<4xf32>)
+      // Shift the window by one column.
+      %win_next = scf.for %k = [%c0 to %p step %c1](%wn = %win : vector<8x4xf32>) -> (vector<8x4xf32>) unroll {
+        %k1 = index.add %k, %c1 : index
+        %last = index.cmp eq, %k1, %p : index
+        %nxt = scf.if %last -> (vector<4xf32>) {
+          scf.yield %xn : vector<4xf32>
+        } else {
+          %nv = vector.extract %win[%k1] : vector<8x4xf32> -> vector<4xf32>
+          scf.yield %nv : vector<4xf32>
+        }
+        %wn_next = vector.insert %nxt into %wn[%k] : vector<4xf32>, vector<8x4xf32>
+        scf.yield %wn_next : vector<8x4xf32>
+      }
+      scf.yield %win_next : vector<8x4xf32>
+    }
+  }
+  kernel.return
+}

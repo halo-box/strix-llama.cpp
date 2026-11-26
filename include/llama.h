@@ -1540,6 +1540,18 @@ extern "C" {
     /// seed == LLAMA_DEFAULT_SEED to use a random seed.
     LLAMA_API struct llama_sampler * llama_sampler_init_dist(uint32_t seed);
 
+    /// @details dist, which can also verify a speculative draft by rejection sampling in the backend sampling graph.
+    /// n_cand is the largest number of candidates of a draft distribution.
+    LLAMA_API struct llama_sampler * llama_sampler_init_dist_spec(uint32_t seed, int32_t n_vocab, int32_t n_cand);
+
+    /// Sets the draft for the next backend decode of the sequence of smpl (a dist_spec sampler or a chain that ends with
+    /// one). Output row i keeps tokens[i] with probability min(1, p/q), else it samples norm(max(p - q, 0)); q[i] holds
+    /// n_q[i] candidates with their probabilities. Rows from n_rows on sample p. The sampled token of a row equals
+    /// tokens[i] only if the row kept it. Returns false if smpl has no dist_spec sampler or a draft has too many candidates.
+    LLAMA_API bool llama_sampler_dist_spec_set_draft(
+            struct llama_sampler * smpl, int32_t n_rows, const llama_token * tokens,
+            const llama_token_data * const * q, const int32_t * n_q);
+
     /// @details Top-K sampling described in academic paper "The Curious Case of Neural Text Degeneration" https://arxiv.org/abs/1904.09751
     /// Setting k <= 0 makes this a noop
     LLAMA_API struct llama_sampler * llama_sampler_init_top_k      (int32_t k);

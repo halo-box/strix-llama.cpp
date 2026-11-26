@@ -1,0 +1,232 @@
+// get_rows to f32 dst. dst must be contiguous. A row id out of range leaves the dst values unchanged.
+// src_type is the ggml type: 0 f32, 1 f16, 8 q8_0, 30 bf16. Strides and spans are in elements, for q8_0 in 2-byte units.
+
+config.decl @ggml.get_rows.src_type : %value: index where [range(%value, 0, 30)]
+
+config.decl @ggml.elementwise.wg_size : %value: index where [range(%value, 64, 1024), multiple_of(%value, 64)]
+
+target.decl @ggml_wave64
+
+template.decl @ggml.weight.values4(%wtype: index, %weight: buffer, %w_span: index, %block_base: index, %j: index) -> (vector<4xf32>)
+
+// Returns the src row of dst element j and if the row is valid. i0 is the column, i2 and i3 the src batch.
+func.def inline @ggml_hrx_get_rows_row(%j: index, %ne0: index, %ne1: index, %ne2: index, %src_rows: index, %ids: buffer, %ids_s0: index, %ids_s1: index, %ids_s2: index, %ids_span: index) -> (index, index, index, index, i1) {
+  %c0 = index.constant 0 : index
+  %zero = index.constant 0 : offset
+  %false = scalar.constant false : i1
+  %ids_view = buffer.view %ids[%zero] : buffer -> view<[%ids_span]xi32>
+  %r = index.div %j, %ne0 : index
+  %r_start = index.mul %r, %ne0 : index
+  %i0 = index.sub %j, %r_start : index
+  %i1 = index.rem %r, %ne1 : index
+  %t1 = index.div %r, %ne1 : index
+  %i2 = index.rem %t1, %ne2 : index
+  %i3 = index.div %t1, %ne2 : index
+  %io0 = index.mul %i1, %ids_s0 : index
+  %io1 = index.mul %i2, %ids_s1 : index
+  %io2 = index.mul %i3, %ids_s2 : index
+  %io01 = index.add %io0, %io1 : index
+  %ids_idx = index.add %io01, %io2 : index
+  %ids_off = index.assume %ids_idx [range(%ids_idx, 0, 2147483646)] : index
+  %ids_ok = index.cmp ult, %ids_off, %ids_span : index
+  %row, %ok = scf.if %ids_ok -> (index, i1) {
+    %row_i32 = view.load %ids_view[%ids_off] : view<[%ids_span]xi32> -> i32
+    %row_raw = index.cast %row_i32 : i32 to index
+    %nonneg = index.cmp sge, %row_raw, %c0 : index
+    %below = index.cmp slt, %row_raw, %src_rows : index
+    %valid = scalar.andi %nonneg, %below : i1
+    %row_safe = scf.select %valid, %row_raw, %c0 : index
+    scf.yield %row_safe, %valid : index, i1
+  } else {
+    scf.yield %c0, %false : index, i1
+  }
+  func.return %i0, %i2, %i3, %row, %ok : index, index, index, index, i1
+}
+
+func.def inline @ggml_hrx_get_rows_load1(%stype: index, %src: buffer, %span: index, %idx: index) -> (f32) {
+  %t_f16 = index.constant 1 : index
+  %t_bf16 = index.constant 30 : index
+  %zero = index.constant 0 : offset
+  %c0_f32 = scalar.constant 0.0 : f32
+  %off = index.assume %idx [range(%idx, 0, 2147483646)] : index
+  %ok = index.cmp ult, %off, %span : index
+  %is_f16 = index.cmp eq, %stype, %t_f16 : index
+  %is_bf16 = index.cmp eq, %stype, %t_bf16 : index
+  %v = scf.if %ok -> (f32) {
+    %x = scf.if %is_f16 -> (f32) {
+      %view = buffer.view %src[%zero] : buffer -> view<[%span]xf16>
+      %h = view.load %view[%off] : view<[%span]xf16> -> f16
+      %w = scalar.extf %h : f16 to f32
+      scf.yield %w : f32
+    } else {
+      %y = scf.if %is_bf16 -> (f32) {
+        %view = buffer.view %src[%zero] : buffer -> view<[%span]xbf16>
+        %h = view.load %view[%off] : view<[%span]xbf16> -> bf16
+        %w = scalar.extf %h : bf16 to f32
+        scf.yield %w : f32
+      } else {
+        %view = buffer.view %src[%zero] : buffer -> view<[%span]xf32>
+        %w = view.load %view[%off] : view<[%span]xf32> -> f32
+        scf.yield %w : f32
+      }
+      scf.yield %y : f32
+    }
+    scf.yield %x : f32
+  } else {
+    scf.yield %c0_f32 : f32
+  }
+  func.return %v : f32
+}
+
+// For q8_0, base is the 2-byte unit of the block and i0 the column in the row.
+func.def inline @ggml_hrx_get_rows_load4(%stype: index, %src: buffer, %span: index, %base: index, %i0: index) -> (vector<4xf32>) {
+  %c3 = index.constant 3 : index
+  %c17 = index.constant 17 : index
+  %c32 = index.constant 32 : index
+  %t_f16 = index.constant 1 : index
+  %t_q8_0 = index.constant 8 : index
+  %wtype_q8_0 = index.constant 4 : index
+  %zero = index.constant 0 : offset
+  %zero4 = vector.splatf 0.0 : vector<4xf32>
+  %is_f16 = index.cmp eq, %stype, %t_f16 : index
+  %is_q8_0 = index.cmp eq, %stype, %t_q8_0 : index
+  %v = scf.if %is_q8_0 -> (vector<4xf32>) {
+    %col = index.assume %i0 [range(%i0, 0, 2147483644)] : index
+    %block = index.div %col, %c32 : index
+    %jb = index.rem %col, %c32 : index
+    %block_units = index.mul %block, %c17 : index
+    %block_base = index.add %base, %block_units : index
+    %q = template.apply<@ggml.weight.values4>(%wtype_q8_0, %src, %span, %block_base, %jb) : (index, buffer, index, index, index) -> (vector<4xf32>)
+    scf.yield %q : vector<4xf32>
+  } else {
+    %idx = index.add %base, %i0 : index
+    %off = index.assume %idx [range(%idx, 0, 2147483640)] : index
+    %last = index.add %off, %c3 : index
+    %ok = index.cmp ult, %last, %span : index
+    %h = scf.if %ok -> (vector<4xf32>) {
+      %x = scf.if %is_f16 -> (vector<4xf32>) {
+        %view = buffer.view %src[%zero] : buffer -> view<[%span]xf16>
+        %l = vector.load %view[%off] : view<[%span]xf16> -> vector<4xf16>
+        %w = vector.extf %l : vector<4xf16> to vector<4xf32>
+        scf.yield %w : vector<4xf32>
+      } else {
+        %view = buffer.view %src[%zero] : buffer -> view<[%span]xbf16>
+        %l = vector.load %view[%off] : view<[%span]xbf16> -> vector<4xbf16>
+        %w = vector.extf %l : vector<4xbf16> to vector<4xf32>
+        scf.yield %w : vector<4xf32>
+      }
+      scf.yield %x : vector<4xf32>
+    } else {
+      scf.yield %zero4 : vector<4xf32>
+    }
+    scf.yield %h : vector<4xf32>
+  }
+  func.return %v : vector<4xf32>
+}
+
+// One dst value for each work item. Any row length.
+kernel.def target(@ggml_wave64) export("ggml_get_rows_x1") @ggml_get_rows_x1(%n: index) {
+  %one = index.constant 1 : index
+  %wg_size = config.get @ggml.elementwise.wg_size : index
+  %round = index.sub %wg_size, %one : index
+  %n_round = index.add %n, %round : index
+  %groups = index.div %n_round, %wg_size : index
+  kernel.launch.config workgroups(%groups, %one, %one) workgroup_size(%wg_size, %one, %one) : index
+} launch(%n_in: index, %ne0_in: index, %ne1_in: index, %ne2_in: index, %src_rows_in: index, %s0_in: index, %s1_in: index, %s2_in: index, %s3_in: index, %src_span_in: index, %ids_s0_in: index, %ids_s1_in: index, %ids_s2_in: index, %ids_span_in: index, %src: buffer, %ids: buffer, %dst: buffer) {
+  // The caller checks these ranges.
+  %n = index.assume %n_in [range(%n_in, 1, 2147483647)] : index
+  %ne0 = index.assume %ne0_in [range(%ne0_in, 1, 2147483647)] : index
+  %ne1 = index.assume %ne1_in [range(%ne1_in, 1, 2147483647)] : index
+  %ne2 = index.assume %ne2_in [range(%ne2_in, 1, 2147483647)] : index
+  %src_rows = index.assume %src_rows_in [range(%src_rows_in, 1, 2147483647)] : index
+  %s0 = index.assume %s0_in [range(%s0_in, 0, 2147483647)] : index
+  %s1 = index.assume %s1_in [range(%s1_in, 0, 2147483647)] : index
+  %s2 = index.assume %s2_in [range(%s2_in, 0, 2147483647)] : index
+  %s3 = index.assume %s3_in [range(%s3_in, 0, 2147483647)] : index
+  %src_span = index.assume %src_span_in [range(%src_span_in, 1, 2147483647)] : index
+  %ids_s0 = index.assume %ids_s0_in [range(%ids_s0_in, 0, 2147483647)] : index
+  %ids_s1 = index.assume %ids_s1_in [range(%ids_s1_in, 0, 2147483647)] : index
+  %ids_s2 = index.assume %ids_s2_in [range(%ids_s2_in, 0, 2147483647)] : index
+  %ids_span = index.assume %ids_span_in [range(%ids_span_in, 1, 2147483647)] : index
+  %stype = config.get @ggml.get_rows.src_type : index
+  %wg_size = config.get @ggml.elementwise.wg_size : index
+  %group = kernel.workgroup.id<x> : index
+  %item = kernel.workitem.id<x> : index
+  %base = index.mul %group, %wg_size : index
+  %j_raw = index.add %base, %item : index
+  %j = index.assume %j_raw [range(%j_raw, 0, 2147483646)] : index
+  %zero = index.constant 0 : offset
+  %dst_view = buffer.view %dst[%zero] : buffer -> view<[%n]xf32>
+  %in_bounds = index.cmp ult, %j, %n : index
+  scf.if %in_bounds {
+    %i0, %i2, %i3, %row, %ok = func.call @ggml_hrx_get_rows_row(%j, %ne0, %ne1, %ne2, %src_rows, %ids, %ids_s0, %ids_s1, %ids_s2, %ids_span) : (index, index, index, index, index, buffer, index, index, index, index) -> (index, index, index, index, i1)
+    scf.if %ok {
+      %so0 = index.mul %i0, %s0 : index
+      %so1 = index.mul %row, %s1 : index
+      %so2 = index.mul %i2, %s2 : index
+      %so3 = index.mul %i3, %s3 : index
+      %so01 = index.add %so0, %so1 : index
+      %so23 = index.add %so2, %so3 : index
+      %src_idx = index.add %so01, %so23 : index
+      %x = func.call @ggml_hrx_get_rows_load1(%stype, %src, %src_span, %src_idx) : (index, buffer, index, index) -> (f32)
+      view.store %x, %dst_view[%j] : f32, view<[%n]xf32>
+    }
+  }
+  kernel.return
+}
+
+// 4 dst values of one row for each work item. ne0 must be a multiple of 4, for q8_0 a multiple of 32. Elements in a row must be contiguous.
+kernel.def target(@ggml_wave64) export("ggml_get_rows_x4") @ggml_get_rows_x4(%n: index) {
+  %one = index.constant 1 : index
+  %wg_size = config.get @ggml.elementwise.wg_size : index
+  %wg_x2 = index.add %wg_size, %wg_size : index
+  %per_group = index.add %wg_x2, %wg_x2 : index
+  %round = index.sub %per_group, %one : index
+  %n_round = index.add %n, %round : index
+  %groups = index.div %n_round, %per_group : index
+  kernel.launch.config workgroups(%groups, %one, %one) workgroup_size(%wg_size, %one, %one) : index
+} launch(%n_in: index, %ne0_in: index, %ne1_in: index, %ne2_in: index, %src_rows_in: index, %s1_in: index, %s2_in: index, %s3_in: index, %src_span_in: index, %ids_s0_in: index, %ids_s1_in: index, %ids_s2_in: index, %ids_span_in: index, %src: buffer, %ids: buffer, %dst: buffer) {
+  // The caller checks these ranges. n and ne0 must be multiples of 4.
+  %n = index.assume %n_in [range(%n_in, 4, 2147483644)] : index
+  %ne0 = index.assume %ne0_in [range(%ne0_in, 4, 2147483644)] : index
+  %ne1 = index.assume %ne1_in [range(%ne1_in, 1, 2147483647)] : index
+  %ne2 = index.assume %ne2_in [range(%ne2_in, 1, 2147483647)] : index
+  %src_rows = index.assume %src_rows_in [range(%src_rows_in, 1, 2147483647)] : index
+  %s1 = index.assume %s1_in [range(%s1_in, 0, 2147483647)] : index
+  %s2 = index.assume %s2_in [range(%s2_in, 0, 2147483647)] : index
+  %s3 = index.assume %s3_in [range(%s3_in, 0, 2147483647)] : index
+  %src_span = index.assume %src_span_in [range(%src_span_in, 1, 2147483647)] : index
+  %ids_s0 = index.assume %ids_s0_in [range(%ids_s0_in, 0, 2147483647)] : index
+  %ids_s1 = index.assume %ids_s1_in [range(%ids_s1_in, 0, 2147483647)] : index
+  %ids_s2 = index.assume %ids_s2_in [range(%ids_s2_in, 0, 2147483647)] : index
+  %ids_span = index.assume %ids_span_in [range(%ids_span_in, 1, 2147483647)] : index
+  %stype = config.get @ggml.get_rows.src_type : index
+  %c3 = index.constant 3 : index
+  %c4 = index.constant 4 : index
+  %wg_size = config.get @ggml.elementwise.wg_size : index
+  %wg_x2 = index.add %wg_size, %wg_size : index
+  %per_group = index.add %wg_x2, %wg_x2 : index
+  %group = kernel.workgroup.id<x> : index
+  %item = kernel.workitem.id<x> : index
+  %base = index.mul %group, %per_group : index
+  %lane = index.mul %item, %c4 : index
+  %j_raw = index.add %base, %lane : index
+  %j = index.assume %j_raw [range(%j_raw, 0, 2147483644)] : index
+  %j_last = index.add %j, %c3 : index
+  %zero = index.constant 0 : offset
+  %dst_view = buffer.view %dst[%zero] : buffer -> view<[%n]xf32>
+  %in_bounds = index.cmp ult, %j_last, %n : index
+  scf.if %in_bounds {
+    %i0, %i2, %i3, %row, %ok = func.call @ggml_hrx_get_rows_row(%j, %ne0, %ne1, %ne2, %src_rows, %ids, %ids_s0, %ids_s1, %ids_s2, %ids_span) : (index, index, index, index, index, buffer, index, index, index, index) -> (index, index, index, index, i1)
+    scf.if %ok {
+      %so1 = index.mul %row, %s1 : index
+      %so2 = index.mul %i2, %s2 : index
+      %so3 = index.mul %i3, %s3 : index
+      %so12 = index.add %so1, %so2 : index
+      %row_base = index.add %so12, %so3 : index
+      %x = func.call @ggml_hrx_get_rows_load4(%stype, %src, %src_span, %row_base, %i0) : (index, buffer, index, index, index) -> (vector<4xf32>)
+      vector.store %x, %dst_view[%j] : vector<4xf32>, view<[%n]xf32>
+    }
+  }
+  kernel.return
+}

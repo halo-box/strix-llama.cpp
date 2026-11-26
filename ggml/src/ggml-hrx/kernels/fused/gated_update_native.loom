@@ -1,0 +1,332 @@
+target.decl @ggml_wave32
+
+func.def inline @ggml_hrx_inkling_native_norm(%src: buffer, %dst: buffer, %src_row: index, %dst_row: index, %eps_bits: index) {
+  %c0 = index.constant 0 : index
+  %c576 = index.constant 576 : index
+  %c256 = index.constant 256 : index
+  %two = index.constant 2 : offset
+  %four = index.constant 4 : offset
+  %src_off = index.scale %src_row, %four : index, offset -> offset
+  %dst_off = index.scale %dst_row, %two : index, offset -> offset
+  %in = buffer.view %src[%src_off] : buffer -> view<576x4xf32>
+  %out = buffer.view %dst[%dst_off] : buffer -> view<576x4xf16>
+  %tid = kernel.workitem.id<x> : index
+  %zero4 = vector.splatf 0.0 : vector<4xf32>
+  %zero = scalar.constant 0.0 : f32
+  %a = vector.load %in[%tid, %c0] : view<576x4xf32> -> vector<4xf32>
+  %j = index.add %tid, %c256 : index
+  %b = vector.load %in[%j, %c0] : view<576x4xf32> -> vector<4xf32>
+  %k = index.add %j, %c256 : index
+  %tail = index.cmp ult, %k, %c576 : index
+  %c = scf.if %tail -> (vector<4xf32>) {
+    %v = vector.load %in[%k, %c0] : view<576x4xf32> -> vector<4xf32>
+    scf.yield %v : vector<4xf32>
+  } else {
+    scf.yield %zero4 : vector<4xf32>
+  }
+  %sa = vector.dotf<reassoc|contract> %a, %a, %zero : vector<4xf32>, vector<4xf32>, f32
+  %sb = vector.dotf<reassoc|contract> %b, %b, %sa : vector<4xf32>, vector<4xf32>, f32
+  %sc = vector.dotf<reassoc|contract> %c, %c, %sb : vector<4xf32>, vector<4xf32>, f32
+  %sum = kernel.workgroup.reduce<addf> %sc : f32
+  %eps_i = index.cast %eps_bits : index to i32
+  %eps_vec = vector.from_elements %eps_i : vector<1xi32>
+  %eps_f = vector.bitcast %eps_vec : vector<1xi32> to vector<1xf32>
+  %eps = vector.extract %eps_f[0] : vector<1xf32> -> f32
+  %inv_width = scalar.constant 0.00043402777777777775 : f32
+  %mean = scalar.mulf %sum, %inv_width : f32
+  %biased = scalar.addf %mean, %eps : f32
+  %scale = scalar.rsqrtf %biased : f32
+  %s4 = vector.splat %scale : vector<4xf32>
+  %as = vector.mulf %a, %s4 : vector<4xf32>
+  %bs = vector.mulf %b, %s4 : vector<4xf32>
+  %ah = vector.fptrunc %as : vector<4xf32> to vector<4xf16>
+  %bh = vector.fptrunc %bs : vector<4xf32> to vector<4xf16>
+  vector.store %ah, %out[%tid, %c0] : vector<4xf16>, view<576x4xf16>
+  vector.store %bh, %out[%j, %c0] : vector<4xf16>, view<576x4xf16>
+  scf.if %tail {
+    %cs = vector.mulf %c, %s4 : vector<4xf32>
+    %ch = vector.fptrunc %cs : vector<4xf32> to vector<4xf16>
+    vector.store %ch, %out[%k, %c0] : vector<4xf16>, view<576x4xf16>
+  }
+  func.return
+}
+
+func.def inline @ggml_hrx_inkling_native_pack(%src: buffer, %dst: buffer, %row: index, %dst_byte: offset) {
+  %c0 = index.constant 0 : index
+  %c256 = index.constant 256 : index
+  %c576 = index.constant 576 : index
+  %src_row_bytes = index.constant 18432 : offset
+  %dst_row_bytes = index.constant 9216 : offset
+  %from = index.scale %row, %src_row_bytes : index, offset -> offset
+  %to_row = index.scale %row, %dst_row_bytes : index, offset -> offset
+  %to = index.add %dst_byte, %to_row : offset
+  %w = buffer.view %src[%from] : buffer -> view<576x8xf32>
+  %p = buffer.view %dst[%to] : buffer -> view<576x8xf16>
+  %tid = kernel.workitem.id<x> : index
+  scf.for %i = [%tid to %c576 step %c256] {
+    %v = vector.load %w[%i, %c0] : view<576x8xf32> -> vector<8xf32>
+    %b = vector.fptrunc %v : vector<8xf32> to vector<8xbf16>
+    %widened = vector.extf %b : vector<8xbf16> to vector<8xf32>
+    %h = vector.fptrunc %widened : vector<8xf32> to vector<8xf16>
+    vector.store %h, %p[%i, %c0] : vector<8xf16>, view<576x8xf16>
+  }
+  func.return
+}
+
+// Native Loom uses unit scales for live rows. Pack BF16 weights as F16 once for both projections.
+kernel.def target(@ggml_wave32) export("ggml_inkling_ctrl_prepare_native") @ggml_inkling_ctrl_prepare_native(%tokens: index) {
+  %one = index.constant 1 : index
+  %weights = index.constant 128 : index
+  %threads = index.constant 256 : index
+  %groups = index.add %tokens, %weights : index
+  kernel.launch.config workgroups(%groups, %one, %one) workgroup_size(%threads, %one, %one) : index
+} launch(%n_in: index, %xs: index, %ms: index, %eps_x: index, %eps_m: index, %x: buffer, %m: buffer, %wd: buffer, %wf: buffer, %wg: buffer, %scratch: buffer) {
+  %n = index.assume %n_in [range(%n_in, 128, 8192), multiple_of(%n_in, 128)] : index
+  %g = kernel.workgroup.id<x> : index
+  %c0 = index.constant 0 : index
+  %c96 = index.constant 96 : index
+  %c64 = index.constant 64 : index
+  %e = index.constant 2304 : index
+  %k = index.constant 4608 : index
+  %row_bytes = index.constant 9472 : offset
+  %wd_bytes = index.constant 589824 : offset
+  %wf_bytes = index.constant 294912 : offset
+  %is_input = index.cmp ult, %g, %n : index
+  scf.if %is_input {
+    %x_row = index.mul %g, %xs : index
+    %m_row = index.mul %g, %ms : index
+    %out_x = index.mul %g, %k : index
+    %out_m = index.add %out_x, %e : index
+    func.call @ggml_hrx_inkling_native_norm(%x, %scratch, %x_row, %out_x, %eps_x) : (buffer, buffer, index, index, index)
+    func.call @ggml_hrx_inkling_native_norm(%m, %scratch, %m_row, %out_m, %eps_m) : (buffer, buffer, index, index, index)
+  } else {
+    %i = index.sub %g, %n : index
+    %is_down = index.cmp ult, %i, %c64 : index
+    %is_forget = index.cmp ult, %i, %c96 : index
+    %down = index.scale %n, %row_bytes : index, offset -> offset
+    %forget = index.add %down, %wd_bytes : offset
+    %gain = index.add %forget, %wf_bytes : offset
+    %up_w = scf.select %is_forget, %wf, %wg : buffer
+    %weight = scf.select %is_down, %wd, %up_w : buffer
+    %up_off = scf.select %is_forget, %forget, %gain : offset
+    %off = scf.select %is_down, %down, %up_off : offset
+    %up_base = scf.select %is_forget, %c64, %c96 : index
+    %base = scf.select %is_down, %c0, %up_base : index
+    %row = index.sub %i, %base : index
+    func.call @ggml_hrx_inkling_native_pack(%weight, %scratch, %row, %off) : (buffer, buffer, index, offset)
+  }
+  kernel.return
+}
+
+// Stage one 128-token tile and one 64-column weight tile in shared memory.
+kernel.def target(@ggml_wave32) export("ggml_inkling_ctrl_down_native") @ggml_inkling_ctrl_down_native(%tokens: index) {
+  %one = index.constant 1 : index
+  %c128 = index.constant 128 : index
+  %threads = index.constant 256 : index
+  %groups = index.div %tokens, %c128 : index
+  kernel.launch.config workgroups(%groups, %one, %one) workgroup_size(%threads, %one, %one) : index
+} launch(%n_in: index, %scratch: buffer) {
+  %n = index.assume %n_in [range(%n_in, 128, 8192), multiple_of(%n_in, 128)] : index
+  %c0 = index.constant 0 : index
+  %c2 = index.constant 2 : index
+  %c16 = index.constant 16 : index
+  %c32 = index.constant 32 : index
+  %c64 = index.constant 64 : index
+  %c128 = index.constant 128 : index
+  %c4 = index.constant 4 : index
+  %k = index.constant 4608 : index
+  %zero = index.constant 0 : offset
+  %xrow_bytes = index.constant 9216 : offset
+  %row_bytes = index.constant 9472 : offset
+  %stage_bytes = index.constant 9216 : offset
+  %a_bytes = index.constant 18432 : offset
+  %as_alloc = buffer.alloca<workgroup> align(16) %a_bytes : buffer
+  %bs_alloc = buffer.alloca<workgroup> align(16) %stage_bytes : buffer
+  %as = buffer.view %as_alloc[%zero] : buffer -> view<128x72xf16>
+  %bs = buffer.view %bs_alloc[%zero] : buffer -> view<64x72xf16>
+  %w_off = index.scale %n, %row_bytes : index, offset -> offset
+  %z_off = index.scale %n, %xrow_bytes : index, offset -> offset
+  %x = buffer.view %scratch[%zero] : buffer -> view<[%n]x4608xf16>
+  %w = buffer.view %scratch[%w_off] : buffer -> view<64x4608xf16>
+  %tile = kernel.workgroup.id<x> : index
+  %tile_row = index.mul %tile, %c128 : index
+  %z_bytes = index.constant 256 : offset
+  %z_tile_bytes = index.scale %tile_row, %z_bytes : index, offset -> offset
+  %z_tile_off = index.add %z_off, %z_tile_bytes : offset
+  %z_tile = buffer.view %scratch[%z_tile_off] : buffer -> view<128x64xf32>
+  %t = kernel.workitem.id<x> : index
+  %lane = kernel.subgroup.lane.id : index
+  %wave = kernel.subgroup.id : index
+  %wave_row = index.div %wave, %c2 : index
+  %a0 = index.mul %wave_row, %c32 : index
+  %a1 = index.add %a0, %c16 : index
+  %wave_col = index.rem %wave, %c2 : index
+  %col = index.rem %lane, %c16 : index
+  %b0 = index.madd %wave_col, %c32, %col : index
+  %b1 = index.add %b0, %c16 : index
+  %local_row = index.div %t, %c2 : index
+  %half = index.rem %t, %c2 : index
+  %local_k = index.mul %half, %c32 : index
+  %w_row = index.div %t, %c4 : index
+  %w_seg = index.rem %t, %c4 : index
+  %w_k = index.mul %w_seg, %c16 : index
+  %xrow_raw = index.add %tile_row, %local_row : index
+  %xrow = index.assume %xrow_raw [lt(%xrow_raw, %n)] : index
+  %z8 = vector.splatf 0.0 : vector<8xf32>
+  %init = vector.fragment<init> %z8 shape [%c16, %c16] : vector<8xf32>
+  %a_first = vector.load %x[%xrow, %local_k] : view<[%n]x4608xf16> -> vector<32xf16>
+  %b_first = vector.load %w[%w_row, %w_k] : view<64x4608xf16> -> vector<16xf16>
+  %p00, %p01, %p10, %p11, %unused_a, %unused_b = scf.for %kk = [%c0 to %k step %c64](%c00 = %init : vector<8xf32>, %c01 = %init : vector<8xf32>, %c10 = %init : vector<8xf32>, %c11 = %init : vector<8xf32>, %av = %a_first : vector<32xf16>, %bv = %b_first : vector<16xf16>) -> (vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<32xf16>, vector<16xf16>) {
+    vector.store %av, %as[%local_row, %local_k] : vector<32xf16>, view<128x72xf16>
+    vector.store %bv, %bs[%w_row, %w_k] : vector<16xf16>, view<64x72xf16>
+    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+    %next = index.add %kk, %c64 : index
+    %last = index.sub %k, %c64 : index
+    %next_k = index.min %next, %last : index
+    %next_a = index.add %next_k, %local_k : index
+    %next_b = index.add %next_k, %w_k : index
+    %next_av = vector.load %x[%xrow, %next_a] : view<[%n]x4608xf16> -> vector<32xf16>
+    %next_bv = vector.load %w[%w_row, %next_b] : view<64x4608xf16> -> vector<16xf16>
+    %d00, %d01, %d10, %d11 = scf.for %fi = [%c0 to %c64 step %c16](%f00 = %c00 : vector<8xf32>, %f01 = %c01 : vector<8xf32>, %f10 = %c10 : vector<8xf32>, %f11 = %c11 : vector<8xf32>) -> (vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>) unroll {
+      %l0 = vector.fragment.load<lhs> %as[%a0, %fi] shape [%c16, %c16] : view<128x72xf16> -> vector<16xf16>
+      %l1 = vector.fragment.load<lhs> %as[%a1, %fi] shape [%c16, %c16] : view<128x72xf16> -> vector<16xf16>
+      %v0 = vector.load %bs[%b0, %fi] : view<64x72xf16> -> vector<16xf16>
+      %v1 = vector.load %bs[%b1, %fi] : view<64x72xf16> -> vector<16xf16>
+      %r0 = vector.fragment<rhs> %v0 shape [%c16, %c16] : vector<16xf16>
+      %r1 = vector.fragment<rhs> %v1 shape [%c16, %c16] : vector<16xf16>
+      %s00 = vector.mma %l0, %r0, %f00 : vector<16xf16>, vector<16xf16>, vector<8xf32>
+      %s01 = vector.mma %l0, %r1, %f01 : vector<16xf16>, vector<16xf16>, vector<8xf32>
+      %s10 = vector.mma %l1, %r0, %f10 : vector<16xf16>, vector<16xf16>, vector<8xf32>
+      %s11 = vector.mma %l1, %r1, %f11 : vector<16xf16>, vector<16xf16>, vector<8xf32>
+      scf.yield %s00, %s01, %s10, %s11 : vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>
+    }
+    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+    scf.yield %d00, %d01, %d10, %d11, %next_av, %next_bv : vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<32xf16>, vector<16xf16>
+  }
+  %base_col = index.mul %wave_col, %c32 : index
+  %base_col1 = index.add %base_col, %c16 : index
+  vector.fragment.store<result> %p00, %z_tile[%a0, %base_col] shape [%c16, %c16] : vector<8xf32>, view<128x64xf32>
+  vector.fragment.store<result> %p01, %z_tile[%a0, %base_col1] shape [%c16, %c16] : vector<8xf32>, view<128x64xf32>
+  vector.fragment.store<result> %p10, %z_tile[%a1, %base_col] shape [%c16, %c16] : vector<8xf32>, view<128x64xf32>
+  vector.fragment.store<result> %p11, %z_tile[%a1, %base_col1] shape [%c16, %c16] : vector<8xf32>, view<128x64xf32>
+  kernel.return
+}
+
+func.def inline @ggml_hrx_inkling_native_update(%x: buffer, %m: buffer, %y: buffer, %x_s1: index, %m_s1: index, %y_s1: index, %tok: index, %ch: index, %keep: f32, %gain: f32) {
+  %four = index.constant 4 : offset
+  %xi = index.madd %tok, %x_s1, %ch : index
+  %mi = index.madd %tok, %m_s1, %ch : index
+  %yi = index.madd %tok, %y_s1, %ch : index
+  %xo = index.scale %xi, %four : index, offset -> offset
+  %mo = index.scale %mi, %four : index, offset -> offset
+  %yo = index.scale %yi, %four : index, offset -> offset
+  %xv = buffer.view %x[%xo] : buffer -> view<1xf32>
+  %mv = buffer.view %m[%mo] : buffer -> view<1xf32>
+  %yv = buffer.view %y[%yo] : buffer -> view<1xf32>
+  %xe = view.load %xv[0] : view<1xf32> -> f32
+  %me = view.load %mv[0] : view<1xf32> -> f32
+  %kept = scalar.mulf %keep, %xe : f32
+  %yn = scalar.fmaf %gain, %me, %kept : f32
+  view.store %yn, %yv[0] : f32, view<1xf32>
+  func.return
+}
+
+// On gfx1151 a 16x16 tile per wave keeps both gate projections in registers. The 32x32 wave tile spilled 1344 bytes per lane.
+kernel.def target(@ggml_wave32) export("ggml_inkling_ctrl_apply_native") @ggml_inkling_ctrl_apply_native(%n_t: index) {
+  %one = index.constant 1 : index
+  %wg_size = index.constant 128 : index
+  %groups = index.constant 72 : index
+  %tile_width = index.constant 32 : index
+  %tiles = index.div %n_t, %tile_width : index
+  kernel.launch.config workgroups(%groups, %tiles, %one) workgroup_size(%wg_size, %one, %one) : index
+} launch(%n_in: index, %x_s1: index, %m_s1: index, %y_s1: index, %x: buffer, %m: buffer, %scratch: buffer, %y: buffer) {
+  %n = index.assume %n_in [range(%n_in, 64, 8192), multiple_of(%n_in, 64)] : index
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c4 = index.constant 4 : index
+  %c8 = index.constant 8 : index
+  %c16 = index.constant 16 : index
+  %c32 = index.constant 32 : index
+  %c64 = index.constant 64 : index
+  %c0_offset = index.constant 0 : offset
+  %group = kernel.workgroup.id<x> : index
+  %tile = kernel.workgroup.id<y> : index
+  %tid_raw = kernel.workitem.id<x> : index
+  %t = index.assume %tid_raw [range(%tid_raw, 0, 127)] : index
+  %s_raw = kernel.subgroup.id : index
+  %s = index.assume %s_raw [range(%s_raw, 0, 3)] : index
+  %lane_raw = kernel.subgroup.lane.id : index
+  %lane = index.assume %lane_raw [range(%lane_raw, 0, 31)] : index
+
+  %lds_bytes = index.constant 13824 : offset
+  %lds = buffer.alloca<workgroup> align(16) %lds_bytes : buffer
+  %o_f = index.constant 4608 : offset
+  %o_g = index.constant 9216 : offset
+  %zs = buffer.view %lds[%c0_offset] : buffer -> view<32x72xf16>
+  %fs = buffer.view %lds[%o_f] : buffer -> view<32x72xf16>
+  %gs = buffer.view %lds[%o_g] : buffer -> view<32x72xf16>
+
+  %xrow_bytes = index.constant 9216 : offset
+  %row_bytes = index.constant 9472 : offset
+  %wd_bytes = index.constant 589824 : offset
+  %wf_bytes = index.constant 294912 : offset
+  %z_off = index.scale %n, %xrow_bytes : index, offset -> offset
+  %weight_off = index.scale %n, %row_bytes : index, offset -> offset
+  %wf_off = index.add %weight_off, %wd_bytes : offset
+  %wg_off = index.add %wf_off, %wf_bytes : offset
+  %z = buffer.view %scratch[%z_off] : buffer -> view<[%n]x64xf32>
+  %wf = buffer.view %scratch[%wf_off] : buffer -> view<2304x64xf16>
+  %wg = buffer.view %scratch[%wg_off] : buffer -> view<2304x64xf16>
+  %ld_r = index.div %t, %c4 : index
+  %ld_c = index.rem %t, %c4 : index
+  %ld_k = index.mul %ld_c, %c16 : index
+  %tok0 = index.mul %tile, %c32 : index
+  %row0 = index.mul %group, %c32 : index
+  %tok_raw = index.add %tok0, %ld_r : index
+  %tok = index.assume %tok_raw [lt(%tok_raw, %n)] : index
+  %row = index.add %row0, %ld_r : index
+  %zf = vector.load %z[%tok, %ld_k] : view<[%n]x64xf32> -> vector<16xf32>
+  %zv = vector.fptrunc %zf : vector<16xf32> to vector<16xf16>
+  %fv = vector.load %wf[%row, %ld_k] : view<2304x64xf16> -> vector<16xf16>
+  %gv = vector.load %wg[%row, %ld_k] : view<2304x64xf16> -> vector<16xf16>
+  vector.store %zv, %zs[%ld_r, %ld_k] : vector<16xf16>, view<32x72xf16>
+  vector.store %fv, %fs[%ld_r, %ld_k] : vector<16xf16>, view<32x72xf16>
+  vector.store %gv, %gs[%ld_r, %ld_k] : vector<16xf16>, view<32x72xf16>
+  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+
+  %wr = index.div %s, %c2 : index
+  %wc = index.rem %s, %c2 : index
+  %a_row = index.mul %wr, %c16 : index
+  %b_col = index.mul %wc, %c16 : index
+  %lane_n = index.rem %lane, %c16 : index
+  %lane_m = index.div %lane, %c16 : index
+  %rc = index.add %b_col, %lane_n : index
+  %zero8 = vector.splatf 0.0 : vector<8xf32>
+  %init = vector.fragment<init> %zero8 shape [%c16, %c16] : vector<8xf32>
+  %forget, %gain_proj = scf.for %kh = [%c0 to %c64 step %c16](%af = %init : vector<8xf32>, %ag = %init : vector<8xf32>) -> (vector<8xf32>, vector<8xf32>) unroll {
+    %lhs = vector.fragment.load<lhs> %zs[%a_row, %kh] shape [%c16, %c16] : view<32x72xf16> -> vector<16xf16>
+    %fv = vector.load %fs[%rc, %kh] : view<32x72xf16> -> vector<16xf16>
+    %gv = vector.load %gs[%rc, %kh] : view<32x72xf16> -> vector<16xf16>
+    %fr = vector.fragment<rhs> %fv shape [%c16, %c16] : vector<16xf16>
+    %gr = vector.fragment<rhs> %gv shape [%c16, %c16] : vector<16xf16>
+    %nf = vector.mma %lhs, %fr, %af : vector<16xf16>, vector<16xf16>, vector<8xf32>
+    %ng = vector.mma %lhs, %gr, %ag : vector<16xf16>, vector<16xf16>, vector<8xf32>
+    scf.yield %nf, %ng : vector<8xf32>, vector<8xf32>
+  }
+  %one8 = vector.splatf 1.0 : vector<8xf32>
+  %tanh_f = vector.tanhf<afn> %forget : vector<8xf32>
+  %keep = vector.subf %one8, %tanh_f : vector<8xf32>
+  %gain = vector.tanhf<afn> %gain_proj : vector<8xf32>
+  %ch = index.add %row0, %rc : index
+  %tile_row = index.add %tok0, %a_row : index
+  scf.for %i = [%c0 to %c8 step %c1] unroll {
+    %i2 = index.mul %i, %c2 : index
+    %ti = index.add %lane_m, %i2 : index
+    %out_tok = index.add %tile_row, %ti : index
+    %keep_i = vector.extract %keep[%i] : vector<8xf32> -> f32
+    %gain_i = vector.extract %gain[%i] : vector<8xf32> -> f32
+    func.call @ggml_hrx_inkling_native_update(%x, %m, %y, %x_s1, %m_s1, %y_s1, %out_tok, %ch, %keep_i, %gain_i) : (buffer, buffer, buffer, index, index, index, index, index, f32, f32)
+  }
+  kernel.return
+}

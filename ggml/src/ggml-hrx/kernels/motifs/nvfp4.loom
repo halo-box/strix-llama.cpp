@@ -1,0 +1,188 @@
+// Plain ggml block_nvfp4: 4 UE4M3 scales, then 32 bytes of E2M1 codes. A block has 64 values and 36 bytes.
+// Sub-block s (16 values) has the code bytes 8s to 8s+7: the low nibble of byte j is value j, the high nibble is value 8+j.
+// The 16 values of a sub-block come out in slot order: f16 pair p holds the values (0,2) (8,10) (1,3) (9,11) (4,6) (12,14) (5,7) (13,15).
+
+// UE4M3 scale of sub-block sub. As in ggml_ue4m3_to_fp32 (which gives half of it), the code 0x7F is zero and the sign bit is ignored.
+func.def inline @ggml_nvfp4_scale(%word: i32, %sub: index) -> (f32) {
+  %s = index.cast %sub : index to i32
+  %c3 = scalar.constant 3 : i32
+  %c7 = scalar.constant 7 : i32
+  %c127 = scalar.constant 127 : i32
+  %c255 = scalar.constant 255 : i32
+  %shift = scalar.shli %s, %c3 : i32
+  %moved = scalar.shrui %word, %shift : i32
+  %byte = scalar.andi %moved, %c255 : i32
+  %low7 = scalar.andi %byte, %c127 : i32
+  // The f16 value with the 7 low bits at bit 7 is the E4M3 value / 256, also for subnormal codes.
+  %bits = scalar.shli %low7, %c7 : i32
+  %bits16 = scalar.trunci %bits : i32 to i16
+  %bits_vector = vector.from_elements %bits16 : vector<1xi16>
+  %half_vector = vector.bitcast %bits_vector : vector<1xi16> to vector<1xf16>
+  %half = vector.extract %half_vector[0] : vector<1xf16> -> f16
+  %wide = scalar.extf %half : f16 to f32
+  %k256 = scalar.constant 256.0 : f32
+  %value = scalar.mulf %wide, %k256 : f32
+  %zero = scalar.constant 0.0 : f32
+  %nan = scalar.cmpi eq, %byte, %c127 : i32
+  %clean = scf.select %nan, %zero, %value : f32
+  func.return %clean : f32
+}
+
+// Nibble pair of w as two f16 codes: the magnitude moves to bits 9..11 and the sign to bit 15 of both halves.
+// A code is the E2M1 value / 2^14 (also for the subnormal code 1).
+func.def inline @ggml_nvfp4_pair_shl(%w: i32, %mag_shift: i32, %sgn_shift: i32) -> (i32) {
+  %mag_mask = scalar.constant 234884608 : i32
+  %sgn_mask = scalar.constant -2147450880 : i32
+  %mag_moved = scalar.shli %w, %mag_shift : i32
+  %sgn_moved = scalar.shli %w, %sgn_shift : i32
+  %mag = scalar.andi %mag_moved, %mag_mask : i32
+  %sgn = scalar.andi %sgn_moved, %sgn_mask : i32
+  %pair = scalar.ori %mag, %sgn : i32
+  func.return %pair : i32
+}
+
+// Same for the top nibble pair: the sign is already in place.
+func.def inline @ggml_nvfp4_pair_top(%w: i32) -> (i32) {
+  %mag_mask = scalar.constant 234884608 : i32
+  %sgn_mask = scalar.constant -2147450880 : i32
+  %c3 = scalar.constant 3 : i32
+  %mag_moved = scalar.shrui %w, %c3 : i32
+  %mag = scalar.andi %mag_moved, %mag_mask : i32
+  %sgn = scalar.andi %w, %sgn_mask : i32
+  %pair = scalar.ori %mag, %sgn : i32
+  func.return %pair : i32
+}
+
+// The four f16 pairs of one code word, in slot order.
+func.def inline @ggml_nvfp4_codes8(%w: i32) -> (vector<4xi32>) {
+  %m0 = scalar.constant 9 : i32
+  %m1 = scalar.constant 5 : i32
+  %m2 = scalar.constant 1 : i32
+  %s0 = scalar.constant 12 : i32
+  %s1 = scalar.constant 8 : i32
+  %s2 = scalar.constant 4 : i32
+  %a0 = func.call @ggml_nvfp4_pair_shl(%w, %m0, %s0) : (i32, i32, i32) -> (i32)
+  %a1 = func.call @ggml_nvfp4_pair_shl(%w, %m1, %s1) : (i32, i32, i32) -> (i32)
+  %a2 = func.call @ggml_nvfp4_pair_shl(%w, %m2, %s2) : (i32, i32, i32) -> (i32)
+  %a3 = func.call @ggml_nvfp4_pair_top(%w) : (i32) -> (i32)
+  %words = vector.from_elements %a0, %a1, %a2, %a3 : vector<4xi32>
+  func.return %words : vector<4xi32>
+}
+
+// 16 codes of one sub-block in slot order. w0 has code bytes 0..3, w1 code bytes 4..7.
+func.def inline @ggml_nvfp4_codes16(%w0: i32, %w1: i32) -> (vector<16xf16>) {
+  %a = func.call @ggml_nvfp4_codes8(%w0) : (i32) -> (vector<4xi32>)
+  %b = func.call @ggml_nvfp4_codes8(%w1) : (i32) -> (vector<4xi32>)
+  %a0 = vector.extract %a[0] : vector<4xi32> -> i32
+  %a1 = vector.extract %a[1] : vector<4xi32> -> i32
+  %a2 = vector.extract %a[2] : vector<4xi32> -> i32
+  %a3 = vector.extract %a[3] : vector<4xi32> -> i32
+  %b0 = vector.extract %b[0] : vector<4xi32> -> i32
+  %b1 = vector.extract %b[1] : vector<4xi32> -> i32
+  %b2 = vector.extract %b[2] : vector<4xi32> -> i32
+  %b3 = vector.extract %b[3] : vector<4xi32> -> i32
+  %words = vector.from_elements %a0, %a1, %a2, %a3, %b0, %b1, %b2, %b3 : vector<8xi32>
+  %codes = vector.bitcast %words : vector<8xi32> to vector<16xf16>
+  func.return %codes : vector<16xf16>
+}
+
+// 8 codes in natural order: the low nibbles (high = false) or the high nibbles of the code words w0 and w1.
+func.def inline @ggml_nvfp4_half8(%w0: i32, %w1: i32, %high: i1) -> (vector<8xf16>) {
+  %a = func.call @ggml_nvfp4_codes8(%w0) : (i32) -> (vector<4xi32>)
+  %b = func.call @ggml_nvfp4_codes8(%w1) : (i32) -> (vector<4xi32>)
+  %a0 = vector.extract %a[0] : vector<4xi32> -> i32
+  %a1 = vector.extract %a[1] : vector<4xi32> -> i32
+  %a2 = vector.extract %a[2] : vector<4xi32> -> i32
+  %a3 = vector.extract %a[3] : vector<4xi32> -> i32
+  %b0 = vector.extract %b[0] : vector<4xi32> -> i32
+  %b1 = vector.extract %b[1] : vector<4xi32> -> i32
+  %b2 = vector.extract %b[2] : vector<4xi32> -> i32
+  %b3 = vector.extract %b[3] : vector<4xi32> -> i32
+  // Pairs 0 and 2 have the low nibbles of the bytes (0,2) and (1,3). Pairs 1 and 3 have the high nibbles.
+  %pa = scf.select %high, %a1, %a0 : i32
+  %qa = scf.select %high, %a3, %a2 : i32
+  %pb = scf.select %high, %b1, %b0 : i32
+  %qb = scf.select %high, %b3, %b2 : i32
+  %words = vector.from_elements %pa, %qa, %pb, %qb : vector<4xi32>
+  %h = vector.bitcast %words : vector<4xi32> to vector<8xf16>
+  %e0 = vector.extract %h[0] : vector<8xf16> -> f16
+  %e1 = vector.extract %h[2] : vector<8xf16> -> f16
+  %e2 = vector.extract %h[1] : vector<8xf16> -> f16
+  %e3 = vector.extract %h[3] : vector<8xf16> -> f16
+  %e4 = vector.extract %h[4] : vector<8xf16> -> f16
+  %e5 = vector.extract %h[6] : vector<8xf16> -> f16
+  %e6 = vector.extract %h[5] : vector<8xf16> -> f16
+  %e7 = vector.extract %h[7] : vector<8xf16> -> f16
+  %r = vector.from_elements %e0, %e1, %e2, %e3, %e4, %e5, %e6, %e7 : vector<8xf16>
+  func.return %r : vector<8xf16>
+}
+
+// 16 codes of one sub-block in natural order.
+func.def inline @ggml_nvfp4_codes16_natural(%w0: i32, %w1: i32) -> (vector<16xf16>) {
+  %slot = func.call @ggml_nvfp4_codes16(%w0, %w1) : (i32, i32) -> (vector<16xf16>)
+  %codes = vector.shuffle<[0, 4, 1, 5, 8, 12, 9, 13, 2, 6, 3, 7, 10, 14, 11, 15]> %slot : vector<16xf16>
+  func.return %codes : vector<16xf16>
+}
+
+template.decl @ggml.weight.wmma16(%wtype: index, %weight: buffer, %w_span: index, %row_base: index, %row_valid: i1, %k: index, %k_size: index, %part: index) -> (vector<8xf16>, vector<8xf16>)
+
+// Weight type 40. row_base and w_span are in halves. k is a multiple of 64 and K is a multiple of 64.
+// Part p gives the values p*8 to p*8+7 (sub-block p/2) and 32+p*8 to 32+p*8+7 (sub-block 2+p/2) of the block at k.
+template.def<@ggml.weight.wmma16> device @ggml_nvfp4_wmma16(%wtype: index, %weight: buffer, %w_span: index, %row_base: index, %row_valid: i1, %k: index, %k_size: index, %part: index) -> (vector<8xf16>, vector<8xf16>) where [eq(%wtype, 40)] {
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c18 = index.constant 18 : index
+  %c64 = index.constant 64 : index
+  %b2 = index.constant 2 : offset
+  %zero8 = vector.splatf 0.0 : vector<8xf16>
+  %k_in = index.cmp ult, %k, %k_size : index
+  %valid = scalar.andi %row_valid, %k_in : i1
+  %k_bounded = index.assume %k [range(%k, 0, 2147483646)] : index
+  %block = index.div %k_bounded, %c64 : index
+  %block_halves = index.mul %block, %c18 : index
+  %base0 = index.add %row_base, %block_halves : index
+  %base = index.assume %base0 [range(%base0, 0, 2147483600)] : index
+  %end = index.add %base, %c18 : index
+  %in_span = index.cmp ule, %end, %w_span : index
+  %ok = scalar.andi %valid, %in_span : i1
+  %low, %high = scf.if %ok -> (vector<8xf16>, vector<8xf16>) {
+    %part_in = index.assume %part [range(%part, 0, 3)] : index
+    %sub_lo = index.div %part_in, %c2 : index
+    %sub_hi = index.add %sub_lo, %c2 : index
+    %odd = index.rem %part_in, %c2 : index
+    %nib_hi = index.cmp eq, %odd, %c1 : index
+    %byte = index.scale %base, %b2 : index, offset -> offset
+    %words = buffer.view %weight[%byte] : buffer -> view<9xi32>
+    %lo2 = index.mul %sub_lo, %c2 : index
+    %hi2 = index.mul %sub_hi, %c2 : index
+    %i_lo0 = index.add %lo2, %c1 : index
+    %i_lo1 = index.add %lo2, %c2 : index
+    %i_hi0 = index.add %hi2, %c1 : index
+    %i_hi1 = index.add %hi2, %c2 : index
+    %scales = view.load %words[0] : view<9xi32> -> i32
+    %w_lo0 = view.load %words[%i_lo0] : view<9xi32> -> i32
+    %w_lo1 = view.load %words[%i_lo1] : view<9xi32> -> i32
+    %w_hi0 = view.load %words[%i_hi0] : view<9xi32> -> i32
+    %w_hi1 = view.load %words[%i_hi1] : view<9xi32> -> i32
+    %d_lo = func.call @ggml_nvfp4_scale(%scales, %sub_lo) : (i32, index) -> (f32)
+    %d_hi = func.call @ggml_nvfp4_scale(%scales, %sub_hi) : (i32, index) -> (f32)
+    %codes_lo = func.call @ggml_nvfp4_half8(%w_lo0, %w_lo1, %nib_hi) : (i32, i32, i1) -> (vector<8xf16>)
+    %codes_hi = func.call @ggml_nvfp4_half8(%w_hi0, %w_hi1, %nib_hi) : (i32, i32, i1) -> (vector<8xf16>)
+    // code * 2^14 is the E2M1 value. Both products are exact in f16.
+    %pre32 = scalar.constant 16384.0 : f32
+    %pre16 = scalar.fptrunc %pre32 : f32 to f16
+    %pre = vector.splat %pre16 : vector<8xf16>
+    %d_lo16 = scalar.fptrunc %d_lo : f32 to f16
+    %d_hi16 = scalar.fptrunc %d_hi : f32 to f16
+    %f_lo = vector.splat %d_lo16 : vector<8xf16>
+    %f_hi = vector.splat %d_hi16 : vector<8xf16>
+    %v_lo0 = vector.mulf %codes_lo, %pre : vector<8xf16>
+    %v_hi0 = vector.mulf %codes_hi, %pre : vector<8xf16>
+    %v_lo = vector.mulf %v_lo0, %f_lo : vector<8xf16>
+    %v_hi = vector.mulf %v_hi0, %f_hi : vector<8xf16>
+    scf.yield %v_lo, %v_hi : vector<8xf16>, vector<8xf16>
+  } else {
+    scf.yield %zero8, %zero8 : vector<8xf16>, vector<8xf16>
+  }
+  template.return %low, %high : vector<8xf16>, vector<8xf16>
+}

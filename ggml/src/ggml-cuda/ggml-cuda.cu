@@ -10388,7 +10388,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 op->src[2]->type == GGML_TYPE_F32 && (op->src[3] == nullptr || op->src[3]->type == GGML_TYPE_F32) &&
                 op->type == GGML_TYPE_F32;
         case GGML_OP_FLASH_ATTN_EXT:
-            return ggml_cuda_flash_attn_ext_supported(dev_ctx->device, op);
+            // the indexed bias is not implemented here yet; the graph then builds the dense bias mask
+            return !ggml_flash_attn_ext_has_indexed_bias(op) && ggml_cuda_flash_attn_ext_supported(dev_ctx->device, op);
         case GGML_OP_CROSS_ENTROPY_LOSS:
         case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
         case GGML_OP_OPT_STEP_ADAMW:

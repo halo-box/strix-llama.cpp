@@ -1,0 +1,30 @@
+// Shared parts of the MUL_MAT_ID kernels. route = token * n_ids + slot. ids strides and span are in elements.
+
+// The expert of a route, and false if the id is out of [0, n_as).
+func.def inline @ggml_hrx_mmid_expert(%ids: buffer, %i_span: index, %i_s0: index, %i_s1: index, %n_ids: index, %n_as: index, %route: index) -> (index, i1) {
+  %c0 = index.constant 0 : index
+  %c0_offset = index.constant 0 : offset
+  %zero_i32 = scalar.constant 0 : i32
+  %slot = index.rem %route, %n_ids : index
+  %token = index.div %route, %n_ids : index
+  %i_slot = index.mul %slot, %i_s0 : index
+  %i_token = index.mul %token, %i_s1 : index
+  %i_index0 = index.add %i_slot, %i_token : index
+  %i_index = index.assume %i_index0 [range(%i_index0, 0, 2147483646)] : index
+  %ids_view = buffer.view %ids[%c0_offset] : buffer -> view<[%i_span]xi32>
+  %i_in = index.cmp ult, %i_index, %i_span : index
+  %id32 = scf.if %i_in -> (i32) {
+    %v = view.load %ids_view[%i_index] : view<[%i_span]xi32> -> i32
+    scf.yield %v : i32
+  } else {
+    %neg = scalar.constant -1 : i32
+    scf.yield %neg : i32
+  }
+  %n_as32 = index.cast %n_as : index to i32
+  %ge0 = scalar.cmpi sge, %id32, %zero_i32 : i32
+  %lt_n = scalar.cmpi slt, %id32, %n_as32 : i32
+  %ok = scalar.andi %ge0, %lt_n : i1
+  %id_raw = index.cast %id32 : i32 to index
+  %id = scf.select %ok, %id_raw, %c0 : index
+  func.return %id, %ok : index, i1
+}

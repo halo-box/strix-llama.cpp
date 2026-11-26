@@ -1,0 +1,242 @@
+// GPU side of the NPU int8 GEMM (kernels/npu/gemm_i8_k*.loom). The NPU reads and writes 8x8 fragments:
+// A (activations, M x K) at (m/64)*64*K + (k/128)*8192 + ((m%64)/8)*1024 + ((k%128)/8)*64 + (m%8)*8 + k%8,
+// C (i32 sums, M x N) at ((m/64)*(N/128) + n/128)*8192 + ((n%128)/64)*4096 + ((m%64)/8)*512 + ((n%64)/8)*64 + (m%8)*8 + n%8.
+// K and N are multiples of 128.
+
+config.decl @ggml.npu.wg_size : %value: index where [range(%value, 64, 1024), multiple_of(%value, 64)]
+
+config.decl @ggml.npu.attn_gate : %value: index where [range(%value, 0, 1)]
+
+target.decl @ggml_wave64
+
+// 8 elements at idx. The index is clamped into the span, so that the access is in bounds. The callers keep idx + 8 <= span.
+func.def inline @ggml_npu_load8_f32(%buf: buffer, %span_in: index, %idx_in: index) -> (vector<8xf32>) {
+  %c7 = index.constant 7 : index
+  %c8 = index.constant 8 : index
+  %zero = index.constant 0 : offset
+  %span = index.assume %span_in [range(%span_in, 8, 2147483647)] : index
+  %last = index.sub %span, %c8 : index
+  %limit0 = index.sub %span, %c7 : index
+  %idx0 = index.assume %idx_in [range(%idx_in, 0, 2147483639)] : index
+  %idx1 = index.min %idx0, %last : index
+  %idx, %limit = index.assume %idx1, %limit0 [lt(%idx1, %limit0)] : index, index
+  %extent = index.add %limit, %c7 : index
+  %view = buffer.view %buf[%zero] : buffer -> view<[%extent]xf32>
+  %v = vector.load %view[%idx] : view<[%extent]xf32> -> vector<8xf32>
+  func.return %v : vector<8xf32>
+}
+
+func.def inline @ggml_npu_load8_i32(%buf: buffer, %span_in: index, %idx_in: index) -> (vector<8xi32>) {
+  %c7 = index.constant 7 : index
+  %c8 = index.constant 8 : index
+  %zero = index.constant 0 : offset
+  %span = index.assume %span_in [range(%span_in, 8, 2147483647)] : index
+  %last = index.sub %span, %c8 : index
+  %limit0 = index.sub %span, %c7 : index
+  %idx0 = index.assume %idx_in [range(%idx_in, 0, 2147483639)] : index
+  %idx1 = index.min %idx0, %last : index
+  %idx, %limit = index.assume %idx1, %limit0 [lt(%idx1, %limit0)] : index, index
+  %extent = index.add %limit, %c7 : index
+  %view = buffer.view %buf[%zero] : buffer -> view<[%extent]xi32>
+  %v = vector.load %view[%idx] : view<[%extent]xi32> -> vector<8xi32>
+  func.return %v : vector<8xi32>
+}
+
+func.def inline @ggml_npu_store8_f32(%buf: buffer, %span_in: index, %idx_in: index, %v: vector<8xf32>) {
+  %c7 = index.constant 7 : index
+  %c8 = index.constant 8 : index
+  %zero = index.constant 0 : offset
+  %span = index.assume %span_in [range(%span_in, 8, 2147483647)] : index
+  %last = index.sub %span, %c8 : index
+  %limit0 = index.sub %span, %c7 : index
+  %idx0 = index.assume %idx_in [range(%idx_in, 0, 2147483639)] : index
+  %idx1 = index.min %idx0, %last : index
+  %idx, %limit = index.assume %idx1, %limit0 [lt(%idx1, %limit0)] : index, index
+  %extent = index.add %limit, %c7 : index
+  %view = buffer.view %buf[%zero] : buffer -> view<[%extent]xf32>
+  vector.store %v, %view[%idx] : vector<8xf32>, view<[%extent]xf32>
+  func.return
+}
+
+func.def inline @ggml_npu_store8_i8(%buf: buffer, %span_in: index, %idx_in: index, %v: vector<8xi8>) {
+  %c7 = index.constant 7 : index
+  %c8 = index.constant 8 : index
+  %zero = index.constant 0 : offset
+  %span = index.assume %span_in [range(%span_in, 8, 2147483647)] : index
+  %last = index.sub %span, %c8 : index
+  %limit0 = index.sub %span, %c7 : index
+  %idx0 = index.assume %idx_in [range(%idx_in, 0, 2147483639)] : index
+  %idx1 = index.min %idx0, %last : index
+  %idx, %limit = index.assume %idx1, %limit0 [lt(%idx1, %limit0)] : index, index
+  %extent = index.add %limit, %c7 : index
+  %view = buffer.view %buf[%zero] : buffer -> view<[%extent]xi8>
+  vector.store %v, %view[%idx] : vector<8xi8>, view<[%extent]xi8>
+  func.return
+}
+
+// One workgroup per row. Each lane keeps eight activations across the scale reduction.
+kernel.def target(@ggml_wave64) export("ggml_npu_quant_rows") @ggml_npu_quant_rows(%row_count: index) {
+  %one = index.constant 1 : index
+  %wg_size = config.get @ggml.npu.wg_size : index
+  kernel.launch.config workgroups(%row_count, %one, %one) workgroup_size(%wg_size, %one, %one) : index
+} launch(%rows_in: index, %k_in: index, %s1_in: index, %src_span_in: index, %dst_span_in: index, %src: buffer, %dst: buffer, %scales: buffer) {
+  %rows = index.assume %rows_in [range(%rows_in, 1, 2147483647)] : index
+  %k_size = index.assume %k_in [range(%k_in, 128, 2147483520)] : index
+  %s1 = index.assume %s1_in [range(%s1_in, 0, 2147483647)] : index
+  %src_span = index.assume %src_span_in [range(%src_span_in, 8, 2147483647)] : index
+  %dst_span = index.assume %dst_span_in [range(%dst_span_in, 16384, 2147483647)] : index
+  %c0 = index.constant 0 : index
+  %c8 = index.constant 8 : index
+  %c16 = index.constant 16 : index
+  %c64 = index.constant 64 : index
+  %c1024 = index.constant 1024 : index
+  %c8192 = index.constant 8192 : index
+  %zero = index.constant 0 : offset
+  %fzero = scalar.constant 0.0 : f32
+  %zero8 = vector.splatf 0.0 : vector<8xf32>
+  %row = kernel.workgroup.id<x> : index
+  %item = kernel.workitem.id<x> : index
+  %groups = index.div %k_size, %c8 : index
+  %row_base = index.mul %row, %s1 : index
+
+  %active = index.cmp ult, %item, %groups : index
+  %v = scf.if %active -> (vector<8xf32>) {
+    %k = index.mul %item, %c8 : index
+    %i = index.add %row_base, %k : index
+    %x = func.call @ggml_npu_load8_f32(%src, %src_span, %i) : (buffer, index, index) -> (vector<8xf32>)
+    scf.yield %x : vector<8xf32>
+  } else {
+    scf.yield %zero8 : vector<8xf32>
+  }
+  %a = vector.absf %v : vector<8xf32>
+  %part = vector.reduce<maxnumf> %a, %fzero : vector<8xf32>, f32
+  %amax = kernel.workgroup.reduce<maxnumf> %part : f32
+  %nonzero = scalar.cmpf ogt, %amax, %fzero : f32
+  %c127 = scalar.constant 127.0 : f32
+  %inv_raw = scalar.divf %c127, %amax : f32
+  %inv = scf.select %nonzero, %inv_raw, %fzero : f32
+  %scale = scalar.divf %amax, %c127 : f32
+  %inv8 = vector.splat %inv : vector<8xf32>
+  %lo8 = vector.splatf -127.0 : vector<8xf32>
+  %hi8 = vector.splatf 127.0 : vector<8xf32>
+
+  %tile_row = index.div %row, %c64 : index
+  %row_in_tile = index.rem %row, %c64 : index
+  %row_frag = index.div %row_in_tile, %c8 : index
+  %row_lane = index.rem %row, %c8 : index
+  %tile_base = index.mul %tile_row, %c64 : index
+  %tile_base_k = index.mul %tile_base, %k_size : index
+  %frag_base = index.mul %row_frag, %c1024 : index
+  %lane_base = index.mul %row_lane, %c8 : index
+  %dst_row0 = index.add %tile_base_k, %frag_base : index
+  %dst_row = index.add %dst_row0, %lane_base : index
+  scf.if %active {
+    %y = vector.mulf %v, %inv8 : vector<8xf32>
+    %r = vector.roundevenf %y : vector<8xf32>
+    %c = vector.clampf<number> %r, %lo8, %hi8 : vector<8xf32>
+    %q32 = vector.fptosi %c : vector<8xf32> to vector<8xi32>
+    %q = vector.trunci %q32 : vector<8xi32> to vector<8xi8>
+    %panel = index.div %item, %c16 : index
+    %k_frag = index.rem %item, %c16 : index
+    %panel_off = index.mul %panel, %c8192 : index
+    %frag_off = index.mul %k_frag, %c64 : index
+    %o0 = index.add %dst_row, %panel_off : index
+    %o = index.add %o0, %frag_off : index
+    func.call @ggml_npu_store8_i8(%dst, %dst_span, %o, %q) : (buffer, index, index, vector<8xi8>) -> ()
+  }
+  %first = index.cmp eq, %item, %c0 : index
+  scf.if %first {
+    %scale_view = buffer.view %scales[%zero] : buffer -> view<[%rows]xf32>
+    %safe_row = index.rem %row, %rows : index
+    view.store %scale, %scale_view[%safe_row] : f32, view<[%rows]xf32>
+  }
+  kernel.return
+}
+
+// dst[m, n] = C[m, n] * sa[m] * sw[n] for m < rows and n < N. C has n_pad columns. One lane for each 8 columns of a row. Lanes 8j..8j+7 take
+// rows 8i..8i+7 of the same columns, so they read 256 contiguous bytes of C.
+kernel.def target(@ggml_wave64) export("ggml_npu_dequant") @ggml_npu_dequant(%lanes: index) {
+  %one = index.constant 1 : index
+  %wg_size = config.get @ggml.npu.wg_size : index
+  %round = index.sub %wg_size, %one : index
+  %n_round = index.add %lanes, %round : index
+  %groups = index.div %n_round, %wg_size : index
+  kernel.launch.config workgroups(%groups, %one, %one) workgroup_size(%wg_size, %one, %one) : index
+} launch(%lanes_in: index, %rows_in: index, %n_in: index, %n_pad_in: index, %d1_in: index, %dst_span_in: index, %c_span_in: index, %sw_span_in: index, %c: buffer, %sa: buffer, %sw: buffer, %dst: buffer, %factor: buffer) {
+  %lanes = index.assume %lanes_in [range(%lanes_in, 1, 2147483647)] : index
+  %rows = index.assume %rows_in [range(%rows_in, 1, 2147483647)] : index
+  %n_size = index.assume %n_in [range(%n_in, 8, 2147483520)] : index
+  %n_pad = index.assume %n_pad_in [range(%n_pad_in, 128, 2147483520)] : index
+  %d1 = index.assume %d1_in [range(%d1_in, 0, 2147483647)] : index
+  %dst_span = index.assume %dst_span_in [range(%dst_span_in, 8, 2147483647)] : index
+  %c_span = index.assume %c_span_in [range(%c_span_in, 16384, 2147483647)] : index
+  %sw_span = index.assume %sw_span_in [range(%sw_span_in, 128, 2147483647)] : index
+  %wg_size = config.get @ggml.npu.wg_size : index
+  %c8 = index.constant 8 : index
+  %c64 = index.constant 64 : index
+  %c128 = index.constant 128 : index
+  %c512 = index.constant 512 : index
+  %c4096 = index.constant 4096 : index
+  %c8192 = index.constant 8192 : index
+  %zero = index.constant 0 : offset
+  %group = kernel.workgroup.id<x> : index
+  %item = kernel.workitem.id<x> : index
+  %base = index.mul %group, %wg_size : index
+  %t = index.add %base, %item : index
+  %in_range = index.cmp ult, %t, %lanes : index
+  %row_lane = index.rem %t, %c8 : index
+  %g = index.div %t, %c8 : index
+  %n_groups = index.div %n_size, %c8 : index
+  %m8 = index.div %g, %n_groups : index
+  %ng = index.rem %g, %n_groups : index
+  %m8_rows = index.mul %m8, %c8 : index
+  %m = index.add %m8_rows, %row_lane : index
+  %n = index.mul %ng, %c8 : index
+  %row_ok = index.cmp ult, %m, %rows : index
+  %live = scalar.andi %in_range, %row_ok : i1
+  scf.if %live {
+    %n_tiles = index.div %n_pad, %c128 : index
+    %tile_m = index.div %m, %c64 : index
+    %tile_n = index.div %n, %c128 : index
+    %tile0 = index.mul %tile_m, %n_tiles : index
+    %tile = index.add %tile0, %tile_n : index
+    %m_in = index.rem %m, %c64 : index
+    %n_in_tile = index.rem %n, %c128 : index
+    %n_half = index.div %n_in_tile, %c64 : index
+    %n_in_half = index.rem %n, %c64 : index
+    %m_frag = index.div %m_in, %c8 : index
+    %n_frag = index.div %n_in_half, %c8 : index
+    %t_off = index.mul %tile, %c8192 : index
+    %h_off = index.mul %n_half, %c4096 : index
+    %m_off = index.mul %m_frag, %c512 : index
+    %n_off = index.mul %n_frag, %c64 : index
+    %l_off = index.mul %row_lane, %c8 : index
+    %o0a = index.add %t_off, %h_off : index
+    %o0 = index.add %o0a, %m_off : index
+    %o1 = index.add %o0, %n_off : index
+    %ci = index.add %o1, %l_off : index
+    %sa_view = buffer.view %sa[%zero] : buffer -> view<[%rows]xf32>
+    %acc = func.call @ggml_npu_load8_i32(%c, %c_span, %ci) : (buffer, index, index) -> (vector<8xi32>)
+    %accf = vector.sitofp %acc : vector<8xi32> to vector<8xf32>
+    %a = view.load %sa_view[%m] : view<[%rows]xf32> -> f32
+    %a8 = vector.splat %a : vector<8xf32>
+    %w8 = func.call @ggml_npu_load8_f32(%sw, %sw_span, %n) : (buffer, index, index) -> (vector<8xf32>)
+    %ya = vector.mulf %accf, %a8 : vector<8xf32>
+    %y = vector.mulf %ya, %w8 : vector<8xf32>
+    %d0 = index.mul %m, %d1 : index
+    %d = index.add %d0, %n : index
+    %gate = config.get @ggml.npu.attn_gate : index
+    %one = index.constant 1 : index
+    %apply = index.cmp eq, %gate, %one : index
+    %result = scf.if %apply -> (vector<8xf32>) {
+      %f = func.call @ggml_npu_load8_f32(%factor, %dst_span, %d) : (buffer, index, index) -> (vector<8xf32>)
+      %sig = vector.logisticf %y : vector<8xf32>
+      %gated = vector.mulf %f, %sig : vector<8xf32>
+      scf.yield %gated : vector<8xf32>
+    } else {
+      scf.yield %y : vector<8xf32>
+    }
+    func.call @ggml_npu_store8_f32(%dst, %dst_span, %d, %result) : (buffer, index, index, vector<8xf32>) -> ()
+  }
+  kernel.return
+}

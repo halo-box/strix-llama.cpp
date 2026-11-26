@@ -1,0 +1,302 @@
+// argsort of f32 rows longer than one workgroup can hold. Strides are in elements.
+// A bitonic sort in workgroup memory sorts each block of the row, then merge passes join pairs of sorted runs. The
+// work buffer holds (key, index) pairs, row r at 2 * r * ne0 from an offset. Keys are unsigned and in the sort order,
+// and equal keys go by the index. Thus the sort is stable. -0 and +0 are equal.
+
+// 0 ascending, 1 descending.
+config.decl @ggml.argsort.order : %value: index where [range(%value, 0, 1)]
+// Values in a block, 2 for each lane.
+config.decl @ggml.argsort.block : %value: index where [range(%value, 128, 2048), power_of_two(%value)]
+// 1: the merge writes the indices to dst. 0: it writes pairs to the work buffer.
+config.decl @ggml.argsort.final : %value: index where [range(%value, 0, 1)]
+config.decl @ggml.argsort.wg_size : %value: index where [range(%value, 64, 1024), multiple_of(%value, 64)]
+
+target.decl @ggml_wave64
+
+// Unsigned key with the order of the f32 values, reversed for descending order.
+func.def inline @ggml_hrx_argsort_long_key(%x: f32, %desc: i1) -> (i32) {
+  %c0_f32 = scalar.constant 0.0 : f32
+  %c0_i32 = scalar.constant 0 : i32
+  %sign = scalar.constant -2147483648 : i32
+  %all = scalar.constant -1 : i32
+  %bits0 = scalar.bitcast %x : f32 to i32
+  %is_zero = scalar.cmpf oeq, %x, %c0_f32 : f32
+  %bits = scf.select %is_zero, %c0_i32, %bits0 : i32
+  %neg = scalar.cmpi slt, %bits, %c0_i32 : i32
+  %flipped = scalar.xori %bits, %all : i32
+  %set = scalar.ori %bits, %sign : i32
+  %asc = scf.select %neg, %flipped, %set : i32
+  %reversed = scalar.xori %asc, %all : i32
+  %key = scf.select %desc, %reversed, %asc : i32
+  func.return %key : i32
+}
+
+// True if pair (ka, ia) comes before pair (kb, ib).
+func.def inline @ggml_hrx_argsort_long_before(%ka: i32, %ia: i32, %kb: i32, %ib: i32) -> (i1) {
+  %lt = scalar.cmpi ult, %ka, %kb : i32
+  %eq = scalar.cmpi eq, %ka, %kb : i32
+  %ilt = scalar.cmpi slt, %ia, %ib : i32
+  %tie = scalar.andi %eq, %ilt : i1
+  %r = scalar.ori %lt, %tie : i1
+  func.return %r : i1
+}
+
+// One workgroup for each block of each row. Writes the sorted pairs of the block to the work buffer at out_off.
+kernel.def target(@ggml_wave64) export("ggml_argsort_block_f32") @ggml_argsort_block_f32(%groups: index) {
+  %one = index.constant 1 : index
+  %wg_size = config.get @ggml.argsort.wg_size : index
+  kernel.launch.config workgroups(%groups, %one, %one) workgroup_size(%wg_size, %one, %one) : index
+} launch(%ne0_in: index, %blocks_in: index, %ne1_in: index, %ne2_in: index, %s1_in: index, %s2_in: index, %s3_in: index, %src_span_in: index, %out_off_in: index, %work_span_in: index, %src: buffer, %work: buffer) {
+  // op_argsort checks these ranges. wg_size is block / 2.
+  %ne0 = index.assume %ne0_in [range(%ne0_in, 1, 1073741823)] : index
+  %blocks = index.assume %blocks_in [range(%blocks_in, 1, 2147483647)] : index
+  %ne1 = index.assume %ne1_in [range(%ne1_in, 1, 2147483647)] : index
+  %ne2 = index.assume %ne2_in [range(%ne2_in, 1, 2147483647)] : index
+  %s1 = index.assume %s1_in [range(%s1_in, 0, 2147483647)] : index
+  %s2 = index.assume %s2_in [range(%s2_in, 0, 2147483647)] : index
+  %s3 = index.assume %s3_in [range(%s3_in, 0, 2147483647)] : index
+  %src_span = index.assume %src_span_in [range(%src_span_in, 1, 2147483647)] : index
+  %out_off = index.assume %out_off_in [range(%out_off_in, 0, 2147483647)] : index
+  %work_span = index.assume %work_span_in [range(%work_span_in, 2, 2147483647)] : index
+  %order = config.get @ggml.argsort.order : index
+  %block = config.get @ggml.argsort.block : index
+  %wg_size = config.get @ggml.argsort.wg_size : index
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c4 = index.constant 4 : index
+  %zero = index.constant 0 : offset
+  %one_b = index.constant 1 : offset
+  %pad_key = scalar.constant -1 : i32
+  %pad_idx = scalar.constant 2147483647 : i32
+  %desc = index.cmp eq, %order, %c1 : index
+  %group = kernel.workgroup.id<x> : index
+  %item = kernel.workitem.id<x> : index
+
+  %bi = index.rem %group, %blocks : index
+  %row = index.div %group, %blocks : index
+  %i1 = index.rem %row, %ne1 : index
+  %t0 = index.div %row, %ne1 : index
+  %i2 = index.rem %t0, %ne2 : index
+  %i3 = index.div %t0, %ne2 : index
+  %so1 = index.mul %i1, %s1 : index
+  %so2 = index.mul %i2, %s2 : index
+  %so3 = index.mul %i3, %s3 : index
+  %so12 = index.add %so1, %so2 : index
+  %src_base = index.add %so12, %so3 : index
+  %first = index.mul %bi, %block : index
+  %row_pairs = index.mul %row, %ne0 : index
+
+  %bytes0 = index.mul %block, %c4 : index
+  %bytes = index.scale %bytes0, %one_b : index, offset -> offset
+  %keys_lds = buffer.alloca<workgroup> align(16) %bytes : buffer
+  %ids_lds = buffer.alloca<workgroup> align(16) %bytes : buffer
+  %keys = buffer.view %keys_lds[%zero] : buffer -> view<[%block]xi32>
+  %ids = buffer.view %ids_lds[%zero] : buffer -> view<[%block]xi32>
+  %src_view = buffer.view %src[%zero] : buffer -> view<[%src_span]xf32>
+  %work_view = buffer.view %work[%zero] : buffer -> view<[%work_span]xi32>
+  %src_top = index.sub %src_span, %c1 : index
+
+  // Values past the row get the last key and the largest index. They sort to the end.
+  scf.for %t = [%item to %block step %wg_size] {
+    %j = index.add %first, %t : index
+    %valid = index.cmp ult, %j, %ne0 : index
+    %raw = index.add %src_base, %j : index
+    %rc = index.min %raw, %src_top : index
+    %off = index.assume %rc [range(%rc, 0, 2147483646), le(%rc, %src_top)] : index
+    %x = view.load %src_view[%off] : view<[%src_span]xf32> -> f32
+    %k0 = func.call @ggml_hrx_argsort_long_key(%x, %desc) : (f32, i1) -> (i32)
+    %j_i32 = index.cast %j : index to i32
+    %k = scf.select %valid, %k0, %pad_key : i32
+    %i = scf.select %valid, %j_i32, %pad_idx : i32
+    view.store %k, %keys[%t] : i32, view<[%block]xi32>
+    view.store %i, %ids[%t] : i32, view<[%block]xi32>
+  }
+
+  // Bitonic network: size = 2, 4, ..., block; stride = size / 2, ..., 1. Each lane does one compare and swap.
+  %log_block0 = index.ctlzi %block : index
+  %log_block1 = index.ctlzi %c1 : index
+  %log_block = index.sub %log_block1, %log_block0 : index
+  %steps = index.add %log_block, %c1 : index
+  scf.for %p = [%c1 to %steps step %c1] {
+    %size = index.shli %c1, %p : index
+    scf.for %q = [%c0 to %p step %c1] {
+      %sh0 = index.sub %p, %q : index
+      %sh = index.sub %sh0, %c1 : index
+      %stride = index.shli %c1, %sh : index
+      kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+      %hi = index.div %item, %stride : index
+      %lo = index.rem %item, %stride : index
+      %hi2 = index.mul %hi, %stride : index
+      %hi4 = index.mul %hi2, %c2 : index
+      %a_raw = index.add %hi4, %lo : index
+      %b_raw = index.add %a_raw, %stride : index
+      %top = index.sub %block, %c1 : index
+      %ac = index.min %a_raw, %top : index
+      %bc = index.min %b_raw, %top : index
+      %a = index.assume %ac [range(%ac, 0, 2047), le(%ac, %top)] : index
+      %b = index.assume %bc [range(%bc, 0, 2047), le(%bc, %top)] : index
+      %ka = view.load %keys[%a] : view<[%block]xi32> -> i32
+      %ia = view.load %ids[%a] : view<[%block]xi32> -> i32
+      %kb = view.load %keys[%b] : view<[%block]xi32> -> i32
+      %ib = view.load %ids[%b] : view<[%block]xi32> -> i32
+      %dir_bits = index.andi %a_raw, %size : index
+      %up = index.cmp eq, %dir_bits, %c0 : index
+      %b_first = func.call @ggml_hrx_argsort_long_before(%kb, %ib, %ka, %ia) : (i32, i32, i32, i32) -> (i1)
+      %a_first = func.call @ggml_hrx_argsort_long_before(%ka, %ia, %kb, %ib) : (i32, i32, i32, i32) -> (i1)
+      %swap = scf.select %up, %b_first, %a_first : i1
+      scf.if %swap {
+        view.store %kb, %keys[%a] : i32, view<[%block]xi32>
+        view.store %ib, %ids[%a] : i32, view<[%block]xi32>
+        view.store %ka, %keys[%b] : i32, view<[%block]xi32>
+        view.store %ia, %ids[%b] : i32, view<[%block]xi32>
+      }
+    }
+  }
+  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+
+  scf.for %t = [%item to %block step %wg_size] {
+    %j = index.add %first, %t : index
+    %valid = index.cmp ult, %j, %ne0 : index
+    scf.if %valid {
+      %k = view.load %keys[%t] : view<[%block]xi32> -> i32
+      %i = view.load %ids[%t] : view<[%block]xi32> -> i32
+      %rj = index.add %row_pairs, %j : index
+      %rj2 = index.mul %rj, %c2 : index
+      %o_raw = index.add %out_off, %rj2 : index
+      %o = index.assume %o_raw [range(%o_raw, 0, 2147483645)] : index
+      %o1 = index.add %o, %c1 : index
+      %ok = index.cmp ult, %o1, %work_span : index
+      scf.if %ok {
+        view.store %k, %work_view[%o] : i32, view<[%work_span]xi32>
+        view.store %i, %work_view[%o1] : i32, view<[%work_span]xi32>
+      }
+    }
+  }
+  kernel.return
+}
+
+// Pair p of a row goes to its place in the merge of its run (length run) and the next or previous run. Its place is
+// its position in its run plus the count of pairs in the other run that come before it (binary search, steps rounds).
+kernel.def target(@ggml_wave64) export("ggml_argsort_merge_f32") @ggml_argsort_merge_f32(%groups: index) {
+  %one = index.constant 1 : index
+  %wg_size = config.get @ggml.argsort.wg_size : index
+  kernel.launch.config workgroups(%groups, %one, %one) workgroup_size(%wg_size, %one, %one) : index
+} launch(%n_in: index, %ne0_in: index, %ne1_in: index, %ne2_in: index, %run_in: index, %steps_in: index, %in_off_in: index, %out_off_in: index, %work_span_in: index, %d1_in: index, %d2_in: index, %d3_in: index, %dst_span_in: index, %work: buffer, %dst: buffer) {
+  // op_argsort checks these ranges.
+  %n = index.assume %n_in [range(%n_in, 1, 1073741823)] : index
+  %ne0 = index.assume %ne0_in [range(%ne0_in, 1, 1073741823)] : index
+  %ne1 = index.assume %ne1_in [range(%ne1_in, 1, 2147483647)] : index
+  %ne2 = index.assume %ne2_in [range(%ne2_in, 1, 2147483647)] : index
+  %run = index.assume %run_in [range(%run_in, 1, 1073741823)] : index
+  %steps = index.assume %steps_in [range(%steps_in, 1, 32)] : index
+  %in_off = index.assume %in_off_in [range(%in_off_in, 0, 2147483647)] : index
+  %out_off = index.assume %out_off_in [range(%out_off_in, 0, 2147483647)] : index
+  %work_span = index.assume %work_span_in [range(%work_span_in, 2, 2147483647)] : index
+  %d1 = index.assume %d1_in [range(%d1_in, 0, 2147483647)] : index
+  %d2 = index.assume %d2_in [range(%d2_in, 0, 2147483647)] : index
+  %d3 = index.assume %d3_in [range(%d3_in, 0, 2147483647)] : index
+  %dst_span = index.assume %dst_span_in [range(%dst_span_in, 1, 2147483647)] : index
+  %final_cfg = config.get @ggml.argsort.final : index
+  %wg_size = config.get @ggml.argsort.wg_size : index
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %zero = index.constant 0 : offset
+  %final = index.cmp eq, %final_cfg, %c1 : index
+  %group = kernel.workgroup.id<x> : index
+  %item = kernel.workitem.id<x> : index
+  %g0 = index.mul %group, %wg_size : index
+  %gid = index.add %g0, %item : index
+  %in_range = index.cmp ult, %gid, %n : index
+  %work_view = buffer.view %work[%zero] : buffer -> view<[%work_span]xi32>
+  %work_top = index.sub %work_span, %c2 : index
+
+  scf.if %in_range {
+    %row = index.div %gid, %ne0 : index
+    %p = index.rem %gid, %ne0 : index
+    %row_pairs = index.mul %row, %ne0 : index
+    %in_row0 = index.mul %row_pairs, %c2 : index
+    %in_row = index.add %in_off, %in_row0 : index
+
+    %p2 = index.mul %p, %c2 : index
+    %own_raw = index.add %in_row, %p2 : index
+    %own_c = index.min %own_raw, %work_top : index
+    %own = index.assume %own_c [range(%own_c, 0, 2147483645), le(%own_c, %work_top)] : index
+    %own1 = index.add %own, %c1 : index
+    %k = view.load %work_view[%own] : view<[%work_span]xi32> -> i32
+    %i = view.load %work_view[%own1] : view<[%work_span]xi32> -> i32
+
+    %q = index.div %p, %run : index
+    %start = index.mul %q, %run : index
+    %q_other = index.xori %q, %c1 : index
+    %o_start = index.mul %q_other, %run : index
+    %o_has = index.cmp ult, %o_start, %ne0 : index
+    %o_left0 = index.sub %ne0, %o_start : index
+    %o_left = scf.select %o_has, %o_left0, %c0 : index
+    %o_len = index.min %o_left, %run : index
+
+    // Count of pairs in the other run before this pair.
+    %count, %unused = scf.for %s = [%c0 to %steps step %c1](%lo = %c0 : index, %hi = %o_len : index) -> (index, index) {
+      // lo <= hi in each round.
+      %span0 = index.sub %hi, %lo : index
+      %span = index.assume %span0 [range(%span0, 0, 1073741823)] : index
+      %half = index.div %span, %c2 : index
+      %mid = index.add %lo, %half : index
+      %open = index.cmp ult, %lo, %hi : index
+      %m_pos = index.add %o_start, %mid : index
+      %m2 = index.mul %m_pos, %c2 : index
+      %m_raw = index.add %in_row, %m2 : index
+      %m_c = index.min %m_raw, %work_top : index
+      %m = index.assume %m_c [range(%m_c, 0, 2147483645), le(%m_c, %work_top)] : index
+      %m1 = index.add %m, %c1 : index
+      %km = view.load %work_view[%m] : view<[%work_span]xi32> -> i32
+      %im = view.load %work_view[%m1] : view<[%work_span]xi32> -> i32
+      %m_first = func.call @ggml_hrx_argsort_long_before(%km, %im, %k, %i) : (i32, i32, i32, i32) -> (i1)
+      %go_up = scalar.andi %open, %m_first : i1
+      %not_first = scalar.xori %m_first, %open : i1
+      %go_down = scalar.andi %open, %not_first : i1
+      %mid1 = index.add %mid, %c1 : index
+      %lo_next = scf.select %go_up, %mid1, %lo : index
+      %hi_next = scf.select %go_down, %mid, %hi : index
+      scf.yield %lo_next, %hi_next : index, index
+    }
+
+    %base = index.min %start, %o_start : index
+    %in_run = index.sub %p, %start : index
+    %pos0 = index.add %base, %in_run : index
+    %pos = index.add %pos0, %count : index
+
+    scf.if %final {
+      %i1 = index.rem %row, %ne1 : index
+      %t0 = index.div %row, %ne1 : index
+      %i2 = index.rem %t0, %ne2 : index
+      %i3 = index.div %t0, %ne2 : index
+      %do1 = index.mul %i1, %d1 : index
+      %do2 = index.mul %i2, %d2 : index
+      %do3 = index.mul %i3, %d3 : index
+      %do12 = index.add %do1, %do2 : index
+      %dst_base = index.add %do12, %do3 : index
+      %d_raw = index.add %dst_base, %pos : index
+      %d = index.assume %d_raw [range(%d_raw, 0, 2147483646)] : index
+      %ok = index.cmp ult, %d, %dst_span : index
+      scf.if %ok {
+        %dst_view = buffer.view %dst[%zero] : buffer -> view<[%dst_span]xi32>
+        view.store %i, %dst_view[%d] : i32, view<[%dst_span]xi32>
+      }
+    } else {
+      %pos2 = index.mul %pos, %c2 : index
+      %out_row0 = index.mul %row_pairs, %c2 : index
+      %out_row = index.add %out_off, %out_row0 : index
+      %w_raw = index.add %out_row, %pos2 : index
+      %w = index.assume %w_raw [range(%w_raw, 0, 2147483645)] : index
+      %w1 = index.add %w, %c1 : index
+      %ok = index.cmp ult, %w1, %work_span : index
+      scf.if %ok {
+        view.store %k, %work_view[%w] : i32, view<[%work_span]xi32>
+        view.store %i, %work_view[%w1] : i32, view<[%work_span]xi32>
+      }
+    }
+  }
+  kernel.return
+}

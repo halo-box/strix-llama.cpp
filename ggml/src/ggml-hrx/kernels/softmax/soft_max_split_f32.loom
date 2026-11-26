@@ -1,0 +1,223 @@
+// Softmax of long rows without a mask in two steps. Each workgroup takes one part of a row.
+// Step 1 writes the max and the sum of exp(x - max) of each part. Step 2 combines the parts of the row in part order
+// and writes exp(x - max) / sum for its part.
+
+config.decl @ggml.norm.wg_size : %value: index where [range(%value, 64, 1024), multiple_of(%value, 64)]
+
+target.decl @ggml_wave64
+
+func.def inline @ggml_hrx_sm_split_f32(%bits: index) -> (f32) {
+  %bits_i32 = index.cast %bits : index to i32
+  %vec = vector.from_elements %bits_i32 : vector<1xi32>
+  %fvec = vector.bitcast %vec : vector<1xi32> to vector<1xf32>
+  %value = vector.extract %fvec[0] : vector<1xf32> -> f32
+  func.return %value : f32
+}
+
+kernel.def target(@ggml_wave64) export("ggml_soft_max_f32_split_part") @ggml_soft_max_f32_split_part(%groups: index) {
+  %one = index.constant 1 : index
+  %wg_size = config.get @ggml.norm.wg_size : index
+  kernel.launch.config workgroups(%groups, %one, %one) workgroup_size(%wg_size, %one, %one) : index
+} launch(%groups_in: index, %n_parts_in: index, %chunk_in: index, %ne0_in: index, %ne1_in: index, %ne2_in: index, %s1_in: index, %s2_in: index, %s3_in: index, %src_span_in: index, %part_span_in: index, %scale_bits: index, %src: buffer, %part: buffer) {
+  // The caller checks these ranges.
+  %groups = index.assume %groups_in [range(%groups_in, 1, 2147483647)] : index
+  %n_parts = index.assume %n_parts_in [range(%n_parts_in, 1, 2147483647)] : index
+  %chunk = index.assume %chunk_in [range(%chunk_in, 1, 2147483647)] : index
+  %ne0 = index.assume %ne0_in [range(%ne0_in, 1, 2147483647)] : index
+  %ne1 = index.assume %ne1_in [range(%ne1_in, 1, 2147483647)] : index
+  %ne2 = index.assume %ne2_in [range(%ne2_in, 1, 2147483647)] : index
+  %s1 = index.assume %s1_in [range(%s1_in, 0, 2147483647)] : index
+  %s2 = index.assume %s2_in [range(%s2_in, 0, 2147483647)] : index
+  %s3 = index.assume %s3_in [range(%s3_in, 0, 2147483647)] : index
+  %src_span = index.assume %src_span_in [range(%src_span_in, 1, 2147483647)] : index
+  %part_span = index.assume %part_span_in [range(%part_span_in, 1, 2147483647)] : index
+  %wg_size = config.get @ggml.norm.wg_size : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %gid = kernel.workgroup.id<x> : index
+  %item = kernel.workitem.id<x> : index
+  %zero = index.constant 0 : offset
+  %src_view = buffer.view %src[%zero] : buffer -> view<[%src_span]xf32>
+  %part_view = buffer.view %part[%zero] : buffer -> view<[%part_span]xf32>
+
+  %row = index.div %gid, %n_parts : index
+  %p = index.rem %gid, %n_parts : index
+  %i1 = index.rem %row, %ne1 : index
+  %t0 = index.div %row, %ne1 : index
+  %i2 = index.rem %t0, %ne2 : index
+  %i3 = index.div %t0, %ne2 : index
+  %so1 = index.mul %i1, %s1 : index
+  %so2 = index.mul %i2, %s2 : index
+  %so3 = index.mul %i3, %s3 : index
+  %so12 = index.add %so1, %so2 : index
+  %src_base = index.add %so12, %so3 : index
+  %lo = index.mul %p, %chunk : index
+  %hi_raw = index.add %lo, %chunk : index
+  %hi = index.min %hi_raw, %ne0 : index
+  %first = index.add %lo, %item : index
+
+  %scale = func.call @ggml_hrx_sm_split_f32(%scale_bits) : (index) -> (f32)
+  %c0_f32 = scalar.constant 0.0 : f32
+  %lowest = scalar.constant -3.4028234663852886e+38 : f32
+
+  %partial_max = scf.for %c = [%first to %hi step %wg_size](%acc = %lowest : f32) -> (f32) {
+    %src_idx = index.add %src_base, %c : index
+    %src_off = index.assume %src_idx [range(%src_idx, 0, 2147483646)] : index
+    %src_ok = index.cmp ult, %src_off, %src_span : index
+    %next = scf.if %src_ok -> (f32) {
+      %x = view.load %src_view[%src_off] : view<[%src_span]xf32> -> f32
+      %xs = scalar.mulf %x, %scale : f32
+      %mx = scalar.maxnumf %acc, %xs : f32
+      scf.yield %mx : f32
+    } else {
+      scf.yield %acc : f32
+    }
+    scf.yield %next : f32
+  }
+  %part_max = kernel.workgroup.reduce<maxnumf> %partial_max : f32
+
+  %partial_sum = scf.for %c = [%first to %hi step %wg_size](%acc = %c0_f32 : f32) -> (f32) {
+    %src_idx = index.add %src_base, %c : index
+    %src_off = index.assume %src_idx [range(%src_idx, 0, 2147483646)] : index
+    %src_ok = index.cmp ult, %src_off, %src_span : index
+    %next = scf.if %src_ok -> (f32) {
+      %x = view.load %src_view[%src_off] : view<[%src_span]xf32> -> f32
+      %xs = scalar.mulf %x, %scale : f32
+      %shifted = scalar.subf %xs, %part_max : f32
+      %e = scalar.expf<afn> %shifted : f32
+      %sum = scalar.addf %acc, %e : f32
+      scf.yield %sum : f32
+    } else {
+      scf.yield %acc : f32
+    }
+    scf.yield %next : f32
+  }
+  %part_sum = kernel.workgroup.reduce<addf> %partial_sum : f32
+
+  %c0 = index.constant 0 : index
+  %is_first = index.cmp eq, %item, %c0 : index
+  scf.if %is_first {
+    %o_raw = index.mul %gid, %c2 : index
+    %o = index.assume %o_raw [range(%o_raw, 0, 2147483645)] : index
+    %o1 = index.add %o, %c1 : index
+    %o_ok = index.cmp ult, %o1, %part_span : index
+    scf.if %o_ok {
+      view.store %part_max, %part_view[%o] : f32, view<[%part_span]xf32>
+      view.store %part_sum, %part_view[%o1] : f32, view<[%part_span]xf32>
+    }
+  }
+  kernel.return
+}
+
+kernel.def target(@ggml_wave64) export("ggml_soft_max_f32_split_norm") @ggml_soft_max_f32_split_norm(%groups: index) {
+  %one = index.constant 1 : index
+  %wg_size = config.get @ggml.norm.wg_size : index
+  kernel.launch.config workgroups(%groups, %one, %one) workgroup_size(%wg_size, %one, %one) : index
+} launch(%groups_in: index, %n_parts_in: index, %chunk_in: index, %ne0_in: index, %ne1_in: index, %ne2_in: index, %s1_in: index, %s2_in: index, %s3_in: index, %src_span_in: index, %part_span_in: index, %d1_in: index, %d2_in: index, %d3_in: index, %dst_span_in: index, %scale_bits: index, %src: buffer, %part: buffer, %dst: buffer) {
+  // The caller checks these ranges.
+  %groups = index.assume %groups_in [range(%groups_in, 1, 2147483647)] : index
+  %n_parts = index.assume %n_parts_in [range(%n_parts_in, 1, 2147483647)] : index
+  %chunk = index.assume %chunk_in [range(%chunk_in, 1, 2147483647)] : index
+  %ne0 = index.assume %ne0_in [range(%ne0_in, 1, 2147483647)] : index
+  %ne1 = index.assume %ne1_in [range(%ne1_in, 1, 2147483647)] : index
+  %ne2 = index.assume %ne2_in [range(%ne2_in, 1, 2147483647)] : index
+  %s1 = index.assume %s1_in [range(%s1_in, 0, 2147483647)] : index
+  %s2 = index.assume %s2_in [range(%s2_in, 0, 2147483647)] : index
+  %s3 = index.assume %s3_in [range(%s3_in, 0, 2147483647)] : index
+  %src_span = index.assume %src_span_in [range(%src_span_in, 1, 2147483647)] : index
+  %part_span = index.assume %part_span_in [range(%part_span_in, 1, 2147483647)] : index
+  %d1 = index.assume %d1_in [range(%d1_in, 0, 2147483647)] : index
+  %d2 = index.assume %d2_in [range(%d2_in, 0, 2147483647)] : index
+  %d3 = index.assume %d3_in [range(%d3_in, 0, 2147483647)] : index
+  %dst_span = index.assume %dst_span_in [range(%dst_span_in, 1, 2147483647)] : index
+  %wg_size = config.get @ggml.norm.wg_size : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %gid = kernel.workgroup.id<x> : index
+  %item = kernel.workitem.id<x> : index
+  %zero = index.constant 0 : offset
+  %src_view = buffer.view %src[%zero] : buffer -> view<[%src_span]xf32>
+  %part_view = buffer.view %part[%zero] : buffer -> view<[%part_span]xf32>
+  %dst_view = buffer.view %dst[%zero] : buffer -> view<[%dst_span]xf32>
+
+  %row = index.div %gid, %n_parts : index
+  %p = index.rem %gid, %n_parts : index
+  %i1 = index.rem %row, %ne1 : index
+  %t0 = index.div %row, %ne1 : index
+  %i2 = index.rem %t0, %ne2 : index
+  %i3 = index.div %t0, %ne2 : index
+  %so1 = index.mul %i1, %s1 : index
+  %so2 = index.mul %i2, %s2 : index
+  %so3 = index.mul %i3, %s3 : index
+  %so12 = index.add %so1, %so2 : index
+  %src_base = index.add %so12, %so3 : index
+  %do1 = index.mul %i1, %d1 : index
+  %do2 = index.mul %i2, %d2 : index
+  %do3 = index.mul %i3, %d3 : index
+  %do12 = index.add %do1, %do2 : index
+  %dst_base = index.add %do12, %do3 : index
+  %lo = index.mul %p, %chunk : index
+  %hi_raw = index.add %lo, %chunk : index
+  %hi = index.min %hi_raw, %ne0 : index
+  %first = index.add %lo, %item : index
+
+  %scale = func.call @ggml_hrx_sm_split_f32(%scale_bits) : (index) -> (f32)
+  %c0_f32 = scalar.constant 0.0 : f32
+  %lowest = scalar.constant -3.4028234663852886e+38 : f32
+
+  // Every work item combines the parts of the row in the same order.
+  %p0_raw = index.mul %row, %n_parts : index
+  %p_end = index.add %p0_raw, %n_parts : index
+  %row_max = scf.for %q = [%p0_raw to %p_end step %c1](%acc = %lowest : f32) -> (f32) {
+    %o_raw = index.mul %q, %c2 : index
+    %o = index.assume %o_raw [range(%o_raw, 0, 2147483645)] : index
+    %o_ok = index.cmp ult, %o, %part_span : index
+    %next = scf.if %o_ok -> (f32) {
+      %m = view.load %part_view[%o] : view<[%part_span]xf32> -> f32
+      %mx = scalar.maxnumf %acc, %m : f32
+      scf.yield %mx : f32
+    } else {
+      scf.yield %acc : f32
+    }
+    scf.yield %next : f32
+  }
+  %row_sum = scf.for %q = [%p0_raw to %p_end step %c1](%acc = %c0_f32 : f32) -> (f32) {
+    %o_raw = index.mul %q, %c2 : index
+    %o = index.assume %o_raw [range(%o_raw, 0, 2147483645)] : index
+    %o1 = index.add %o, %c1 : index
+    %o_ok = index.cmp ult, %o1, %part_span : index
+    %next = scf.if %o_ok -> (f32) {
+      %m = view.load %part_view[%o] : view<[%part_span]xf32> -> f32
+      %s = view.load %part_view[%o1] : view<[%part_span]xf32> -> f32
+      %d = scalar.subf %m, %row_max : f32
+      %f = scalar.expf<afn> %d : f32
+      %add = scalar.fmaf %s, %f, %acc : f32
+      scf.yield %add : f32
+    } else {
+      scf.yield %acc : f32
+    }
+    scf.yield %next : f32
+  }
+  %c1_f32 = scalar.constant 1.0 : f32
+  %inv_sum = scalar.divf %c1_f32, %row_sum : f32
+
+  scf.for %c = [%first to %hi step %wg_size] {
+    %src_idx = index.add %src_base, %c : index
+    %src_off = index.assume %src_idx [range(%src_idx, 0, 2147483646)] : index
+    %dst_idx = index.add %dst_base, %c : index
+    %dst_off = index.assume %dst_idx [range(%dst_idx, 0, 2147483646)] : index
+    %src_ok = index.cmp ult, %src_off, %src_span : index
+    scf.if %src_ok {
+      %dst_ok = index.cmp ult, %dst_off, %dst_span : index
+      scf.if %dst_ok {
+        %x = view.load %src_view[%src_off] : view<[%src_span]xf32> -> f32
+        %xs = scalar.mulf %x, %scale : f32
+        %shifted = scalar.subf %xs, %row_max : f32
+        %e = scalar.expf<afn> %shifted : f32
+        %y = scalar.mulf %e, %inv_sum : f32
+        view.store %y, %dst_view[%dst_off] : f32, view<[%dst_span]xf32>
+      }
+    }
+  }
+  kernel.return
+}

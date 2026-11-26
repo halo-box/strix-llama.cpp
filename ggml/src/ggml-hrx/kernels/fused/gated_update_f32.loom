@@ -1,0 +1,477 @@
+// Gated update: y = x - tanh(Wf z) * x + tanh(Wg z) * m with z = Wd [rms_norm(x); rms_norm(m)].
+// x, m and y are rows of E values, with row strides in elements. Wd has 64 rows of 2E values (the x half first), Wf and
+// Wg have E rows of 64 values. The weights are F32 and contiguous. E is a multiple of 256.
+// The norms scale the dot products: z = rx * (Wd_x . x) + rm * (Wd_m . m). Each sum has a fixed order.
+// part: for token t and chunk p of 256 input values (P = E / 128 chunks, the x chunks first), the 64 dots at
+// (t * P + p) * 64 and the sum of squares at sq_off + t * P + p. z: the 64 values of token t at z_off + t * 64.
+
+// E / 256: the chunks of x, and of m.
+config.decl @ggml.gated.half_chunks : %value: index where [range(%value, 1, 65536)]
+// 1: the down lanes read x from global memory, for few tokens. 0: the tokens go through workgroup memory.
+config.decl @ggml.gated.down_direct : %value: index where [range(%value, 0, 1)]
+// Rows of one down workgroup and rows of one lane: 16 lanes for each down_rpl rows. 64 / down_rows workgroups for each chunk.
+config.decl @ggml.gated.down_rows : %value: index where [range(%value, 16, 64), multiple_of(%value, 16)]
+config.decl @ggml.gated.down_rpl : %value: index where [range(%value, 1, 4)]
+// Tokens of one workgroup of the down and apply kernels.
+config.decl @ggml.gated.down_tokens : %value: index where [range(%value, 1, 1024)]
+config.decl @ggml.gated.apply_tokens : %value: index where [range(%value, 1, 64)]
+// Rows of one apply workgroup, one row for each lane.
+config.decl @ggml.gated.apply_rows : %value: index where [range(%value, 32, 256), multiple_of(%value, 32)]
+// 1: the apply kernel adds the partial sums itself. 0: it reads z.
+config.decl @ggml.gated.apply_parts : %value: index where [range(%value, 0, 1)]
+
+target.decl @ggml_wave32
+
+func.def inline @ggml_hrx_gated_param(%bits: index) -> (f32) {
+  %bits_i32 = index.cast %bits : index to i32
+  %vec = vector.from_elements %bits_i32 : vector<1xi32>
+  %fvec = vector.bitcast %vec : vector<1xi32> to vector<1xf32>
+  %value = vector.extract %fvec[0] : vector<1xf32> -> f32
+  func.return %value : f32
+}
+
+func.def inline @ggml_hrx_gated_load(%buf: buffer, %elem: index) -> (f32) {
+  %four = index.constant 4 : offset
+  %bytes = index.scale %elem, %four : index, offset -> offset
+  %view = buffer.view %buf[%bytes] : buffer -> view<1xf32>
+  %v = view.load %view[0] : view<1xf32> -> f32
+  func.return %v : f32
+}
+
+func.def inline @ggml_hrx_gated_store(%buf: buffer, %elem: index, %v: f32) {
+  %four = index.constant 4 : offset
+  %bytes = index.scale %elem, %four : index, offset -> offset
+  %view = buffer.view %buf[%bytes] : buffer -> view<1xf32>
+  view.store %v, %view[0] : f32, view<1xf32>
+  func.return
+}
+
+// Cephes tanhf, as the TANH kernel (elementwise/unary_f32.loom).
+func.def inline @ggml_hrx_gated_tanh(%x: f32) -> (f32) {
+  %one = scalar.constant 1.0 : f32
+  %two = scalar.constant 2.0 : f32
+  %small_max = scalar.constant 0.625 : f32
+  %k4 = scalar.constant -0.00570498872745 : f32
+  %k3 = scalar.constant 0.0206390887954 : f32
+  %k2 = scalar.constant -0.0537397155531 : f32
+  %k1 = scalar.constant 0.133314422036 : f32
+  %k0 = scalar.constant -0.333332819422 : f32
+  %ax = scalar.absf %x : f32
+  %ax2 = scalar.addf %ax, %ax : f32
+  %e = scalar.expf<afn> %ax2 : f32
+  %e1 = scalar.addf %e, %one : f32
+  %q = scalar.divf %two, %e1 : f32
+  %big_abs = scalar.subf %one, %q : f32
+  %big = scalar.copysignf %big_abs, %x : f32
+  %s = scalar.mulf %x, %x : f32
+  %p3 = scalar.fmaf %k4, %s, %k3 : f32
+  %p2 = scalar.fmaf %p3, %s, %k2 : f32
+  %p1 = scalar.fmaf %p2, %s, %k1 : f32
+  %p0 = scalar.fmaf %p1, %s, %k0 : f32
+  %ps = scalar.mulf %p0, %s : f32
+  %small = scalar.fmaf %ps, %x, %x : f32
+  %is_small = scalar.cmpf olt, %ax, %small_max : f32
+  %r = scf.select %is_small, %small, %big : f32
+  func.return %r : f32
+}
+
+// 1 / sqrt(sum / E + eps), as the RMS_NORM kernel.
+func.def inline @ggml_hrx_gated_rnorm(%sum: f32, %e_f: f32, %eps: f32) -> (f32) {
+  %one = scalar.constant 1.0 : f32
+  %mean = scalar.divf %sum, %e_f : f32
+  %biased = scalar.addf %mean, %eps : f32
+  %root = scalar.sqrtf %biased : f32
+  %r = scalar.divf %one, %root : f32
+  func.return %r : f32
+}
+
+// Sums of the partial dots of row r and of the squares of chunks [p0, p0 + n) of token t, in chunk order. The loads go first.
+func.def inline @ggml_hrx_gated_sums(%part: buffer, %sq_off: index, %base: index, %p0: index, %r: index) -> (f32, f32) {
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c64 = index.constant 64 : index
+  %f0 = scalar.constant 0.0 : f32
+  %n = config.get @ggml.gated.half_chunks : index
+  %s, %q = scf.for %p = [%c0 to %n step %c1](%a = %f0 : f32, %b = %f0 : f32) -> (f32, f32) unroll {
+    %pc0 = index.add %base, %p0 : index
+    %pc = index.add %pc0, %p : index
+    %pi = index.madd %pc, %c64, %r : index
+    %v = func.call @ggml_hrx_gated_load(%part, %pi) : (buffer, index) -> (f32)
+    %si = index.add %sq_off, %pc : index
+    %w = func.call @ggml_hrx_gated_load(%part, %si) : (buffer, index) -> (f32)
+    %an = scalar.addf %a, %v : f32
+    %bn = scalar.addf %b, %w : f32
+    scf.yield %an, %bn : f32, f32
+  }
+  func.return %s, %q : f32, f32
+}
+
+// z value r of token t: the partial dots and sums of squares of the chunks in chunk order.
+func.def inline @ggml_hrx_gated_z(%part: buffer, %sq_off: index, %t: index, %r: index, %e_f: f32, %eps_x: f32, %eps_m: f32) -> (f32) {
+  %c0 = index.constant 0 : index
+  %px = config.get @ggml.gated.half_chunks : index
+  %n_chunks = index.add %px, %px : index
+  %base = index.mul %t, %n_chunks : index
+  %sx, %qx = func.call @ggml_hrx_gated_sums(%part, %sq_off, %base, %c0, %r) : (buffer, index, index, index, index) -> (f32, f32)
+  %sm, %qm = func.call @ggml_hrx_gated_sums(%part, %sq_off, %base, %px, %r) : (buffer, index, index, index, index) -> (f32, f32)
+  %rx = func.call @ggml_hrx_gated_rnorm(%qx, %e_f, %eps_x) : (f32, f32, f32) -> (f32)
+  %rm = func.call @ggml_hrx_gated_rnorm(%qm, %e_f, %eps_m) : (f32, f32, f32) -> (f32)
+  %zx = scalar.mulf %sx, %rx : f32
+  %zm = scalar.mulf %sm, %rm : f32
+  %z = scalar.addf %zx, %zm : f32
+  func.return %z : f32
+}
+
+// Dots of lane (g, s) for one token: rows rpl g to rpl g + rpl - 1, the vectors 16 q + s of the chunk (q < 4). Each row
+// adds the 4 vectors in q order, then the 16 lanes of the row. The rows of a lane do not change the sums. The first wave also
+// adds the squares of the chunk. Writes the partial results of chunk pc of the token.
+func.def inline @ggml_hrx_gated_down_token(%nb: index, %rpl: index, %bank: vector<[%nb]x4xf32>, %xs: vector<4x4xf32>, %part: buffer, %sq_off: index, %pc: index, %g: index, %writer: i1, %sq_wave: i1, %sq_writer: i1) {
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c4 = index.constant 4 : index
+  %c64 = index.constant 64 : index
+  %f0 = scalar.constant 0.0 : f32
+  %zero4 = vector.splatf 0.0 : vector<4xf32>
+  %zero_d = vector.splatf 0.0 : vector<[%rpl]xf32>
+  %dots = scf.for %i = [%c0 to %rpl step %c1](%d = %zero_d : vector<[%rpl]xf32>) -> (vector<[%rpl]xf32>) unroll {
+    %acc = scf.for %q = [%c0 to %c4 step %c1](%a = %zero4 : vector<4xf32>) -> (vector<4xf32>) unroll {
+      %bi = index.madd %i, %c4, %q : index
+      %x4 = vector.extract %xs[%q] : vector<4x4xf32> -> vector<4xf32>
+      %w4 = vector.extract %bank[%bi] : vector<[%nb]x4xf32> -> vector<4xf32>
+      %s = vector.fmaf %w4, %x4, %a : vector<4xf32>
+      scf.yield %s : vector<4xf32>
+    }
+    %lane = vector.reduce<addf> %acc, %f0 : vector<4xf32>, f32
+    %dot = kernel.subgroup.reduce<addf> %lane {cluster_size = 16} : f32
+    %dn = vector.insert %dot into %d[%i] : f32, vector<[%rpl]xf32>
+    scf.yield %dn : vector<[%rpl]xf32>
+  }
+  scf.if %writer {
+    %pr = index.mul %pc, %c64 : index
+    %r0 = index.mul %g, %rpl : index
+    %pi = index.add %pr, %r0 : index
+    %four = index.constant 4 : offset
+    %bytes = index.scale %pi, %four : index, offset -> offset
+    %view = buffer.view %part[%bytes] : buffer -> view<[%rpl]xf32>
+    vector.store %dots, %view[%c0] : vector<[%rpl]xf32>, view<[%rpl]xf32>
+  }
+  scf.if %sq_wave {
+    %sacc = scf.for %q = [%c0 to %c4 step %c1](%a = %zero4 : vector<4xf32>) -> (vector<4xf32>) unroll {
+      %x4 = vector.extract %xs[%q] : vector<4x4xf32> -> vector<4xf32>
+      %s = vector.fmaf %x4, %x4, %a : vector<4xf32>
+      scf.yield %s : vector<4xf32>
+    }
+    %slane = vector.reduce<addf> %sacc, %f0 : vector<4xf32>, f32
+    %sq = kernel.subgroup.reduce<addf> %slane {cluster_size = 16} : f32
+    scf.if %sq_writer {
+      %si = index.add %sq_off, %pc : index
+      func.call @ggml_hrx_gated_store(%part, %si, %sq) : (buffer, index, f32)
+    }
+  }
+  func.return
+}
+
+// The x values of lane s for one token: vectors 16 q + s of the chunk in view xv.
+func.def inline @ggml_hrx_gated_xs(%xv: view<256xf32>, %s: index) -> (vector<4x4xf32>) {
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c4 = index.constant 4 : index
+  %c16 = index.constant 16 : index
+  %zero = vector.splatf 0.0 : vector<4x4xf32>
+  %xs = scf.for %q = [%c0 to %c4 step %c1](%b = %zero : vector<4x4xf32>) -> (vector<4x4xf32>) unroll {
+    %v = index.madd %q, %c16, %s : index
+    %ei = index.mul %v, %c4 : index
+    %x4 = vector.load %xv[%ei] : view<256xf32> -> vector<4xf32>
+    %bn = vector.insert %x4 into %b[%q] : vector<4xf32>, vector<4x4xf32>
+    scf.yield %bn : vector<4x4xf32>
+  }
+  func.return %xs : vector<4x4xf32>
+}
+
+// One workgroup: chunk p (x), down_rows rows and down_tokens tokens (y). Lane (g, s) keeps the weights of its rows for the
+// vectors 16 q + s of the chunk in registers. The workgroups of the first rows also add the squares.
+kernel.def target(@ggml_wave32) export("ggml_gated_update_down") @ggml_gated_update_down(%n_chunks: index, %n_t: index) {
+  %one = index.constant 1 : index
+  %c16 = index.constant 16 : index
+  %c64 = index.constant 64 : index
+  %rows = config.get @ggml.gated.down_rows : index
+  %rpl = config.get @ggml.gated.down_rpl : index
+  %lane_rows = index.div %rows, %rpl : index
+  %wg_size = index.mul %lane_rows, %c16 : index
+  %row_groups = index.div %c64, %rows : index
+  %tokens = config.get @ggml.gated.down_tokens : index
+  %round = index.sub %tokens, %one : index
+  %n_round = index.add %n_t, %round : index
+  %tiles = index.div %n_round, %tokens : index
+  %ys = index.mul %tiles, %row_groups : index
+  kernel.launch.config workgroups(%n_chunks, %ys, %one) workgroup_size(%wg_size, %one, %one) : index
+} launch(%e_in: index, %n_t_in: index, %x_s1_in: index, %m_s1_in: index, %sq_off_in: index, %x: buffer, %m: buffer, %w: buffer, %part: buffer) {
+  // The caller checks these ranges.
+  %e = index.assume %e_in [range(%e_in, 256, 16777216)] : index
+  %n_t = index.assume %n_t_in [range(%n_t_in, 1, 2147483647)] : index
+  %x_s1 = index.assume %x_s1_in [range(%x_s1_in, 0, 2147483647)] : index
+  %m_s1 = index.assume %m_s1_in [range(%m_s1_in, 0, 2147483647)] : index
+  %sq_off = index.assume %sq_off_in [range(%sq_off_in, 0, 2147483647)] : index
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c4 = index.constant 4 : index
+  %c16 = index.constant 16 : index
+  %c32 = index.constant 32 : index
+  %c64 = index.constant 64 : index
+  %c256 = index.constant 256 : index
+  %zero = index.constant 0 : offset
+  %four = index.constant 4 : offset
+  %rows = config.get @ggml.gated.down_rows : index
+  %rpl = config.get @ggml.gated.down_rpl : index
+  %nb = index.mul %rpl, %c4 : index
+  %zero_bank = vector.splatf 0.0 : vector<[%nb]x4xf32>
+  %tokens = config.get @ggml.gated.down_tokens : index
+  %direct_cfg = config.get @ggml.gated.down_direct : index
+  %direct = index.cmp ne, %direct_cfg, %c0 : index
+  %lane_rows = index.div %rows, %rpl : index
+  %wg_size = index.mul %lane_rows, %c16 : index
+  %row_groups = index.div %c64, %rows : index
+  %p = kernel.workgroup.id<x> : index
+  %y_id = kernel.workgroup.id<y> : index
+  %tile = index.div %y_id, %row_groups : index
+  %row_group = index.rem %y_id, %row_groups : index
+  %tid_raw = kernel.workitem.id<x> : index
+  %tid = index.assume %tid_raw [range(%tid_raw, 0, 255)] : index
+  %g_local = index.div %tid, %c16 : index
+  %g = index.madd %row_group, %lane_rows, %g_local : index
+  %sl = index.rem %tid, %c16 : index
+  %px = config.get @ggml.gated.half_chunks : index
+  %n_chunks = index.add %px, %px : index
+  %in_x = index.cmp ult, %p, %px : index
+  %p_base = scf.select %in_x, %c0, %px : index
+  %p_local = index.sub %p, %p_base : index
+  %k0 = index.mul %p_local, %c256 : index
+  %s1 = scf.select %in_x, %x_s1, %m_s1 : index
+  %src = scf.select %in_x, %x, %m : buffer
+
+  %two_e = index.add %e, %e : index
+  %w_col = index.mul %p, %c256 : index
+  %r_first = index.mul %g, %rpl : index
+  %bank = scf.for %bi = [%c0 to %nb step %c1](%b = %zero_bank : vector<[%nb]x4xf32>) -> (vector<[%nb]x4xf32>) unroll {
+    %i = index.div %bi, %c4 : index
+    %q = index.rem %bi, %c4 : index
+    %r = index.add %r_first, %i : index
+    %w_row = index.mul %r, %two_e : index
+    %w_base = index.add %w_row, %w_col : index
+    %w_bytes = index.scale %w_base, %four : index, offset -> offset
+    %w_view = buffer.view %w[%w_bytes] : buffer -> view<256xf32>
+    %v = index.madd %q, %c16, %sl : index
+    %ei = index.mul %v, %c4 : index
+    %w4 = vector.load %w_view[%ei] : view<256xf32> -> vector<4xf32>
+    %bn = vector.insert %w4 into %b[%bi] : vector<4xf32>, vector<[%nb]x4xf32>
+    scf.yield %bn : vector<[%nb]x4xf32>
+  }
+
+  %first = index.mul %tile, %tokens : index
+  %rest = index.sub %n_t, %first : index
+  %count = index.min %rest, %tokens : index
+  // The first wave of the first rows also adds the squares. The branch is uniform in each wave.
+  %first_rows = index.cmp eq, %row_group, %c0 : index
+  %wave0 = index.cmp ult, %tid, %c32 : index
+  %sq_wave = scalar.andi %first_rows, %wave0 : i1
+  %writer = index.cmp eq, %sl, %c0 : index
+  %g0 = index.cmp eq, %g, %c0 : index
+  %sq_writer = scalar.andi %writer, %g0 : i1
+  scf.if %direct {
+    scf.for %ti = [%c0 to %count step %c1] {
+      %tok = index.add %first, %ti : index
+      %row = index.mul %tok, %s1 : index
+      %xe = index.add %row, %k0 : index
+      %xb = index.scale %xe, %four : index, offset -> offset
+      %xv = buffer.view %src[%xb] : buffer -> view<256xf32>
+      %xs = func.call @ggml_hrx_gated_xs(%xv, %sl) : (view<256xf32>, index) -> (vector<4x4xf32>)
+      %pc0 = index.mul %tok, %n_chunks : index
+      %pc = index.add %pc0, %p : index
+      func.call @ggml_hrx_gated_down_token(%nb, %rpl, %bank, %xs, %part, %sq_off, %pc, %g, %writer, %sq_wave, %sq_writer) : (index, index, vector<[%nb]x4xf32>, vector<4x4xf32>, buffer, index, index, index, i1, i1, i1)
+    }
+  } else {
+    // 16 tokens at a time go through workgroup memory. Lane t loads vector t % 64 of token t / 64 of the round, then the
+    // next ones a workgroup further.
+    %lds_bytes = index.constant 16384 : offset
+    %lds = buffer.alloca<workgroup> align(16) %lds_bytes : buffer
+    %stage = buffer.view %lds[%zero] : buffer -> view<16x256xf32>
+    %s_tok = index.div %tid, %c64 : index
+    %s_vec = index.rem %tid, %c64 : index
+    %s_elem = index.mul %s_vec, %c4 : index
+    %s_step = index.div %wg_size, %c64 : index
+    scf.for %round = [%c0 to %count step %c16] {
+      %left = index.sub %count, %round : index
+      %n_in = index.min %left, %c16 : index
+      scf.for %tb0 = [%s_tok to %n_in step %s_step] {
+        %tb = index.assume %tb0 [range(%tb0, 0, 15)] : index
+        %tok = index.add %first, %round : index
+        %tok_t = index.add %tok, %tb : index
+        %row = index.mul %tok_t, %s1 : index
+        %xe = index.add %row, %k0 : index
+        %xb = index.scale %xe, %four : index, offset -> offset
+        %xv = buffer.view %src[%xb] : buffer -> view<256xf32>
+        %x4 = vector.load %xv[%s_elem] : view<256xf32> -> vector<4xf32>
+        vector.store %x4, %stage[%tb, %s_elem] : vector<4xf32>, view<16x256xf32>
+      }
+      kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+      scf.for %tb0 = [%c0 to %n_in step %c1] {
+        %tb = index.assume %tb0 [range(%tb0, 0, 15)] : index
+        %tb_off = index.mul %tb, %c256 : index
+        %tb_bytes = index.scale %tb_off, %four : index, offset -> offset
+        %row_view = buffer.view %lds[%tb_bytes] : buffer -> view<256xf32>
+        %xs = func.call @ggml_hrx_gated_xs(%row_view, %sl) : (view<256xf32>, index) -> (vector<4x4xf32>)
+        %ti = index.add %round, %tb : index
+        %tok = index.add %first, %ti : index
+        %pc0 = index.mul %tok, %n_chunks : index
+        %pc = index.add %pc0, %p : index
+        func.call @ggml_hrx_gated_down_token(%nb, %rpl, %bank, %xs, %part, %sq_off, %pc, %g, %writer, %sq_wave, %sq_writer) : (index, index, vector<[%nb]x4xf32>, vector<4x4xf32>, buffer, index, index, index, i1, i1, i1)
+      }
+      kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+    }
+  }
+  kernel.return
+}
+
+// z of all tokens, one workgroup for each token and one lane for each value.
+kernel.def target(@ggml_wave32) export("ggml_gated_update_z") @ggml_gated_update_z(%n_t: index) {
+  %one = index.constant 1 : index
+  %wg_size = index.constant 64 : index
+  kernel.launch.config workgroups(%n_t, %one, %one) workgroup_size(%wg_size, %one, %one) : index
+} launch(%e_in: index, %sq_off_in: index, %z_off_in: index, %e_bits: index, %eps_x_bits: index, %eps_m_bits: index, %part: buffer) {
+  %e = index.assume %e_in [range(%e_in, 256, 16777216)] : index
+  %sq_off = index.assume %sq_off_in [range(%sq_off_in, 0, 2147483647)] : index
+  %z_off = index.assume %z_off_in [range(%z_off_in, 0, 2147483647)] : index
+  %c64 = index.constant 64 : index
+  %e_f = func.call @ggml_hrx_gated_param(%e_bits) : (index) -> (f32)
+  %eps_x = func.call @ggml_hrx_gated_param(%eps_x_bits) : (index) -> (f32)
+  %eps_m = func.call @ggml_hrx_gated_param(%eps_m_bits) : (index) -> (f32)
+  %t = kernel.workgroup.id<x> : index
+  %r_raw = kernel.workitem.id<x> : index
+  %r = index.assume %r_raw [range(%r_raw, 0, 63)] : index
+  %z = func.call @ggml_hrx_gated_z(%part, %sq_off, %t, %r, %e_f, %eps_x, %eps_m) : (buffer, index, index, index, f32, f32, f32) -> (f32)
+  %zi0 = index.madd %t, %c64, %r : index
+  %zi = index.add %z_off, %zi0 : index
+  func.call @ggml_hrx_gated_store(%part, %zi, %z) : (buffer, index, f32)
+  kernel.return
+}
+
+// Gates and update of one row and one token. z of the token is row tb of the stage.
+func.def inline @ggml_hrx_gated_row(%n_tok: index, %stage: view<[%n_tok]x64xf32>, %tb: index, %bank_f: vector<16x4xf32>, %bank_g: vector<16x4xf32>, %xe: f32, %me: f32) -> (f32) {
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c4 = index.constant 4 : index
+  %c16 = index.constant 16 : index
+  %f0 = scalar.constant 0.0 : f32
+  %zero4 = vector.splatf 0.0 : vector<4xf32>
+  %af, %ag = scf.for %j = [%c0 to %c16 step %c1](%pf = %zero4 : vector<4xf32>, %pg = %zero4 : vector<4xf32>) -> (vector<4xf32>, vector<4xf32>) unroll {
+    %e = index.mul %j, %c4 : index
+    %z4 = vector.load %stage[%tb, %e] : view<[%n_tok]x64xf32> -> vector<4xf32>
+    %wf = vector.extract %bank_f[%j] : vector<16x4xf32> -> vector<4xf32>
+    %wg = vector.extract %bank_g[%j] : vector<16x4xf32> -> vector<4xf32>
+    %nf = vector.fmaf %wf, %z4, %pf : vector<4xf32>
+    %ng = vector.fmaf %wg, %z4, %pg : vector<4xf32>
+    scf.yield %nf, %ng : vector<4xf32>, vector<4xf32>
+  }
+  %fs = vector.reduce<addf> %af, %f0 : vector<4xf32>, f32
+  %gs = vector.reduce<addf> %ag, %f0 : vector<4xf32>, f32
+  %ft = func.call @ggml_hrx_gated_tanh(%fs) : (f32) -> (f32)
+  %gt = func.call @ggml_hrx_gated_tanh(%gs) : (f32) -> (f32)
+  // The same ops as the unfused graph: MUL, SUB, MUL, ADD.
+  %fx = scalar.mulf %ft, %xe : f32
+  %d = scalar.subf %xe, %fx : f32
+  %gm = scalar.mulf %gt, %me : f32
+  %y = scalar.addf %d, %gm : f32
+  func.return %y : f32
+}
+
+// One workgroup: apply_rows rows (x) of apply_tokens tokens (y). Lane o keeps the weight rows of row o of Wf and Wg in
+// registers. The z values of the tokens are in workgroup memory. Loads and stores go along the rows.
+kernel.def target(@ggml_wave32) export("ggml_gated_update_apply") @ggml_gated_update_apply(%e: index, %n_t: index) {
+  %one = index.constant 1 : index
+  %rows = config.get @ggml.gated.apply_rows : index
+  %tokens = config.get @ggml.gated.apply_tokens : index
+  %groups = index.div %e, %rows : index
+  %round = index.sub %tokens, %one : index
+  %n_round = index.add %n_t, %round : index
+  %tiles = index.div %n_round, %tokens : index
+  kernel.launch.config workgroups(%groups, %tiles, %one) workgroup_size(%rows, %one, %one) : index
+} launch(%e_in: index, %n_t_in: index, %x_s1_in: index, %m_s1_in: index, %y_s1_in: index, %sq_off_in: index, %z_off_in: index, %e_bits: index, %eps_x_bits: index, %eps_m_bits: index, %x: buffer, %m: buffer, %wf: buffer, %wg: buffer, %part: buffer, %y: buffer) {
+  %e = index.assume %e_in [range(%e_in, 256, 16777216)] : index
+  %n_t = index.assume %n_t_in [range(%n_t_in, 1, 2147483647)] : index
+  %x_s1 = index.assume %x_s1_in [range(%x_s1_in, 0, 2147483647)] : index
+  %m_s1 = index.assume %m_s1_in [range(%m_s1_in, 0, 2147483647)] : index
+  %y_s1 = index.assume %y_s1_in [range(%y_s1_in, 0, 2147483647)] : index
+  %sq_off = index.assume %sq_off_in [range(%sq_off_in, 0, 2147483647)] : index
+  %z_off = index.assume %z_off_in [range(%z_off_in, 0, 2147483647)] : index
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c4 = index.constant 4 : index
+  %c16 = index.constant 16 : index
+  %c64 = index.constant 64 : index
+  %zero = index.constant 0 : offset
+  %four = index.constant 4 : offset
+  %one_b = index.constant 1 : offset
+  %zero_bank = vector.splatf 0.0 : vector<16x4xf32>
+  %e_f = func.call @ggml_hrx_gated_param(%e_bits) : (index) -> (f32)
+  %eps_x = func.call @ggml_hrx_gated_param(%eps_x_bits) : (index) -> (f32)
+  %eps_m = func.call @ggml_hrx_gated_param(%eps_m_bits) : (index) -> (f32)
+  %rows = config.get @ggml.gated.apply_rows : index
+  %tokens = config.get @ggml.gated.apply_tokens : index
+  %parts = config.get @ggml.gated.apply_parts : index
+  %use_parts = index.cmp ne, %parts, %c0 : index
+  %group = kernel.workgroup.id<x> : index
+  %tile = kernel.workgroup.id<y> : index
+  %tid_raw = kernel.workitem.id<x> : index
+  %tid = index.assume %tid_raw [range(%tid_raw, 0, 255)] : index
+  %o = index.madd %group, %rows, %tid : index
+  %w_base = index.mul %o, %c64 : index
+  %w_bytes = index.scale %w_base, %four : index, offset -> offset
+  %wf_view = buffer.view %wf[%w_bytes] : buffer -> view<64xf32>
+  %wg_view = buffer.view %wg[%w_bytes] : buffer -> view<64xf32>
+  %bank_f, %bank_g = scf.for %j = [%c0 to %c16 step %c1](%bf = %zero_bank : vector<16x4xf32>, %bg = %zero_bank : vector<16x4xf32>) -> (vector<16x4xf32>, vector<16x4xf32>) unroll {
+    %ei = index.mul %j, %c4 : index
+    %f4 = vector.load %wf_view[%ei] : view<64xf32> -> vector<4xf32>
+    %g4 = vector.load %wg_view[%ei] : view<64xf32> -> vector<4xf32>
+    %bfn = vector.insert %f4 into %bf[%j] : vector<4xf32>, vector<16x4xf32>
+    %bgn = vector.insert %g4 into %bg[%j] : vector<4xf32>, vector<16x4xf32>
+    scf.yield %bfn, %bgn : vector<16x4xf32>, vector<16x4xf32>
+  }
+
+  %c256 = index.constant 256 : index
+  %stage_bytes = index.mul %tokens, %c256 : index
+  %lds_bytes = index.scale %stage_bytes, %one_b : index, offset -> offset
+  %lds = buffer.alloca<workgroup> align(16) %lds_bytes : buffer
+  %stage = buffer.view %lds[%zero] : buffer -> view<[%tokens]x64xf32>
+  %first = index.mul %tile, %tokens : index
+  %rest = index.sub %n_t, %first : index
+  %count = index.min %rest, %tokens : index
+  %n_z = index.mul %count, %c64 : index
+  scf.for %i = [%tid to %n_z step %rows] {
+    %tb = index.div %i, %c64 : index
+    %r = index.rem %i, %c64 : index
+    %tok = index.add %first, %tb : index
+    %z = scf.if %use_parts -> (f32) {
+      %zp = func.call @ggml_hrx_gated_z(%part, %sq_off, %tok, %r, %e_f, %eps_x, %eps_m) : (buffer, index, index, index, f32, f32, f32) -> (f32)
+      scf.yield %zp : f32
+    } else {
+      %zi0 = index.madd %tok, %c64, %r : index
+      %zi = index.add %z_off, %zi0 : index
+      %zl = func.call @ggml_hrx_gated_load(%part, %zi) : (buffer, index) -> (f32)
+      scf.yield %zl : f32
+    }
+    view.store %z, %stage[%tb, %r] : f32, view<[%tokens]x64xf32>
+  }
+  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+
+  scf.for %tb = [%c0 to %count step %c1] {
+    %tok = index.add %first, %tb : index
+    %xi = index.madd %tok, %x_s1, %o : index
+    %mi = index.madd %tok, %m_s1, %o : index
+    %xe = func.call @ggml_hrx_gated_load(%x, %xi) : (buffer, index) -> (f32)
+    %me = func.call @ggml_hrx_gated_load(%m, %mi) : (buffer, index) -> (f32)
+    %ye = func.call @ggml_hrx_gated_row(%tokens, %stage, %tb, %bank_f, %bank_g, %xe, %me) : (index, view<[%tokens]x64xf32>, index, vector<16x4xf32>, vector<16x4xf32>, f32, f32) -> (f32)
+    %yi = index.madd %tok, %y_s1, %o : index
+    func.call @ggml_hrx_gated_store(%y, %yi, %ye) : (buffer, index, f32)
+  }
+  kernel.return
+}

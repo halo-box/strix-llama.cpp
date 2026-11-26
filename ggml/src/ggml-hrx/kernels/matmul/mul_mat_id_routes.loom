@@ -1,0 +1,137 @@
+// Groups the routes of MUL_MAT_ID by expert for the tiled kernel. The table has the record count in word 0.
+// From word 4 it has the records, tile + 2 words each: {bucket, live routes, route ids}. A record holds at most tile routes.
+// Bucket n_as holds the routes with an id out of [0, n_as). The records are in bucket order.
+// The order of the routes in a bucket is arbitrary. It does not change any result.
+
+func.decl @ggml_hrx_mmid_expert(%ids: buffer, %i_span: index, %i_s0: index, %i_s1: index, %n_ids: index, %n_as: index, %route: index) -> (index, i1)
+
+func.def inline @ggml_hrx_mmid_bucket(%ids: buffer, %i_span: index, %i_s0: index, %i_s1: index, %n_ids: index, %n_as: index, %route: index) -> (index) {
+  %expert, %ok = func.call @ggml_hrx_mmid_expert(%ids, %i_span, %i_s0, %i_s1, %n_ids, %n_as, %route) : (buffer, index, index, index, index, index, index) -> (index, i1)
+  %bucket0 = scf.select %ok, %expert, %n_as : index
+  %bucket = index.assume %bucket0 [range(%bucket0, 0, 1023)] : index
+  func.return %bucket : index
+}
+
+// One workgroup. Each workitem owns the 4 buckets 4t to 4t+3. The caller keeps n_as below 1024.
+kernel.def export("ggml_mul_mat_id_routes") @ggml_mul_mat_id_routes() {
+  %one = index.constant 1 : index
+  %wg_size = index.constant 256 : index
+  kernel.launch.config workgroups(%one, %one, %one) workgroup_size(%wg_size, %one, %one) : index
+} launch(%n_routes_in: index, %n_ids_in: index, %n_as_in: index, %tile_in: index, %records_in: index, %i_s0_in: index, %i_s1_in: index, %i_span_in: index, %ids: buffer, %table: buffer) {
+  %n_routes = index.assume %n_routes_in [range(%n_routes_in, 1, 2147483647)] : index
+  %n_ids = index.assume %n_ids_in [range(%n_ids_in, 1, 2147483647)] : index
+  %n_as = index.assume %n_as_in [range(%n_as_in, 1, 1023)] : index
+  %tile = index.assume %tile_in [range(%tile_in, 1, 1024)] : index
+  %records = index.assume %records_in [range(%records_in, 1, 2147483647)] : index
+  %i_s0 = index.assume %i_s0_in [range(%i_s0_in, 0, 2147483647)] : index
+  %i_s1 = index.assume %i_s1_in [range(%i_s1_in, 0, 2147483647)] : index
+  %i_span = index.assume %i_span_in [range(%i_span_in, 1, 2147483647)] : index
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c4 = index.constant 4 : index
+  %c255 = index.constant 255 : index
+  %c256 = index.constant 256 : index
+  %origin = index.constant 0 : offset
+  %records_origin = index.constant 16 : offset
+  %store_bytes = index.constant 4096 : offset
+  %zero = scalar.constant 0 : i32
+  %one = scalar.constant 1 : i32
+  %t0 = kernel.workitem.id<x> : index
+  %t = index.assume %t0 [range(%t0, 0, 255)] : index
+  %ids_noalias, %table_noalias = buffer.assume.noalias %ids, %table : buffer, buffer
+  %stride = index.add %tile, %c2 : index
+  %header = buffer.view %table_noalias[%origin] : buffer -> view<1xi32>
+  %rows = buffer.view %table_noalias[%records_origin] : buffer -> view<[%records]x[%stride]xi32>
+  %counter_store = buffer.alloca<workgroup> align(16) %store_bytes : buffer
+  %offset_store = buffer.alloca<workgroup> align(16) %store_bytes : buffer
+  %counters = buffer.view %counter_store[%origin] : buffer -> view<1024xi32>
+  %offsets = buffer.view %offset_store[%origin] : buffer -> view<1024xi32>
+  %b_first = index.mul %t, %c4 : index
+
+  scf.for %j = [%c0 to %c4 step %c1] unroll {
+    %b0 = index.add %b_first, %j : index
+    %b = index.assume %b0 [range(%b0, 0, 1023)] : index
+    view.store %zero, %counters[%b] : i32, view<1024xi32>
+  }
+  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+  scf.for %r = [%t to %n_routes step %c256] {
+    %b = func.call @ggml_hrx_mmid_bucket(%ids_noalias, %i_span, %i_s0, %i_s1, %n_ids, %n_as, %r) : (buffer, index, index, index, index, index, index) -> (index)
+    %old = view.atomic.rmw<addi> %one, %counters[%b] {ordering = relaxed, scope = workgroup} : i32, view<1024xi32> -> i32
+  }
+  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+
+  %tile_m1 = index.sub %tile, %c1 : index
+  %local = scf.for %j = [%c0 to %c4 step %c1](%acc = %c0 : index) -> (index) unroll {
+    %b0 = index.add %b_first, %j : index
+    %b = index.assume %b0 [range(%b0, 0, 1023)] : index
+    %pop32 = view.load %counters[%b] : view<1024xi32> -> i32
+    %pop0 = index.cast %pop32 : i32 to index
+    %pop = index.assume %pop0 [range(%pop0, 0, 2147483647)] : index
+    %pop_round = index.add %pop, %tile_m1 : index
+    %tiles = index.div %pop_round, %tile : index
+    %next = index.add %acc, %tiles : index
+    scf.yield %next : index
+  }
+  %local32 = index.cast %local : index to i32
+  %first32 = kernel.workgroup.scan<addi> %local32 {direction = forward, mode = exclusive} : i32
+  %is_last = index.cmp eq, %t, %c255 : index
+  scf.if %is_last {
+    %total = scalar.addi %first32, %local32 : i32
+    view.store %total, %header[0] : i32, view<1xi32>
+  }
+  %first0 = index.cast %first32 : i32 to index
+  %first = index.assume %first0 [range(%first0, 0, 2147483647)] : index
+  %end = scf.for %j = [%c0 to %c4 step %c1](%run = %first : index) -> (index) unroll {
+    %b0 = index.add %b_first, %j : index
+    %b = index.assume %b0 [range(%b0, 0, 1023)] : index
+    %b32 = index.cast %b : index to i32
+    %run32 = index.cast %run : index to i32
+    view.store %run32, %offsets[%b] : i32, view<1024xi32>
+    %pop32 = view.load %counters[%b] : view<1024xi32> -> i32
+    %pop0 = index.cast %pop32 : i32 to index
+    %pop = index.assume %pop0 [range(%pop0, 0, 2147483647)] : index
+    %pop_round = index.add %pop, %tile_m1 : index
+    %tiles = index.div %pop_round, %tile : index
+    scf.for %q = [%c0 to %tiles step %c1] {
+      %rec0 = index.add %run, %q : index
+      %rec_in = index.cmp ult, %rec0, %records : index
+      scf.if %rec_in {
+        %done = index.mul %q, %tile : index
+        %remaining = index.sub %pop, %done : index
+        %live = index.min %remaining, %tile : index
+        %live32 = index.cast %live : index to i32
+        view.store %b32, %rows[%rec0, %c0] : i32, view<[%records]x[%stride]xi32>
+        view.store %live32, %rows[%rec0, %c1] : i32, view<[%records]x[%stride]xi32>
+      }
+    }
+    %next = index.add %run, %tiles : index
+    scf.yield %next : index
+  }
+  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+  scf.for %j = [%c0 to %c4 step %c1] unroll {
+    %b0 = index.add %b_first, %j : index
+    %b = index.assume %b0 [range(%b0, 0, 1023)] : index
+    view.store %zero, %counters[%b] : i32, view<1024xi32>
+  }
+  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+  scf.for %r = [%t to %n_routes step %c256] {
+    %b = func.call @ggml_hrx_mmid_bucket(%ids_noalias, %i_span, %i_s0, %i_s1, %n_ids, %n_as, %r) : (buffer, index, index, index, index, index, index) -> (index)
+    %rank32 = view.atomic.rmw<addi> %one, %counters[%b] {ordering = relaxed, scope = workgroup} : i32, view<1024xi32> -> i32
+    %base32 = view.load %offsets[%b] : view<1024xi32> -> i32
+    %rank0 = index.cast %rank32 : i32 to index
+    %base0 = index.cast %base32 : i32 to index
+    %rank = index.assume %rank0 [range(%rank0, 0, 2147483647)] : index
+    %base = index.assume %base0 [range(%base0, 0, 2147483647)] : index
+    %q = index.div %rank, %tile : index
+    %s = index.rem %rank, %tile : index
+    %rec0 = index.add %base, %q : index
+    %field = index.add %s, %c2 : index
+    %rec_in = index.cmp ult, %rec0, %records : index
+    scf.if %rec_in {
+      %route32 = index.cast %r : index to i32
+      view.store %route32, %rows[%rec0, %field] : i32, view<[%records]x[%stride]xi32>
+    }
+  }
+  kernel.return
+}

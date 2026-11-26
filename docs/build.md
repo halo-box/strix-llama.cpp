@@ -20,6 +20,7 @@ The following sections describe how to build with different backends and options
 * [CUDA](#cuda)
 * [MUSA](#musa)
 * [HIP](#hip)
+* [HRX](#hrx)
 * [Vulkan](#vulkan)
 * [CANN](#cann)
 * [ZenDNN](#zendnn)
@@ -428,6 +429,61 @@ The environment variable [`HIP_VISIBLE_DEVICES`](https://rocm.docs.amd.com/en/la
 ### Unified Memory
 
 On Linux it is possible to use unified memory architecture (UMA) to share main memory between the CPU and integrated GPU by setting environment variable `GGML_CUDA_ENABLE_UNIFIED_MEMORY=1`. However, this hurts performance for non-integrated GPUs (but enables working with integrated GPUs).
+
+## HRX
+
+This provides GPU acceleration on AMD RDNA3, RDNA3.5 and RDNA4 GPUs (gfx1100, gfx1101, gfx1102, gfx1103, gfx1150, gfx1151, gfx1152, gfx1200, gfx1201) through the HRX runtime. The backend is experimental. Kernels are written in Loom and compiled for the GPU at first use, so ROCm is not required.
+
+Build and install the HRX SDK v0.2.0 from the [hrx-system release](https://github.com/ROCm/hrx-system/releases/tag/v0.2.0) source:
+
+```bash
+curl -L https://github.com/ROCm/hrx-system/archive/refs/tags/v0.2.0.tar.gz | tar xz
+cd hrx-system-0.2.0
+python3 dev.py cmake setup
+source .venv/bin/activate
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DBUILD_SHARED_LIBS=OFF -DIREE_ENABLE_WERROR_FLAG=OFF \
+      -DLIBHRX_BUILD=ON -DLIBHRX_BUILD_HIP_BINDING=OFF -DLIBHRX_BUILD_PASSTHROUGH=OFF -DLIBHRX_BUILD_CTS=OFF
+cmake --build build --target hrx hrx-info loomc_shared
+cmake --install build --prefix /path/to/hrx-sdk --component HrxPublicDist
+```
+
+Then build llama.cpp with:
+
+```bash
+cmake -B build -DGGML_HRX=ON -DCMAKE_PREFIX_PATH=/path/to/hrx-sdk
+cmake --build build --config Release
+```
+
+The devices are named `HRX0`, `HRX1`, ... Use `--list-devices` to show them and `--device HRX0` to select one.
+
+The backend runs TinyStories-15M (`stories15M-q4_0.gguf`) and Inkling 2 Mini (`inkling2_loop`, the Unsloth `Mainline_Support` GGUFs) fully on the GPU. It supports these ops with F32 activations:
+
+* `MUL_MAT` with F32, F16, BF16, Q4_0 and Q8_0 weights, and `MUL_MAT_ID` with F32, F16, Q8_0 and NVFP4 weights
+* `FLASH_ATTN_EXT` (F16 KV cache, optional per-head mask and sinks) and `SET_ROWS`
+* `SOFT_MAX` (with or without a mask), `RMS_NORM`, `ROPE`, `SUM_ROWS`, `ARGSORT` and `SSM_CONV`
+* `ADD`, `SUB`, `MUL` and `DIV` with broadcasting, `SCALE`, `CLAMP`, `FILL`, `SQR`, `SQRT`, `LOG`, the unary ops `SIGMOID`, `TANH`, `EXP`, `NEG`, `ABS`, `SILU`, `RELU`, `GELU`, `SGN` and `STEP`, and `SWIGLU`
+* `GET_ROWS` (F32, F16, BF16 and Q8_0 rows), `CPY`, `DUP` and `CONT` (from F32, F16 or I32), `REPEAT`, `PAD` and `CONCAT`
+
+Other ops and types run on the CPU.
+
+### Inkling 2 Mini with DSpark on Strix Halo
+
+Build `llama-server` with HRX enabled. Use the matching target and draft GGUF files from the Inkling 2 Mini `Mainline_Support` directory.
+
+```bash
+models=/path/to/Mainline_Support
+scripts/serve-inkling2-dspark-hrx.sh \
+    "$models/Inkling-2-Mini-UD-Q4_K_XL.gguf" \
+    "$models/dspark-Inkling-2-Mini-Q8_0.gguf" --port 8080
+```
+
+The launcher selects HRX0 for both models and pins the target token embedding and draft mask embedding there. It uses greedy decoding and proposes up to three tokens per verification step. Pass extra server options after the draft path. Set `LLAMA_SERVER` when the binary is outside `build/bin`.
+
+Set `GGML_HRX_INKLING_BF16_CTRL=1` to use BF16 WMMA for the Inkling 2 Mini loop controller on gfx1151. This rounds the projection inputs to BF16 and accumulates in F32. It applies to supported controller batches of 64 to 8192 tokens in multiples of 64. Other batches use the regular controller. The flag is off by default, and `GGML_HRX_DISABLE_GATED_MMA` disables both WMMA controller paths.
+
+Set `GGML_HRX_INKLING_NATIVE_CTRL=1` to test the Loom-style controller on gfx1151. It normalizes live input rows into F16, uses BF16-rounded weights and keeps the down-projection result in F32 until the gate projection. This mode runs on batches of 128 to 8192 tokens in multiples of 128. If both switches are set, it takes priority on the shapes it supports.
+
+For the optional XDNA2 prefill path, set `GGML_HRX_NPU=1 GGML_HRX_NPU_SPLIT=0` before starting the launcher. DSpark still proposes tokens on HRX0. The target checks each proposal. The `/completion` response reports proposed and accepted counts in `timings.draft_n` and `timings.draft_n_accepted`.
 
 ## Vulkan
 

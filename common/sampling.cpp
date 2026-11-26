@@ -143,7 +143,10 @@ struct common_sampler {
 
         const int n_vocab = llama_vocab_n_tokens(vocab);
 
-        if (sampled_probs) {
+        if (!sampled_probs && !sampled_logits && llama_get_sampled_token_ith(ctx, idx) != LLAMA_TOKEN_NULL) {
+            // the backend returned only the token (dist_spec)
+            cur.assign(1, llama_token_data{llama_get_sampled_token_ith(ctx, idx), 0.0f, 1.0f});
+        } else if (sampled_probs) {
             const uint32_t sampled_probs_count = llama_get_sampled_probs_count_ith(ctx, idx);
             cur.resize(sampled_probs_count);
             for (uint32_t i = 0; i < sampled_probs_count; ++i) {
@@ -476,7 +479,13 @@ struct common_sampler * common_sampler_init(
             const bool greedy = params.n_probs == 0 && !params.samplers.empty() &&
                 ((params.samplers.back() == COMMON_SAMPLER_TYPE_TEMPERATURE && params.temp == 0.0f && params.dynatemp_range == 0.0f) ||
                  (params.samplers.back() == COMMON_SAMPLER_TYPE_TOP_K && params.top_k == 1));
-            samplers.push_back(greedy ? llama_sampler_init_greedy() : llama_sampler_init_dist(params.seed));
+            if (greedy) {
+                samplers.push_back(llama_sampler_init_greedy());
+            } else if (params.spec_verify && params.backend_sampling) {
+                samplers.push_back(llama_sampler_init_dist_spec(params.seed, llama_vocab_n_tokens(vocab), COMMON_SPEC_VERIFY_N_CAND));
+            } else {
+                samplers.push_back(llama_sampler_init_dist(params.seed));
+            }
         }
     } else if (params.mirostat == 1) {
         samplers.push_back(llama_sampler_init_temp(params.temp));
@@ -582,6 +591,7 @@ static bool common_params_sampling_equal(
         && a.mirostat_tau == b.mirostat_tau
         && a.mirostat_eta == b.mirostat_eta
         && a.no_perf == b.no_perf
+        && a.spec_verify == b.spec_verify
         && a.samplers == b.samplers
         && a.dry_sequence_breakers == b.dry_sequence_breakers
         && common_grammar_equal(a.grammar, b.grammar)
@@ -918,6 +928,21 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
     return result;
 }
 
+bool common_sampler_spec_set_draft(struct common_sampler * gsmpl, const llama_tokens & draft, const std::vector<std::vector<llama_token_data>> & draft_q) {
+    if (!gsmpl || !gsmpl->params.backend_sampling || !gsmpl->params.spec_verify || draft_q.size() != draft.size()) {
+        return false;
+    }
+
+    std::vector<const llama_token_data *> q(draft.size());
+    std::vector<int32_t>                  n_q(draft.size());
+    for (size_t i = 0; i < draft.size(); ++i) {
+        q[i]   = draft_q[i].data();
+        n_q[i] = (int32_t) draft_q[i].size();
+    }
+
+    return llama_sampler_dist_spec_set_draft(gsmpl->chain, (int32_t) draft.size(), draft.data(), q.data(), n_q.data());
+}
+
 static float prob_of(const llama_token_data * data, size_t n, llama_token id) {
     for (size_t k = 0; k < n; ++k) {
         if (data[k].id == id) {
@@ -933,6 +958,13 @@ static float prob_of(const llama_token_data * data, size_t n, llama_token id) {
 std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, const std::vector<std::vector<llama_token_data>> & draft_q, bool grammar_first) {
     GGML_ASSERT(idxs.size()    == draft.size() + 1 && "idxs.size() must be draft.size() + 1");
     GGML_ASSERT(draft_q.size() == draft.size() && "draft_q must have one entry per draft token");
+
+    // a backend chain that returns only the token (dist_spec) leaves no p on the host: verify by sampling and matching
+    llama_synchronize(ctx);
+    if (llama_get_sampled_token_ith(ctx, idxs[0]) != LLAMA_TOKEN_NULL &&
+            !llama_get_sampled_probs_ith(ctx, idxs[0]) && !llama_get_sampled_logits_ith(ctx, idxs[0])) {
+        return common_sampler_sample_and_accept_n(gsmpl, ctx, idxs, draft, grammar_first);
+    }
 
     const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx));
 

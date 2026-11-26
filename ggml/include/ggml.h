@@ -2353,6 +2353,19 @@ extern "C" {
             struct ggml_tensor * top_k,
                      int64_t     n_kv_raw);
 
+    GGML_API bool ggml_flash_attn_ext_has_indexed_bias(const struct ggml_tensor * a);
+
+    // Add table[indices[key, query], head, query] to the mask before its F16 rounding.
+    // Queries from all streams are flattened in stream order. Indices must be in [0, table->ne[0]).
+    GGML_API void ggml_flash_attn_ext_add_indexed_bias(
+            struct ggml_tensor * a,
+            struct ggml_tensor * table,
+            struct ggml_tensor * indices);
+
+    // the bias table (F32 [n_bins, n_head, n_q*n_streams]) and the indices (I32 [n_kv, n_q*n_streams]), or NULL
+    GGML_API struct ggml_tensor * ggml_flash_attn_ext_get_bias_table(const struct ggml_tensor * a);
+    GGML_API struct ggml_tensor * ggml_flash_attn_ext_get_bias_indices(const struct ggml_tensor * a);
+
     // TODO: needs to be adapted to ggml_flash_attn_ext
     GGML_API struct ggml_tensor * ggml_flash_attn_back(
            struct ggml_context * ctx,

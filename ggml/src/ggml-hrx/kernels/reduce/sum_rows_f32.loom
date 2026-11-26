@@ -1,0 +1,143 @@
+// Strides are in elements. Each dst row is one value.
+
+config.decl @ggml.sum_rows.lanes : %value: index where [range(%value, 16, 64)]
+
+config.decl @ggml.norm.wg_size : %value: index where [range(%value, 64, 1024), multiple_of(%value, 64)]
+
+target.decl @ggml_wave64
+
+template.decl @ggml.reduce.sum_f32(%value: f32, %lanes: index) -> (f32)
+
+// Sum of the row values first, first + step, ... below ne0.
+func.def inline @ggml_hrx_sum_rows_part(%src: buffer, %span: index, %base: index, %first: index, %ne0: index, %s0: index, %step: index, %use: i1) -> (f32) {
+  %zero = index.constant 0 : offset
+  %c0_f32 = scalar.constant 0.0 : f32
+  %view = buffer.view %src[%zero] : buffer -> view<[%span]xf32>
+  %r = scf.if %use -> (f32) {
+    %p = scf.for %c = [%first to %ne0 step %step](%acc = %c0_f32 : f32) -> (f32) {
+      %co = index.mul %c, %s0 : index
+      %idx = index.add %base, %co : index
+      %off = index.assume %idx [range(%idx, 0, 2147483646)] : index
+      %ok = index.cmp ult, %off, %span : index
+      %next = scf.if %ok -> (f32) {
+        %x = view.load %view[%off] : view<[%span]xf32> -> f32
+        %s = scalar.addf %acc, %x : f32
+        scf.yield %s : f32
+      } else {
+        scf.yield %acc : f32
+      }
+      scf.yield %next : f32
+    }
+    scf.yield %p : f32
+  } else {
+    scf.yield %c0_f32 : f32
+  }
+  func.return %r : f32
+}
+
+func.def inline @ggml_hrx_sum_rows_store(%dst: buffer, %span: index, %idx: index, %value: f32) {
+  %zero = index.constant 0 : offset
+  %view = buffer.view %dst[%zero] : buffer -> view<[%span]xf32>
+  %off = index.assume %idx [range(%idx, 0, 2147483646)] : index
+  %ok = index.cmp ult, %off, %span : index
+  scf.if %ok {
+    view.store %value, %view[%off] : f32, view<[%span]xf32>
+  }
+  func.return
+}
+
+func.def inline @ggml_hrx_sum_rows_bases(%row: index, %ne1: index, %ne2: index, %s1: index, %s2: index, %s3: index, %d1: index, %d2: index, %d3: index) -> (index, index) {
+  %i1 = index.rem %row, %ne1 : index
+  %t0 = index.div %row, %ne1 : index
+  %i2 = index.rem %t0, %ne2 : index
+  %i3 = index.div %t0, %ne2 : index
+  %so1 = index.mul %i1, %s1 : index
+  %so2 = index.mul %i2, %s2 : index
+  %so3 = index.mul %i3, %s3 : index
+  %so12 = index.add %so1, %so2 : index
+  %src_base = index.add %so12, %so3 : index
+  %do1 = index.mul %i1, %d1 : index
+  %do2 = index.mul %i2, %d2 : index
+  %do3 = index.mul %i3, %d3 : index
+  %do12 = index.add %do1, %do2 : index
+  %dst_base = index.add %do12, %do3 : index
+  func.return %src_base, %dst_base : index, index
+}
+
+// lanes work items for each row.
+kernel.def target(@ggml_wave64) export("ggml_sum_rows_f32_rows") @ggml_sum_rows_f32_rows(%groups: index) {
+  %one = index.constant 1 : index
+  %wg_size = config.get @ggml.norm.wg_size : index
+  kernel.launch.config workgroups(%groups, %one, %one) workgroup_size(%wg_size, %one, %one) : index
+} launch(%rows_in: index, %ne0_in: index, %ne1_in: index, %ne2_in: index, %s0_in: index, %s1_in: index, %s2_in: index, %s3_in: index, %src_span_in: index, %d1_in: index, %d2_in: index, %d3_in: index, %dst_span_in: index, %src: buffer, %dst: buffer) {
+  // supports_sum_rows checks these ranges.
+  %rows = index.assume %rows_in [range(%rows_in, 1, 2147483647)] : index
+  %ne0 = index.assume %ne0_in [range(%ne0_in, 1, 2147483647)] : index
+  %ne1 = index.assume %ne1_in [range(%ne1_in, 1, 2147483647)] : index
+  %ne2 = index.assume %ne2_in [range(%ne2_in, 1, 2147483647)] : index
+  %s0 = index.assume %s0_in [range(%s0_in, 0, 2147483647)] : index
+  %s1 = index.assume %s1_in [range(%s1_in, 0, 2147483647)] : index
+  %s2 = index.assume %s2_in [range(%s2_in, 0, 2147483647)] : index
+  %s3 = index.assume %s3_in [range(%s3_in, 0, 2147483647)] : index
+  %src_span = index.assume %src_span_in [range(%src_span_in, 1, 2147483647)] : index
+  %d1 = index.assume %d1_in [range(%d1_in, 0, 2147483647)] : index
+  %d2 = index.assume %d2_in [range(%d2_in, 0, 2147483647)] : index
+  %d3 = index.assume %d3_in [range(%d3_in, 0, 2147483647)] : index
+  %dst_span = index.assume %dst_span_in [range(%dst_span_in, 1, 2147483647)] : index
+  %lanes = config.get @ggml.sum_rows.lanes : index
+  %wg_size = config.get @ggml.norm.wg_size : index
+  %c0 = index.constant 0 : index
+  %group = kernel.workgroup.id<x> : index
+  %item = kernel.workitem.id<x> : index
+  %rows_per_group = index.div %wg_size, %lanes : index
+  %group_row0 = index.mul %group, %rows_per_group : index
+  %local_row = index.div %item, %lanes : index
+  %lane = index.rem %item, %lanes : index
+  %row_raw = index.add %group_row0, %local_row : index
+  %row = index.assume %row_raw [range(%row_raw, 0, 2147483646)] : index
+  %row_ok = index.cmp ult, %row, %rows : index
+  %src_base, %dst_base = func.call @ggml_hrx_sum_rows_bases(%row, %ne1, %ne2, %s1, %s2, %s3, %d1, %d2, %d3) : (index, index, index, index, index, index, index, index, index) -> (index, index)
+  %partial = func.call @ggml_hrx_sum_rows_part(%src, %src_span, %src_base, %lane, %ne0, %s0, %lanes, %row_ok) : (buffer, index, index, index, index, index, index, i1) -> (f32)
+  // All lanes must join the cluster reduce. Lanes past the last row add zeros.
+  %sum = template.apply<@ggml.reduce.sum_f32>(%partial, %lanes) : (f32, index) -> (f32)
+  %first_lane = index.cmp eq, %lane, %c0 : index
+  %store = scalar.andi %row_ok, %first_lane : i1
+  scf.if %store {
+    func.call @ggml_hrx_sum_rows_store(%dst, %dst_span, %dst_base, %sum) : (buffer, index, index, f32)
+  }
+  kernel.return
+}
+
+// One workgroup for each row.
+kernel.def target(@ggml_wave64) export("ggml_sum_rows_f32_wg") @ggml_sum_rows_f32_wg(%rows: index) {
+  %one = index.constant 1 : index
+  %wg_size = config.get @ggml.norm.wg_size : index
+  kernel.launch.config workgroups(%rows, %one, %one) workgroup_size(%wg_size, %one, %one) : index
+} launch(%rows_in: index, %ne0_in: index, %ne1_in: index, %ne2_in: index, %s0_in: index, %s1_in: index, %s2_in: index, %s3_in: index, %src_span_in: index, %d1_in: index, %d2_in: index, %d3_in: index, %dst_span_in: index, %src: buffer, %dst: buffer) {
+  // supports_sum_rows checks these ranges.
+  %ne0 = index.assume %ne0_in [range(%ne0_in, 1, 2147483647)] : index
+  %ne1 = index.assume %ne1_in [range(%ne1_in, 1, 2147483647)] : index
+  %ne2 = index.assume %ne2_in [range(%ne2_in, 1, 2147483647)] : index
+  %s0 = index.assume %s0_in [range(%s0_in, 0, 2147483647)] : index
+  %s1 = index.assume %s1_in [range(%s1_in, 0, 2147483647)] : index
+  %s2 = index.assume %s2_in [range(%s2_in, 0, 2147483647)] : index
+  %s3 = index.assume %s3_in [range(%s3_in, 0, 2147483647)] : index
+  %src_span = index.assume %src_span_in [range(%src_span_in, 1, 2147483647)] : index
+  %d1 = index.assume %d1_in [range(%d1_in, 0, 2147483647)] : index
+  %d2 = index.assume %d2_in [range(%d2_in, 0, 2147483647)] : index
+  %d3 = index.assume %d3_in [range(%d3_in, 0, 2147483647)] : index
+  %dst_span = index.assume %dst_span_in [range(%dst_span_in, 1, 2147483647)] : index
+  %wg_size = config.get @ggml.norm.wg_size : index
+  %c0 = index.constant 0 : index
+  %true = scalar.constant true : i1
+  %row = kernel.workgroup.id<x> : index
+  %item = kernel.workitem.id<x> : index
+  %src_base, %dst_base = func.call @ggml_hrx_sum_rows_bases(%row, %ne1, %ne2, %s1, %s2, %s3, %d1, %d2, %d3) : (index, index, index, index, index, index, index, index, index) -> (index, index)
+  %partial = func.call @ggml_hrx_sum_rows_part(%src, %src_span, %src_base, %item, %ne0, %s0, %wg_size, %true) : (buffer, index, index, index, index, index, index, i1) -> (f32)
+  %sum = kernel.workgroup.reduce<addf> %partial : f32
+  %first = index.cmp eq, %item, %c0 : index
+  scf.if %first {
+    func.call @ggml_hrx_sum_rows_store(%dst, %dst_span, %dst_base, %sum) : (buffer, index, index, f32)
+  }
+  kernel.return
+}

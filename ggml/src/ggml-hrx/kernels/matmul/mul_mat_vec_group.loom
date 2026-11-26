@@ -1,0 +1,277 @@
+// ggml_mul_mat_vec_xs for up to 6 weights of the same type and K that read the same input columns, in one dispatch.
+// 2D tensors only. Each weight gets whole workgroups. All workgroups make the same number of row passes (at most 256 / vec_cols).
+// A row gets the same result as in ggml_mul_mat_vec_xs: the per-row sums do not depend on the passes.
+// Member m starts at workgroup start_m (start_0 = 0). An unused member has start_m = the workgroup count.
+
+config.decl @ggml.mul_mat.weight_type : %value: index where [range(%value, 0, 4)]
+
+config.decl @ggml.mul_mat.vec_cols : %value: index where [range(%value, 1, 8)]
+
+config.decl @ggml.mul_mat.vec_xs_depth : %value: index where [range(%value, 1, 4)]
+
+// 1: the last superblock is partial. Only for weight types with 32-value blocks.
+config.decl @ggml.mul_mat.vec_k_tail : %value: index where [range(%value, 0, 1)]
+
+target.decl @ggml_wave32
+
+template.decl @ggml.weight.offsets16(%wtype: index, %part: index) -> (index, index, index, index)
+
+template.decl @ggml.weight.part16(%wtype: index, %weight: buffer, %sb_byte: offset, %part: index) -> (vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>, index, index, index, index)
+
+template.decl @ggml.weight.superblock(%wtype: index) -> (offset, offset, index)
+
+func.decl @ggml_hrx_mm_store(%dst: buffer, %d_span: index, %index: index, %value: f32)
+
+func.decl @ggml_hrx_mv_col_base(%i: index, %n_tile: index, %n_cols: index, %x_batch: index, %x_s1: index, %k_size: index, %x_span: index, %ok_in: i1) -> (index, i1, i1, i1)
+
+func.decl @ggml_hrx_mv_xload(%use: i1, %input: buffer, %x_base: index, %sb: index, %o0: index, %o1: index, %o2: index, %o3: index) -> (vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>)
+
+func.decl @ggml_hrx_mv_dot16(%use: i1, %w0: vector<4xf32>, %w1: vector<4xf32>, %w2: vector<4xf32>, %w3: vector<4xf32>, %x0: vector<4xf32>, %x1: vector<4xf32>, %x2: vector<4xf32>, %x3: vector<4xf32>) -> (f32)
+
+// Partial sum slot of pass p, column col and slot slot. The caller keeps p < 256 / n_tile, col < n_tile and slot < 16.
+// Unlike ggml_mul_mat_vec_xs, a workgroup with fewer columns can make more passes.
+func.def inline @ggml_hrx_mvg_stage_index(%p: index, %n_tile: index, %col: index, %slot: index) -> (index) {
+  %c16 = index.constant 16 : index
+  %c4095 = index.constant 4095 : index
+  %p_cols = index.mul %p, %n_tile : index
+  %p_col = index.add %p_cols, %col : index
+  %p_slots = index.mul %p_col, %c16 : index
+  %index0 = index.add %p_slots, %slot : index
+  %index = index.min %index0, %c4095 : index
+  func.return %index : index
+}
+
+// The value of the member of workgroup wg: the last member whose start is at most wg.
+func.def inline @ggml_hrx_mvg_pick(%wg: index, %s1: index, %s2: index, %s3: index, %s4: index, %s5: index, %v0: index, %v1: index, %v2: index, %v3: index, %v4: index, %v5: index) -> (index) {
+  %m1 = index.cmp uge, %wg, %s1 : index
+  %m2 = index.cmp uge, %wg, %s2 : index
+  %m3 = index.cmp uge, %wg, %s3 : index
+  %m4 = index.cmp uge, %wg, %s4 : index
+  %m5 = index.cmp uge, %wg, %s5 : index
+  %p1 = scf.select %m1, %v1, %v0 : index
+  %p2 = scf.select %m2, %v2, %p1 : index
+  %p3 = scf.select %m3, %v3, %p2 : index
+  %p4 = scf.select %m4, %v4, %p3 : index
+  %p5 = scf.select %m5, %v5, %p4 : index
+  func.return %p5 : index
+}
+
+func.def inline @ggml_hrx_mvg_pick_buffer(%wg: index, %s1: index, %s2: index, %s3: index, %s4: index, %s5: index, %b0: buffer, %b1: buffer, %b2: buffer, %b3: buffer, %b4: buffer, %b5: buffer) -> (buffer) {
+  %m1 = index.cmp uge, %wg, %s1 : index
+  %m2 = index.cmp uge, %wg, %s2 : index
+  %m3 = index.cmp uge, %wg, %s3 : index
+  %m4 = index.cmp uge, %wg, %s4 : index
+  %m5 = index.cmp uge, %wg, %s5 : index
+  %p1 = scf.select %m1, %b1, %b0 : buffer
+  %p2 = scf.select %m2, %b2, %p1 : buffer
+  %p3 = scf.select %m3, %b3, %p2 : buffer
+  %p4 = scf.select %m4, %b4, %p3 : buffer
+  %p5 = scf.select %m5, %b5, %p4 : buffer
+  func.return %p5 : buffer
+}
+
+kernel.def target(@ggml_wave32) export("ggml_mul_mat_vec_group") @ggml_mul_mat_vec_group(%n_wg: index) {
+  %one = index.constant 1 : index
+  %wg_size = index.constant 256 : index
+  kernel.launch.config workgroups(%n_wg, %one, %one) workgroup_size(%wg_size, %one, %one) : index
+} launch(%k_size_in: index, %n_cols_in: index, %x_s1_in: index, %x_span_in: index, %n_pass_in: index, %s1: index, %s2: index, %s3: index, %s4: index, %s5: index, %rows0: index, %rows1: index, %rows2: index, %rows3: index, %rows4: index, %rows5: index, %w_s1_0: index, %w_s1_1: index, %w_s1_2: index, %w_s1_3: index, %w_s1_4: index, %w_s1_5: index, %w_span0: index, %w_span1: index, %w_span2: index, %w_span3: index, %w_span4: index, %w_span5: index, %d_s1_0: index, %d_s1_1: index, %d_s1_2: index, %d_s1_3: index, %d_s1_4: index, %d_s1_5: index, %d_span0: index, %d_span1: index, %d_span2: index, %d_span3: index, %d_span4: index, %d_span5: index, %input: buffer, %w0: buffer, %w1: buffer, %w2: buffer, %w3: buffer, %w4: buffer, %w5: buffer, %o0: buffer, %o1: buffer, %o2: buffer, %o3: buffer, %o4: buffer, %o5: buffer) {
+  %c0 = index.constant 0 : index
+  %wg = kernel.workgroup.id<x> : index
+  %start = func.call @ggml_hrx_mvg_pick(%wg, %s1, %s2, %s3, %s4, %s5, %c0, %s1, %s2, %s3, %s4, %s5) : (index, index, index, index, index, index, index, index, index, index, index, index) -> (index)
+  %n_rows_m = func.call @ggml_hrx_mvg_pick(%wg, %s1, %s2, %s3, %s4, %s5, %rows0, %rows1, %rows2, %rows3, %rows4, %rows5) : (index, index, index, index, index, index, index, index, index, index, index, index) -> (index)
+  %w_s1_m = func.call @ggml_hrx_mvg_pick(%wg, %s1, %s2, %s3, %s4, %s5, %w_s1_0, %w_s1_1, %w_s1_2, %w_s1_3, %w_s1_4, %w_s1_5) : (index, index, index, index, index, index, index, index, index, index, index, index) -> (index)
+  %w_span_m = func.call @ggml_hrx_mvg_pick(%wg, %s1, %s2, %s3, %s4, %s5, %w_span0, %w_span1, %w_span2, %w_span3, %w_span4, %w_span5) : (index, index, index, index, index, index, index, index, index, index, index, index) -> (index)
+  %d_s1_m = func.call @ggml_hrx_mvg_pick(%wg, %s1, %s2, %s3, %s4, %s5, %d_s1_0, %d_s1_1, %d_s1_2, %d_s1_3, %d_s1_4, %d_s1_5) : (index, index, index, index, index, index, index, index, index, index, index, index) -> (index)
+  %d_span_m = func.call @ggml_hrx_mvg_pick(%wg, %s1, %s2, %s3, %s4, %s5, %d_span0, %d_span1, %d_span2, %d_span3, %d_span4, %d_span5) : (index, index, index, index, index, index, index, index, index, index, index, index) -> (index)
+  %weight = func.call @ggml_hrx_mvg_pick_buffer(%wg, %s1, %s2, %s3, %s4, %s5, %w0, %w1, %w2, %w3, %w4, %w5) : (index, index, index, index, index, index, buffer, buffer, buffer, buffer, buffer, buffer) -> (buffer)
+  %dst = func.call @ggml_hrx_mvg_pick_buffer(%wg, %s1, %s2, %s3, %s4, %s5, %o0, %o1, %o2, %o3, %o4, %o5) : (index, index, index, index, index, index, buffer, buffer, buffer, buffer, buffer, buffer) -> (buffer)
+  %wg_local = index.sub %wg, %start : index
+
+  // From here on the same as ggml_mul_mat_vec_xs with one batch.
+  %k_size = index.assume %k_size_in [range(%k_size_in, 1, 2147483647)] : index
+  %n_rows = index.assume %n_rows_m [range(%n_rows_m, 1, 2147483647)] : index
+  %n_cols = index.assume %n_cols_in [range(%n_cols_in, 1, 2147483647)] : index
+  %w_s1 = index.assume %w_s1_m [range(%w_s1_m, 0, 2147483647)] : index
+  %w_span = index.assume %w_span_m [range(%w_span_m, 1, 2147483647)] : index
+  %x_s1 = index.assume %x_s1_in [range(%x_s1_in, 0, 2147483647)] : index
+  %x_span = index.assume %x_span_in [range(%x_span_in, 1, 2147483647)] : index
+  %d_s1 = index.assume %d_s1_m [range(%d_s1_m, 0, 2147483647)] : index
+  %d_span = index.assume %d_span_m [range(%d_span_m, 1, 2147483647)] : index
+  %n_pass = index.assume %n_pass_in [range(%n_pass_in, 1, 256)] : index
+  %wtype = config.get @ggml.mul_mat.weight_type : index
+  %n_tile = config.get @ggml.mul_mat.vec_cols : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c3 = index.constant 3 : index
+  %c4 = index.constant 4 : index
+  %c5 = index.constant 5 : index
+  %c6 = index.constant 6 : index
+  %c7 = index.constant 7 : index
+  %c16 = index.constant 16 : index
+  %c255 = index.constant 255 : index
+  %c256 = index.constant 256 : index
+  %c4096 = index.constant 4096 : index
+  %stage_bytes = index.constant 16384 : offset
+  %b0 = index.constant 0 : offset
+  %zero = scalar.constant 0.0 : f32
+  %zero4 = vector.splatf 0.0 : vector<4xf32>
+  %true = scalar.constant true : i1
+  %false = scalar.constant false : i1
+  %depth = config.get @ggml.mul_mat.vec_xs_depth : index
+  %t0 = kernel.workitem.id<x> : index
+  %t = index.assume %t0 [range(%t0, 0, 255)] : index
+  %slot = index.div %t, %c16 : index
+  %part = index.rem %t, %c16 : index
+  %weight_noalias, %input_noalias, %dst_noalias = buffer.assume.noalias %weight, %input, %dst : buffer, buffer, buffer
+  %stage = buffer.alloca<workgroup> align(16) %stage_bytes : buffer
+  %stage_view = buffer.view %stage[%b0] : buffer -> view<4096xf32>
+  %unit_bytes, %sb_bytes, %sb_units = template.apply<@ggml.weight.superblock>(%wtype) : (index) -> (offset, offset, index)
+  %k_tail = config.get @ggml.mul_mat.vec_k_tail : index
+  %k_pad = index.mul %k_tail, %c255 : index
+  %k_round = index.add %k_size, %k_pad : index
+  %n_sb0 = index.div %k_round, %c256 : index
+  %n_sb1 = index.min %n_sb0, %c16 : index
+  %no_sb = index.cmp eq, %n_sb1, %c0 : index
+  %n_sb2 = scf.select %no_sb, %c1, %n_sb1 : index
+  %n_sb = index.assume %n_sb2 [range(%n_sb2, 1, 16)] : index
+  %rows_par0 = index.div %c16, %n_sb : index
+  %rows_par = index.assume %rows_par0 [range(%rows_par0, 1, 16)] : index
+  %row_off = index.div %slot, %n_sb : index
+  %sb = index.rem %slot, %n_sb : index
+  %slot_on = index.cmp ult, %row_off, %rows_par : index
+  %pass0 = index.mul %wg_local, %n_pass : index
+  %row0 = index.mul %pass0, %rows_par : index
+  %wg_rows = index.mul %n_pass, %rows_par : index
+  %row_end_raw = index.add %row0, %wg_rows : index
+  %row_end = index.min %row_end_raw, %n_rows : index
+  %last_row = index.sub %row_end, %c1 : index
+  // If the last row is in the weight span, all rows of the workgroup are in it.
+  %w_last_base = index.mul %last_row, %w_s1 : index
+  %has_tail = index.cmp ne, %k_tail, %c0 : index
+  %full_units = index.mul %n_sb, %sb_units : index
+  %k_units = index.mul %k_size, %sb_units : index
+  %tail_units = index.div %k_units, %c256 : index
+  %row_units = scf.select %has_tail, %tail_units, %full_units : index
+  %w_last_end = index.add %w_last_base, %row_units : index
+  %w_ok = index.cmp ule, %w_last_end, %w_span : index
+  %x_base0, %use0, %store0, %x_ok0 = func.call @ggml_hrx_mv_col_base(%c0, %n_tile, %n_cols, %c0, %x_s1, %k_size, %x_span, %true) : (index, index, index, index, index, index, index, i1) -> (index, i1, i1, i1)
+  %x_base1, %use1, %store1, %x_ok1 = func.call @ggml_hrx_mv_col_base(%c1, %n_tile, %n_cols, %c0, %x_s1, %k_size, %x_span, %x_ok0) : (index, index, index, index, index, index, index, i1) -> (index, i1, i1, i1)
+  %x_base2, %use2, %store2, %x_ok2 = func.call @ggml_hrx_mv_col_base(%c2, %n_tile, %n_cols, %c0, %x_s1, %k_size, %x_span, %x_ok1) : (index, index, index, index, index, index, index, i1) -> (index, i1, i1, i1)
+  %x_base3, %use3, %store3, %x_ok3 = func.call @ggml_hrx_mv_col_base(%c3, %n_tile, %n_cols, %c0, %x_s1, %k_size, %x_span, %x_ok2) : (index, index, index, index, index, index, index, i1) -> (index, i1, i1, i1)
+  %x_base4, %use4, %store4, %x_ok4 = func.call @ggml_hrx_mv_col_base(%c4, %n_tile, %n_cols, %c0, %x_s1, %k_size, %x_span, %x_ok3) : (index, index, index, index, index, index, index, i1) -> (index, i1, i1, i1)
+  %x_base5, %use5, %store5, %x_ok5 = func.call @ggml_hrx_mv_col_base(%c5, %n_tile, %n_cols, %c0, %x_s1, %k_size, %x_span, %x_ok4) : (index, index, index, index, index, index, index, i1) -> (index, i1, i1, i1)
+  %x_base6, %use6, %store6, %x_ok6 = func.call @ggml_hrx_mv_col_base(%c6, %n_tile, %n_cols, %c0, %x_s1, %k_size, %x_span, %x_ok5) : (index, index, index, index, index, index, index, i1) -> (index, i1, i1, i1)
+  %x_base7, %use7, %store7, %x_ok = func.call @ggml_hrx_mv_col_base(%c7, %n_tile, %n_cols, %c0, %x_s1, %k_size, %x_span, %x_ok6) : (index, index, index, index, index, index, index, i1) -> (index, i1, i1, i1)
+  %ok = scf.select %w_ok, %x_ok, %false : i1
+  scf.if %ok {
+    %o0, %o1, %o2, %o3 = template.apply<@ggml.weight.offsets16>(%wtype, %part) : (index, index) -> (index, index, index, index)
+    // A lane past K in the partial superblock loads no data. The dot products stay uniform in each group of 16 lanes.
+    %sb_k = index.mul %sb, %c256 : index
+    %lane_last = index.add %o3, %c4 : index
+    %lane_end = index.add %sb_k, %lane_last : index
+    %lane_in = index.cmp ule, %lane_end, %k_size : index
+    %lane_ok = scf.select %has_tail, %lane_in, %true : i1
+    %xu0 = scf.select %lane_ok, %use0, %false : i1
+    %xu1 = scf.select %lane_ok, %use1, %false : i1
+    %xu2 = scf.select %lane_ok, %use2, %false : i1
+    %xu3 = scf.select %lane_ok, %use3, %false : i1
+    %xu4 = scf.select %lane_ok, %use4, %false : i1
+    %xu5 = scf.select %lane_ok, %use5, %false : i1
+    %xu6 = scf.select %lane_ok, %use6, %false : i1
+    %xu7 = scf.select %lane_ok, %use7, %false : i1
+    %x00, %x01, %x02, %x03 = func.call @ggml_hrx_mv_xload(%xu0, %input_noalias, %x_base0, %sb, %o0, %o1, %o2, %o3) : (i1, buffer, index, index, index, index, index, index) -> (vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>)
+    %x10, %x11, %x12, %x13 = func.call @ggml_hrx_mv_xload(%xu1, %input_noalias, %x_base1, %sb, %o0, %o1, %o2, %o3) : (i1, buffer, index, index, index, index, index, index) -> (vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>)
+    %x20, %x21, %x22, %x23 = func.call @ggml_hrx_mv_xload(%xu2, %input_noalias, %x_base2, %sb, %o0, %o1, %o2, %o3) : (i1, buffer, index, index, index, index, index, index) -> (vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>)
+    %x30, %x31, %x32, %x33 = func.call @ggml_hrx_mv_xload(%xu3, %input_noalias, %x_base3, %sb, %o0, %o1, %o2, %o3) : (i1, buffer, index, index, index, index, index, index) -> (vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>)
+    %x40, %x41, %x42, %x43 = func.call @ggml_hrx_mv_xload(%xu4, %input_noalias, %x_base4, %sb, %o0, %o1, %o2, %o3) : (i1, buffer, index, index, index, index, index, index) -> (vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>)
+    %x50, %x51, %x52, %x53 = func.call @ggml_hrx_mv_xload(%xu5, %input_noalias, %x_base5, %sb, %o0, %o1, %o2, %o3) : (i1, buffer, index, index, index, index, index, index) -> (vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>)
+    %x60, %x61, %x62, %x63 = func.call @ggml_hrx_mv_xload(%xu6, %input_noalias, %x_base6, %sb, %o0, %o1, %o2, %o3) : (i1, buffer, index, index, index, index, index, index) -> (vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>)
+    %x70, %x71, %x72, %x73 = func.call @ggml_hrx_mv_xload(%xu7, %input_noalias, %x_base7, %sb, %o0, %o1, %o2, %o3) : (i1, buffer, index, index, index, index, index, index) -> (vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>)
+    %w_sb_byte = index.scale %sb, %sb_bytes : index, offset -> offset
+    %in_tile = index.cmp ult, %part, %n_tile : index
+    %writer = scf.select %slot_on, %in_tile, %false : i1
+    %is1 = index.cmp eq, %part, %c1 : index
+    %is2 = index.cmp eq, %part, %c2 : index
+    %is3 = index.cmp eq, %part, %c3 : index
+    %is4 = index.cmp eq, %part, %c4 : index
+    %is5 = index.cmp eq, %part, %c5 : index
+    %is6 = index.cmp eq, %part, %c6 : index
+    %is7 = index.cmp eq, %part, %c7 : index
+    scf.for %p = [%c0 to %n_pass step %c1] pipeline(%depth) {
+      // A row past the end reads the last row. The final sum skips its partial.
+      %pass = index.add %pass0, %p : index
+      %pass_row = index.mul %pass, %rows_par : index
+      %row_raw = index.add %pass_row, %row_off : index
+      %row_in = index.cmp ult, %row_raw, %n_rows : index
+      %row = scf.select %row_in, %row_raw, %last_row : index
+      %w_row = index.mul %row, %w_s1 : index
+      %w_row_byte = index.scale %w_row, %unit_bytes : index, offset -> offset
+      %sb_byte = index.add %w_sb_byte, %w_row_byte : offset
+      %d0, %d1, %d2, %d3 = scf.if %lane_ok -> (vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>) {
+        %e0, %e1, %e2, %e3, %q0, %q1, %q2, %q3 = template.apply<@ggml.weight.part16>(%wtype, %weight_noalias, %sb_byte, %part) : (index, buffer, offset, index) -> (vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>, index, index, index, index)
+        scf.yield %e0, %e1, %e2, %e3 : vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>
+      } else {
+        scf.yield %zero4, %zero4, %zero4, %zero4 : vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>
+      }
+      %v0 = func.call @ggml_hrx_mv_dot16(%use0, %d0, %d1, %d2, %d3, %x00, %x01, %x02, %x03) : (i1, vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>) -> (f32)
+      %v1 = func.call @ggml_hrx_mv_dot16(%use1, %d0, %d1, %d2, %d3, %x10, %x11, %x12, %x13) : (i1, vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>) -> (f32)
+      %v2 = func.call @ggml_hrx_mv_dot16(%use2, %d0, %d1, %d2, %d3, %x20, %x21, %x22, %x23) : (i1, vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>) -> (f32)
+      %v3 = func.call @ggml_hrx_mv_dot16(%use3, %d0, %d1, %d2, %d3, %x30, %x31, %x32, %x33) : (i1, vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>) -> (f32)
+      %v4 = func.call @ggml_hrx_mv_dot16(%use4, %d0, %d1, %d2, %d3, %x40, %x41, %x42, %x43) : (i1, vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>) -> (f32)
+      %v5 = func.call @ggml_hrx_mv_dot16(%use5, %d0, %d1, %d2, %d3, %x50, %x51, %x52, %x53) : (i1, vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>) -> (f32)
+      %v6 = func.call @ggml_hrx_mv_dot16(%use6, %d0, %d1, %d2, %d3, %x60, %x61, %x62, %x63) : (i1, vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>) -> (f32)
+      %v7 = func.call @ggml_hrx_mv_dot16(%use7, %d0, %d1, %d2, %d3, %x70, %x71, %x72, %x73) : (i1, vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>) -> (f32)
+      %u1 = scf.select %is1, %v1, %v0 : f32
+      %u2 = scf.select %is2, %v2, %u1 : f32
+      %u3 = scf.select %is3, %v3, %u2 : f32
+      %u4 = scf.select %is4, %v4, %u3 : f32
+      %u5 = scf.select %is5, %v5, %u4 : f32
+      %u6 = scf.select %is6, %v6, %u5 : f32
+      %u7 = scf.select %is7, %v7, %u6 : f32
+      scf.if %writer {
+        %i_raw = func.call @ggml_hrx_mvg_stage_index(%p, %n_tile, %part, %slot) : (index, index, index, index) -> (index)
+        %i = index.assume %i_raw [range(%i_raw, 0, 4095)] : index
+        %i_in = index.cmp ult, %i, %c4096 : index
+        scf.if %i_in {
+          view.store %u7, %stage_view[%i] : f32, view<4096xf32>
+        }
+      }
+    }
+  }
+  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+  scf.if %ok {
+    %n_out = index.mul %wg_rows, %n_tile : index
+    scf.for %o_raw = [%t to %n_out step %c256] {
+      %o = index.assume %o_raw [range(%o_raw, 0, 4095)] : index
+      %row_local = index.div %o, %n_tile : index
+      %col = index.rem %o, %n_tile : index
+      %p = index.div %row_local, %rows_par : index
+      %ro = index.rem %row_local, %rows_par : index
+      %row = index.add %row0, %row_local : index
+      %row_in = index.cmp ult, %row, %n_rows : index
+      %col_in = index.cmp ult, %col, %n_cols : index
+      %st = scf.select %row_in, %col_in, %false : i1
+      scf.if %st {
+        %ro_slots = index.mul %ro, %n_sb : index
+        %sum = scf.for %j = [%c0 to %n_sb step %c1](%acc = %zero : f32) -> (f32) {
+          %slot_j = index.add %ro_slots, %j : index
+          %i_raw = func.call @ggml_hrx_mvg_stage_index(%p, %n_tile, %col, %slot_j) : (index, index, index, index) -> (index)
+          %i = index.assume %i_raw [range(%i_raw, 0, 4095)] : index
+          %i_in = index.cmp ult, %i, %c4096 : index
+          %next = scf.if %i_in -> (f32) {
+            %part_sum = view.load %stage_view[%i] : view<4096xf32> -> f32
+            %a = scalar.addf %acc, %part_sum : f32
+            scf.yield %a : f32
+          } else {
+            scf.yield %acc : f32
+          }
+          scf.yield %next : f32
+        }
+        %d_col = index.mul %col, %d_s1 : index
+        %d_index = index.add %d_col, %row : index
+        func.call @ggml_hrx_mm_store(%dst_noalias, %d_span, %d_index, %sum) : (buffer, index, index, f32)
+      }
+    }
+  }
+  kernel.return
+}

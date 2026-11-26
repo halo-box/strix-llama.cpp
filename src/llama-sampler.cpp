@@ -1421,6 +1421,287 @@ struct llama_sampler * llama_sampler_init_dist(uint32_t seed) {
     );
 }
 
+// dist_spec: dist that can also verify a speculative draft in the backend sampling graph (rejection sampling)
+// output row i of the sequence checks the draft token of row i: the row keeps it with probability min(1, p/q), else it
+// samples norm(max(p - q, 0)); a row without a draft token samples p. The host reads one token for each row.
+
+struct llama_sampler_dist_spec : public llama_sampler_backend {
+    const uint32_t seed;
+          uint32_t seed_cur;
+
+    std::mt19937 rng;
+
+    const int32_t n_vocab;
+    const int32_t n_cand; // most candidates of a draft distribution
+
+    // draft of the next backend decode, by output row: token (-1: none), q of the token, n_cand candidates and their q
+    std::vector<llama_token> draft;
+    std::vector<float>       draft_q;
+    std::vector<llama_token> cand_id;
+    std::vector<float>       cand_q;
+
+    // inputs of the current sampling graph, two for each row: [u, v, q(token), q of the candidates] and [token, candidates]
+    std::vector<ggml_tensor *> inp_f;
+    std::vector<ggml_tensor *> inp_i;
+
+    void copy_state(const llama_sampler_dist_spec & src) {
+        seed_cur = src.seed_cur;
+        rng      = src.rng;
+    }
+};
+
+static const char * llama_sampler_dist_spec_name(const struct llama_sampler * smpl) {
+    auto * sctx = (llama_sampler_dist_spec *) smpl->ctx;
+    return sctx->get_name();
+}
+
+static void llama_sampler_dist_spec_apply(struct llama_sampler * smpl, llama_token_data_array * cur_p) {
+    auto * sctx = (llama_sampler_dist_spec *) smpl->ctx;
+
+    if (cur_p->size == 0) {
+        cur_p->selected = -1;
+        return;
+    }
+
+    llama_sampler_softmax_impl(cur_p, false);
+    cur_p->selected = llama_sample_dist(cur_p, sctx->rng);
+}
+
+static void llama_sampler_dist_spec_reset(struct llama_sampler * smpl) {
+    auto * sctx = (llama_sampler_dist_spec *) smpl->ctx;
+    sctx->seed_cur = get_rng_seed(sctx->seed);
+    sctx->rng.seed(sctx->seed_cur);
+}
+
+static struct llama_sampler * llama_sampler_dist_spec_clone(const struct llama_sampler * smpl) {
+    const auto * sctx = (const llama_sampler_dist_spec *) smpl->ctx;
+    auto * result = llama_sampler_init_dist_spec(sctx->seed, sctx->n_vocab, sctx->n_cand);
+
+    auto * result_ctx = (llama_sampler_dist_spec *) result->ctx;
+    result_ctx->copy_state(*sctx);
+
+    return result;
+}
+
+static void llama_sampler_dist_spec_free(struct llama_sampler * smpl) {
+    delete (llama_sampler_dist_spec *) smpl->ctx;
+}
+
+static bool llama_sampler_dist_spec_backend_init(
+        struct llama_sampler       * smpl,
+        ggml_backend_buffer_type_t   buft,
+        uint32_t                     n_outputs_max_per_seq) {
+    GGML_UNUSED(n_outputs_max_per_seq);
+
+    auto * sctx = (llama_sampler_dist_spec *) smpl->ctx;
+
+    const bool res = llama_sampler_backend_support(smpl, buft);
+
+    sctx->init(res);
+
+    return res;
+}
+
+static void llama_sampler_dist_spec_backend_apply(
+        struct llama_sampler      * smpl,
+        struct ggml_context       * ctx,
+        struct ggml_cgraph        * gf,
+        struct llama_sampler_data * data) {
+    GGML_UNUSED(gf);
+
+    auto * sctx = (llama_sampler_dist_spec *) smpl->ctx;
+
+    const int64_t K = sctx->n_cand;
+
+    ggml_tensor * inp_f = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 3 + K);
+    ggml_format_name(inp_f, "spec_f_%zu", sctx->inp_f.size());
+    ggml_set_input(inp_f);
+    sctx->inp_f.push_back(inp_f);
+
+    ggml_tensor * inp_i = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1 + K);
+    ggml_format_name(inp_i, "spec_i_%zu", sctx->inp_i.size());
+    ggml_set_input(inp_i);
+    sctx->inp_i.push_back(inp_i);
+
+    ggml_tensor * logits = ggml_reshape_1d(ctx, data->logits, ggml_nelements(data->logits));
+
+    // p over the vocabulary, one value for each row
+    ggml_tensor * p = ggml_soft_max(ctx, logits);
+    int64_t n = ggml_nelements(p);
+    if (data->candidates != nullptr) {
+        n = sctx->n_vocab;
+        ggml_tensor * zero = ggml_fill(ctx, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, n), 0.0f);
+        p = ggml_set_rows(ctx, zero, ggml_reshape_2d(ctx, p, 1, ggml_nelements(p)), data->candidates);
+    }
+    ggml_tensor * pv = ggml_reshape_2d(ctx, p, 1, n);
+    ggml_set_name(pv, "spec_p");
+
+    ggml_tensor * tok = ggml_view_1d(ctx, inp_i, 1, 0);
+    ggml_tensor * ids = ggml_view_1d(ctx, inp_i, K, sizeof(int32_t));
+    ggml_tensor * u   = ggml_view_1d(ctx, inp_f, 1, 0);
+    ggml_tensor * v   = ggml_view_1d(ctx, inp_f, 1, sizeof(float));
+    ggml_tensor * q_t = ggml_view_1d(ctx, inp_f, 1, 2*sizeof(float));
+    ggml_tensor * q_c = ggml_view_2d(ctx, inp_f, 1, K, sizeof(float), 3*sizeof(float));
+
+    // keep the draft token if u*q < p
+    ggml_tensor * p_t = ggml_reshape_1d(ctx, ggml_get_rows(ctx, pv, tok), 1);
+    ggml_tensor * acc = ggml_step(ctx, ggml_sub(ctx, p_t, ggml_mul(ctx, u, q_t)));
+    ggml_set_name(acc, "spec_accept");
+
+    // residual max(p - q, 0): q is 0 outside its candidates; p is the fallback if nothing is left
+    ggml_tensor * r_c = ggml_relu(ctx, ggml_sub(ctx, ggml_get_rows(ctx, pv, ids), q_c));
+    ggml_tensor * res = ggml_set_rows(ctx, ggml_cont(ctx, pv), r_c, ids);
+    ggml_tensor * none = ggml_scale_bias(ctx, ggml_step(ctx, ggml_sum(ctx, res)), -1.0f, 1.0f);
+    res = ggml_reshape_1d(ctx, ggml_add(ctx, res, ggml_mul(ctx, pv, none)), n);
+    ggml_set_name(res, "spec_residual");
+
+    // draw from the residual like the dist sampler: index of the first cumulative weight above v * sum
+    ggml_tensor * mask = ggml_step(ctx, ggml_sub(ctx, ggml_cumsum(ctx, res), ggml_mul(ctx, v, ggml_sum(ctx, res))));
+    ggml_tensor * idxf = ggml_scale_bias(ctx, ggml_clamp(ctx, ggml_sum(ctx, mask), 1.0f, (float) n), -1.0f, (float) n);
+
+    ggml_tensor * tokf = ggml_cast(ctx, tok, GGML_TYPE_F32);
+    ggml_tensor * out  = ggml_add(ctx, idxf, ggml_mul(ctx, acc, ggml_sub(ctx, tokf, idxf)));
+
+    data->sampled    = ggml_cast(ctx, out, GGML_TYPE_I32);
+    data->probs      = nullptr;
+    data->logits     = nullptr;
+    data->candidates = nullptr;
+    ggml_set_name(data->sampled, "spec_sampled");
+}
+
+static void llama_sampler_dist_spec_backend_set_input(struct llama_sampler * smpl) {
+    auto * sctx = (llama_sampler_dist_spec *) smpl->ctx;
+
+    const int32_t K = sctx->n_cand;
+
+    std::uniform_real_distribution<double> dist(0.0f, 1.0f);
+
+    std::vector<float>   f(3 + K);
+    std::vector<int32_t> ids(1 + K);
+
+    for (size_t r = 0; r < sctx->inp_f.size(); ++r) {
+        // two draws for each row, so the stream does not depend on the draft
+        const float u = dist(sctx->rng);
+        const float v = dist(sctx->rng);
+
+        const bool has_draft = r < sctx->draft.size() && sctx->draft[r] >= 0;
+
+        std::fill(f.begin(), f.end(), 0.0f);
+        std::fill(ids.begin(), ids.end(), 0);
+
+        // a row without a draft token never keeps it (u > 1) and its residual is p
+        f[0] = has_draft ? u : 2.0f;
+        f[1] = v;
+        f[2] = has_draft ? sctx->draft_q[r] : 1.0f;
+        if (has_draft) {
+            ids[0] = sctx->draft[r];
+            for (int32_t k = 0; k < K; ++k) {
+                ids[1 + k]  = sctx->cand_id[r*K + k];
+                f[3 + k]    = sctx->cand_q[r*K + k];
+            }
+        }
+
+        ggml_backend_tensor_set(sctx->inp_f[r], f.data(),   0, f.size()*sizeof(float));
+        ggml_backend_tensor_set(sctx->inp_i[r], ids.data(), 0, ids.size()*sizeof(int32_t));
+    }
+
+    // a draft is for one decode
+    sctx->draft.clear();
+}
+
+static void llama_sampler_dist_spec_backend_reset(struct llama_sampler * smpl) {
+    auto * sctx = (llama_sampler_dist_spec *) smpl->ctx;
+    sctx->inp_f.clear();
+    sctx->inp_i.clear();
+}
+
+static struct llama_sampler_i llama_sampler_dist_spec_i = {
+    /* .name              = */ llama_sampler_dist_spec_name,
+    /* .accept            = */ nullptr,
+    /* .apply             = */ llama_sampler_dist_spec_apply,
+    /* .reset             = */ llama_sampler_dist_spec_reset,
+    /* .clone             = */ llama_sampler_dist_spec_clone,
+    /* .free              = */ llama_sampler_dist_spec_free,
+    /* .backend_init      = */ llama_sampler_dist_spec_backend_init,
+    /* .backend_accept    = */ nullptr,
+    /* .backend_apply     = */ llama_sampler_dist_spec_backend_apply,
+    /* .backend_set_input = */ llama_sampler_dist_spec_backend_set_input,
+    /* .backend_reset     = */ llama_sampler_dist_spec_backend_reset,
+    /* .copy_state        = */ llama_sampler_backend_copy_state<llama_sampler_dist_spec>,
+};
+
+struct llama_sampler * llama_sampler_init_dist_spec(uint32_t seed, int32_t n_vocab, int32_t n_cand) {
+    auto seed_cur = get_rng_seed(seed);
+    return llama_sampler_init(
+        /* .iface = */ &llama_sampler_dist_spec_i,
+        /* .ctx   = */ new llama_sampler_dist_spec {
+            ("dist_spec"),
+            /* .seed     = */ seed,
+            /* .seed_cur = */ seed_cur,
+            /* .rng      = */ std::mt19937(seed_cur),
+            /* .n_vocab  = */ n_vocab,
+            /* .n_cand   = */ std::max(n_cand, 1),
+            /* .draft    = */ {},
+            /* .draft_q  = */ {},
+            /* .cand_id  = */ {},
+            /* .cand_q   = */ {},
+            /* .inp_f    = */ {},
+            /* .inp_i    = */ {},
+        }
+    );
+}
+
+bool llama_sampler_dist_spec_set_draft(
+        struct llama_sampler * smpl, int32_t n_rows, const llama_token * tokens, const llama_token_data * const * q, const int32_t * n_q) {
+    if (smpl == nullptr) {
+        return false;
+    }
+    if (smpl->iface == &llama_sampler_chain_i) {
+        const auto * chain = (const llama_sampler_chain *) smpl->ctx;
+        if (chain->samplers.empty()) {
+            return false;
+        }
+        smpl = chain->samplers.back().ptr;
+    }
+    if (smpl->iface != &llama_sampler_dist_spec_i) {
+        return false;
+    }
+
+    auto * sctx = (llama_sampler_dist_spec *) smpl->ctx;
+
+    const int32_t K = sctx->n_cand;
+
+    sctx->draft.clear();
+    for (int32_t r = 0; r < n_rows; ++r) {
+        if (n_q[r] < 1 || n_q[r] > K) {
+            return false;
+        }
+    }
+
+    sctx->draft.assign(tokens, tokens + n_rows);
+    sctx->draft_q.assign(n_rows, 0.0f);
+    sctx->cand_id.assign((size_t) n_rows*K, 0);
+    sctx->cand_q.assign((size_t) n_rows*K, 0.0f);
+
+    for (int32_t r = 0; r < n_rows; ++r) {
+        for (int32_t k = 0; k < K; ++k) {
+            // padding repeats the first candidate, so the scatter writes the same value twice
+            const llama_token_data & c = q[r][k < n_q[r] ? k : 0];
+            sctx->cand_id[r*K + k] = c.id;
+            sctx->cand_q[r*K + k]  = c.p;
+            if (k < n_q[r] && c.id == tokens[r]) {
+                sctx->draft_q[r] = c.p;
+            }
+        }
+        if (sctx->draft_q[r] <= 0.0f) {
+            // a token outside its own q: verify by sampling p only
+            sctx->draft[r] = -1;
+        }
+    }
+
+    return true;
+}
+
 void llama_sampler_backend_begin(llama_sampler * sampler) {
     GGML_ASSERT(sampler != nullptr);
 
@@ -4323,6 +4604,10 @@ void llama_sampler_copy(const struct llama_sampler * src, struct llama_sampler *
 uint32_t llama_sampler_get_seed(const struct llama_sampler * smpl) {
     if (smpl->iface == &llama_sampler_dist_i) {
         return ((const llama_sampler_dist *) smpl->ctx)->seed_cur;
+    }
+
+    if (smpl->iface == &llama_sampler_dist_spec_i) {
+        return ((const llama_sampler_dist_spec *) smpl->ctx)->seed_cur;
     }
 
     if (smpl->iface == &llama_sampler_mirostat_i) {
