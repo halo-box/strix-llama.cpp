@@ -1,13 +1,21 @@
+cmake_minimum_required(VERSION 3.14)
+
 # Usage: cmake -DKERNEL_DIR=<dir> -DOUTPUT=<file.cpp> -P embed-kernels.cmake
 
 file(GLOB_RECURSE kernel_files RELATIVE "${KERNEL_DIR}" "${KERNEL_DIR}/*.loom")
+file(GLOB_RECURSE generated_files RELATIVE "${GENERATED_KERNEL_DIR}" "${GENERATED_KERNEL_DIR}/*.loom")
+list(APPEND kernel_files ${generated_files})
 list(SORT kernel_files)
 
 set(arrays "")
 set(table  "")
 set(index  0)
 foreach(file IN LISTS kernel_files)
-    file(READ "${KERNEL_DIR}/${file}" hex HEX)
+    if(file IN_LIST generated_files)
+        file(READ "${GENERATED_KERNEL_DIR}/${file}" hex HEX)
+    else()
+        file(READ "${KERNEL_DIR}/${file}" hex HEX)
+    endif()
     string(LENGTH "${hex}" hex_len)
     math(EXPR size "${hex_len} / 2")
     string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," bytes "${hex}")
