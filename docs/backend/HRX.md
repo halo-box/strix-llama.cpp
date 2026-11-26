@@ -93,3 +93,19 @@ done
 ```
 
 The second command scores the tokens saved by the first and reports both perplexities and mean KL divergence in nats per scored token. Regenerate the reference for each FA setting, ubatch size and backend. For the CPU pair use `-dev none -ngl 0`. The target-only comparison does not need a draft model.
+
+The table uses the Q4_K_XL target above on a Ryzen AI Max+ 395. Each row scores 1,016 next tokens across two 256-token chunks per corpus. Pooled PPL is the exponential of mean token loss. Take the reference PPL from the first command, before reference compression. KL is the mean of the tool's forward KL estimate, in nats per token.
+
+| Reference | Candidate | FA | Ubatch | Reference PPL | Candidate PPL | Mean KL |
+|---|---|---|---:|---:|---:|---:|
+| Master CPU | PR CPU | off | 128, 256 | 13.4500 | 2.2455 | 3.602786 |
+| Master CPU | PR CPU | on | 128, 256 | 15.1196 | 2.2449 | 3.850718 |
+| Master Vulkan | PR Vulkan | off | 128 | 13.4066 | 2.2389 | 3.563863 |
+| Master Vulkan | PR Vulkan | off | 256 | 12.7633 | 2.2417 | 3.567997 |
+| Master Vulkan | PR Vulkan | on | 128 | 14.4555 | 2.2463 | 3.698233 |
+| Master Vulkan | PR Vulkan | on | 256 | 13.8679 | 2.2443 | 3.596213 |
+| Master CPU with loader fix | PR CPU | on | 256 | 2.2449 | 2.2449 | <0.000001 |
+| Master Vulkan with loader fix | PR Vulkan | on | 256 | 2.2442 | 2.2443 | <0.000001 |
+| PR CPU | PR HRX | on | 256 | 2.2449 | 2.2438 | 0.002045 |
+
+The base was `1da4f8e50cd679aba69682990a9abe9bacec7f5c` and the PR build was `c68d5875a3e32ee57fc3e4f29fe7264e0d77ee3d`. Master copies the physical layer into each repeated layer before loading optional expert scales. Moving that copy after scale loading on master accounts for the large PPL difference at FA on, ubatch 256. This sample measures target-model quality at short context. The 32k DSpark table above measures throughput.

@@ -28,7 +28,7 @@ def gen(K, G):
     assert G in (1, 2)
     KC = K // 128
     CPG = COLS // G
-    opt = dict(KC=KC, G=G, CPG=CPG, ring=ring, eslot=eslot)
+    opt = dict(CPG=CPG, ring=ring, eslot=eslot)
     w = Writer()
     I8, V8 = f"tile<{REC}xi8>", f"view<{REC}xi8>"
     I32, V32 = f"tile<{4 * CREC}xi32>", f"view<{4 * CREC}xi32>"
@@ -111,7 +111,7 @@ def gen(K, G):
 
     w("  pipeline.serial {")
     w("  scf.for %p = [%c0 to %passes step %c1] {")
-    w(f"  %prow = index.mul %p, %cpg2 : index")   # first 64-row block of this pass
+    w("  %prow = index.mul %p, %cpg2 : index")   # first 64-row block of this pass
     # ---------------- phase 1: A into the retained rings ----------------
     w("  pipeline.concurrent {")
     for c in range(COLS):
@@ -204,7 +204,7 @@ def gen(K, G):
 
 
 def compute_strand(w, c, r, o, ty):
-    KC, CPG, ring = o["KC"], o["CPG"], o["ring"]
+    CPG, ring = o["CPG"], o["ring"]
     I8, V8, I32, V32, J, JV, DMA_OUT = (ty[k] for k in ("I8", "V8", "I32", "V32", "J", "JV", "DMA_OUT"))
     grp = c // CPG
     rbl = c % CPG
@@ -226,7 +226,7 @@ def compute_strand(w, c, r, o, ty):
     w("    %zvec = vector.splati 0 : vector<16xi32>")
     w(f"    %tg = index.add %tg{grp}, %c0 : index")
     w(f"    %astride = index.constant {REC} : offset")
-    w(f"    %aoff0 = index.constant 0 : offset")
+    w("    %aoff0 = index.constant 0 : offset")
     w("    %roff0 = index.constant 0 : offset")
     w(f"    %bstride = index.constant {REC} : offset")
     w(f"    %j0 = index.add %j0{grp}, %c0 : index")
@@ -350,6 +350,7 @@ def compute_strand(w, c, r, o, ty):
     tile("      ", "%gl")
     w("    }")
     w("  }")
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
