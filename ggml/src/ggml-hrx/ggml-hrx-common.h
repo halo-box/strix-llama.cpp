@@ -116,6 +116,8 @@ struct ggml_backend_hrx_context {
     // Recorded graphs, keyed by the first node. A graph that runs again unchanged is replayed with one launch.
     struct node_props {
         ggml_tensor           node;
+        uint64_t              buffer_id;
+        uint64_t              src_buffer_id[GGML_MAX_SRC];
         void *                src_data[GGML_MAX_SRC];
         ggml_backend_buffer_t src_buf[GGML_MAX_SRC];
         int64_t               src_ne[GGML_MAX_SRC][GGML_MAX_DIMS];

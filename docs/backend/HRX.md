@@ -55,6 +55,8 @@ scripts/serve-inkling2-dspark-hrx.sh \
 
 Llama prefers an available HRX GPU for the `inkling2_loop` target. DSpark follows a single HRX target device. Use `--device` or `--device-draft` for explicit placement. The launcher proposes up to three tokens per step. The mixed controller runs on gfx1151 at multiples of 128 from 128 through 8,192 prefill tokens. Other shapes use the regular controller.
 
+Grammar-constrained requests can keep backend sampling enabled. HRX implements `TOKEN_MASK` for F32 logits with I32 candidate IDs and all five packed mask formats, including padded rows. The CPU advances grammar state and prepares masks; HRX applies the mask and samples tokens. The default sample-then-check policy also supports lazy tool grammars with unlimited reasoning. Finite reasoning budgets and grammar-first sampling with reasoning still use CPU sampling. Probabilistic speculative decoding with a grammar retains the target candidates for host verification.
+
 Add `--hrx-npu` to select the HRX GPU paired with XDNA2. It offloads eligible Q8_0 matrix multiplications when the GPU has independent work before the result is needed. The option requires an available NPU. GPU-only runs do not open the NPU. Use `--server FILE` before the two model paths to launch a binary from another build directory.
 
 ## Regenerate the XDNA2 GEMMs

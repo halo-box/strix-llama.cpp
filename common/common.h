@@ -279,6 +279,7 @@ struct common_params_sampling {
     };
 
     common_grammar                      grammar;          // optional grammar constraint (user / output-format / tool-calls)
+    bool                                grammar_first = false; // establish grammar-first policy before decode; required for backend masking
     bool                                grammar_lazy = false;
     std::vector<common_grammar_trigger> grammar_triggers; // optional triggers (for lazy grammars)
     std::set<llama_token>               preserved_tokens;
@@ -321,6 +322,7 @@ struct common_params_sampling {
         0;  // <= 0 forces immediately. Positive values wait for a paragraph break.
 
     bool backend_sampling = false;
+    bool backend_sampling_candidates = false; // retain candidates for speculative sampling
 
     // with backend sampling, the chain ends with dist_spec: the backend returns only the token and can verify a
     // probabilistic draft (see common_sampler_spec_set_draft)

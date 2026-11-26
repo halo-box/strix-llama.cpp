@@ -60,6 +60,9 @@ bool ggml_hrx_supports_argmax(const ggml_hrx_device_context * dev, const ggml_te
 bool ggml_hrx_op_argmax(ggml_backend_hrx_context * ctx, const ggml_tensor * node);
 bool ggml_hrx_supports_cumsum(const ggml_hrx_device_context * dev, const ggml_tensor * op);
 bool ggml_hrx_op_cumsum(ggml_backend_hrx_context * ctx, const ggml_tensor * node);
+bool ggml_hrx_supports_token_mask(const ggml_hrx_device_context * dev, const ggml_tensor * op);
+bool ggml_hrx_op_token_mask(ggml_backend_hrx_context * ctx, const ggml_tensor * node);
+
 bool ggml_hrx_supports_sum(const ggml_hrx_device_context * dev, const ggml_tensor * op);
 bool ggml_hrx_op_sum(ggml_backend_hrx_context * ctx, const ggml_tensor * node);
 

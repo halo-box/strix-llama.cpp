@@ -3113,6 +3113,10 @@ static ggml_backend_buffer_type_t ggml_backend_rpc_device_get_buffer_type(ggml_b
 
 static bool ggml_backend_rpc_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
     GGML_UNUSED(dev);
+    // Older peers do not know this op.
+    if (op->op == GGML_OP_TOKEN_MASK) {
+        return false;
+    }
     //TODO: call the remote backend and cache the results
     return op->op != GGML_OP_FLASH_ATTN_EXT || !ggml_flash_attn_ext_has_indexed_bias(op);
 }
