@@ -1,0 +1,187 @@
+// Packed grammar mask over f32 logits, with optional candidate ids and padded rows.
+config.decl @ggml.elementwise.wg_size : %value: index where [range(%value, 64, 1024), multiple_of(%value, 64)]
+config.decl @ggml.token_mask.ids : %value: index where [range(%value, 0, 1)]
+target.decl @ggml_wave64
+
+kernel.def target(@ggml_wave64) export("ggml_token_mask_f32") @ggml_token_mask_f32(%n: index) {
+  %one = index.constant 1 : index
+  %wg = config.get @ggml.elementwise.wg_size : index
+  %round = index.sub %wg, %one : index
+  %nr = index.add %n, %round : index
+  %groups = index.div %nr, %wg : index
+  kernel.launch.config workgroups(%groups, %one, %one) workgroup_size(%wg, %one, %one) : index
+} launch(%n_in: index, %cols_in: index, %ls_in: index, %is_in: index, %ds_in: index, %lspan_in: index, %ispan_in: index, %dspan_in: index, %psize_in: index, %pspan_in: index, %logits: buffer, %ids: buffer, %payload: buffer, %desc: buffer, %dst: buffer) {
+  %n = index.assume %n_in [range(%n_in, 1, 2147482623)] : index
+  %cols = index.assume %cols_in [range(%cols_in, 1, 2147482623)] : index
+  %ls = index.assume %ls_in [range(%ls_in, 1, 2147482623)] : index
+  %is = index.assume %is_in [range(%is_in, 1, 2147482623)] : index
+  %ds = index.assume %ds_in [range(%ds_in, 4, 2147482623)] : index
+  %lspan = index.assume %lspan_in [range(%lspan_in, 1, 2147482623)] : index
+  %ispan = index.assume %ispan_in [range(%ispan_in, 1, 2147482623)] : index
+  %dspan = index.assume %dspan_in [range(%dspan_in, 4, 2147482623)] : index
+  %psize = index.assume %psize_in [range(%psize_in, 0, 2147482623)] : index
+  %pspan = index.assume %pspan_in [range(%pspan_in, 1, 2147482623)] : index
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c3 = index.constant 3 : index
+  %c4 = index.constant 4 : index
+  %c32 = index.constant 32 : index
+  %zero = index.constant 0 : offset
+  %false = scalar.constant false : i1
+  %zero_i32 = scalar.constant 0 : i32
+  %one_i32 = scalar.constant 1 : i32
+  %neg_inf_bits = scalar.constant -8388608 : i32
+  %neg_inf = scalar.bitcast %neg_inf_bits : i32 to f32
+  %wg = config.get @ggml.elementwise.wg_size : index
+  %has_ids = config.get @ggml.token_mask.ids : index
+  %group = kernel.workgroup.id<x> : index
+  %lane = kernel.workitem.id<x> : index
+  %base = index.mul %group, %wg : index
+  %i = index.add %base, %lane : index
+  %inside = index.cmp ult, %i, %n : index
+  %lv = buffer.view %logits[%zero] : buffer -> view<[%lspan]xf32>
+  %iv = buffer.view %ids[%zero] : buffer -> view<[%ispan]xi32>
+  %pv = buffer.view %payload[%zero] : buffer -> view<[%pspan]xi32>
+  %dv = buffer.view %desc[%zero] : buffer -> view<[%dspan]xi32>
+  %out = buffer.view %dst[%zero] : buffer -> view<[%n]xf32>
+  scf.if %inside {
+    %row = index.div %i, %cols : index
+    %col = index.rem %i, %cols : index
+    %dbase0 = index.mul %row, %ds : index
+    %dtop = index.sub %dspan, %c4 : index
+    %dbase = index.min %dbase0, %dtop : index
+    %d1 = index.add %dbase, %c1 : index
+    %d2 = index.add %dbase, %c2 : index
+    %d3 = index.add %dbase, %c3 : index
+    %m32 = view.load %dv[%dbase] : view<[%dspan]xi32> -> i32
+    %c32v = view.load %dv[%d1] : view<[%dspan]xi32> -> i32
+    %o32 = view.load %dv[%d2] : view<[%dspan]xi32> -> i32
+    %v32 = view.load %dv[%d3] : view<[%dspan]xi32> -> i32
+    %mode = index.cast %m32 : i32 to index
+    %count = index.cast %c32v : i32 to index
+    %offset = index.cast %o32 : i32 to index
+    %vocab = index.cast %v32 : i32 to index
+    %explicit_ids = index.cmp ne, %has_ids, %c0 : index
+    %id32 = scf.if %explicit_ids -> (i32) {
+      %ib = index.mul %row, %is : index
+      %io0 = index.add %ib, %col : index
+      %itop = index.sub %ispan, %c1 : index
+      %io = index.min %io0, %itop : index
+      %id = view.load %iv[%io] : view<[%ispan]xi32> -> i32
+      scf.yield %id : i32
+    } else {
+      %id = index.cast %col : index to i32
+      scf.yield %id : i32
+    }
+    %id = index.cast %id32 : i32 to index
+    %id_ok = scalar.cmpi ult, %id32, %v32 : i32
+    %vocab_ok = scalar.cmpi sgt, %v32, %zero_i32 : i32
+    %mode_ok = index.cmp ule, %mode, %c4 : index
+    %offset_ok = index.cmp ule, %offset, %psize : index
+    %safe_offset = index.min %offset, %psize : index
+    %remaining = index.sub %psize, %safe_offset : index
+    %count_ok = index.cmp ule, %count, %remaining : index
+    %ok0 = scalar.andi %id_ok, %vocab_ok : i1
+    %ok1 = scalar.andi %mode_ok, %offset_ok : i1
+    %ok2 = scalar.andi %ok0, %ok1 : i1
+    %valid = scalar.andi %ok2, %count_ok : i1
+    %allowed = scf.if %valid -> (i1) {
+      %all = index.cmp eq, %mode, %c0 : index
+      %bits = index.cmp eq, %mode, %c4 : index
+      %allow = scf.if %all -> (i1) {
+        %empty = index.cmp eq, %count, %c0 : index
+        scf.yield %empty : i1
+      } else {
+        %result = scf.if %bits -> (i1) {
+          %words0 = index.div %vocab, %c32 : index
+          %tail = index.rem %vocab, %c32 : index
+          %extra = index.cmp ne, %tail, %c0 : index
+          %add = scf.select %extra, %c1, %c0 : index
+          %words = index.add %words0, %add : index
+          %enough = index.cmp eq, %words, %count : index
+          %value = scf.if %enough -> (i1) {
+            %id_bound = index.assume %id [range(%id, 0, 2147483646)] : index
+            %word = index.div %id_bound, %c32 : index
+            %po0 = index.add %offset, %word : index
+            %ptop = index.sub %pspan, %c1 : index
+            %po_floor = index.max %po0, %c0 : index
+            %po_clamped = index.min %po_floor, %ptop : index
+            %po = index.assume %po_clamped [range(%po_clamped, 0, 2147482622), lt(%po_clamped, %pspan)] : index
+            %packed = view.load %pv[%po] : view<[%pspan]xi32> -> i32
+            %bit = index.rem %id_bound, %c32 : index
+            %shift = index.cast %bit : index to i32
+            %shifted = scalar.shrui %packed, %shift : i32
+            %set = scalar.andi %shifted, %one_i32 : i32
+            %yes = scalar.cmpi ne, %set, %zero_i32 : i32
+            scf.yield %yes : i1
+          } else {
+            scf.yield %false : i1
+          }
+          scf.yield %value : i1
+        } else {
+          %allow_ids = index.cmp eq, %mode, %c2 : index
+          %deny_ids = index.cmp eq, %mode, %c3 : index
+          %list = scalar.ori %allow_ids, %deny_ids : i1
+          %answer = scf.if %list -> (i1) {
+            %lo, %hi = scf.while(%l = %c0 : index, %h = %count : index) -> (index, index) {
+              %more = index.cmp ult, %l, %h : index
+              scf.condition %more, %l, %h : i1, index, index
+            } do(%l: index, %h: index) {
+              %delta_raw = index.sub %h, %l : index
+              %delta = index.assume %delta_raw [range(%delta_raw, 0, 2147482623)] : index
+              %half = index.div %delta, %c2 : index
+              %mid_raw = index.add %l, %half : index
+              %mid = index.assume %mid_raw [range(%mid_raw, 0, 2147482622)] : index
+              %po0 = index.add %offset, %mid : index
+              %ptop = index.sub %pspan, %c1 : index
+              %po_floor = index.max %po0, %c0 : index
+              %po_clamped = index.min %po_floor, %ptop : index
+              %po = index.assume %po_clamped [range(%po_clamped, 0, 2147482622), lt(%po_clamped, %pspan)] : index
+              %token = view.load %pv[%po] : view<[%pspan]xi32> -> i32
+              %less = scalar.cmpi slt, %token, %id32 : i32
+              %next = index.add %mid, %c1 : index
+              %ln = scf.select %less, %next, %l : index
+              %hn = scf.select %less, %h, %mid : index
+              scf.yield %ln, %hn : index, index
+            }
+            %found_range = index.cmp ult, %lo, %count : index
+            %found = scf.if %found_range -> (i1) {
+              %po0 = index.add %offset, %lo : index
+              %ptop = index.sub %pspan, %c1 : index
+              %po_floor = index.max %po0, %c0 : index
+              %po_clamped = index.min %po_floor, %ptop : index
+              %po = index.assume %po_clamped [range(%po_clamped, 0, 2147482622), lt(%po_clamped, %pspan)] : index
+              %token = view.load %pv[%po] : view<[%pspan]xi32> -> i32
+              %match = scalar.cmpi eq, %token, %id32 : i32
+              scf.yield %match : i1
+            } else {
+              scf.yield %false : i1
+            }
+            %yes = scalar.xori %found, %deny_ids : i1
+            scf.yield %yes : i1
+          } else {
+            scf.yield %false : i1
+          }
+          scf.yield %answer : i1
+        }
+        scf.yield %result : i1
+      }
+      scf.yield %allow : i1
+    } else {
+      scf.yield %false : i1
+    }
+    %result = scf.if %allowed -> (f32) {
+      %lb = index.mul %row, %ls : index
+      %li0 = index.add %lb, %col : index
+      %ltop = index.sub %lspan, %c1 : index
+      %li = index.min %li0, %ltop : index
+      %value = view.load %lv[%li] : view<[%lspan]xf32> -> f32
+      scf.yield %value : f32
+    } else {
+      scf.yield %neg_inf : f32
+    }
+    view.store %result, %out[%i] : f32, view<[%n]xf32>
+  }
+  kernel.return
+}

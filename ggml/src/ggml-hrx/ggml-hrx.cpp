@@ -32,7 +32,10 @@ bool ggml_hrx_check(hrx_status_t status, const char * expr, const char * file, i
     return false;
 }
 
+static std::atomic<uint64_t> ggml_hrx_next_buffer_id{1};
+
 struct ggml_hrx_buffer_context {
+    const uint64_t id = ggml_hrx_next_buffer_id.fetch_add(1);
     std::atomic<uint64_t> weight_version{0};
     bool shared_pool = false;
     ggml_hrx_device_context * dev    = nullptr;
@@ -755,6 +758,7 @@ static bool ggml_hrx_compute_node(ggml_backend_hrx_context * ctx, const ggml_ten
         case GGML_OP_ARGMAX:         return ggml_hrx_op_argmax(ctx, node);
         case GGML_OP_CUMSUM:         return ggml_hrx_op_cumsum(ctx, node);
         case GGML_OP_SUM:            return ggml_hrx_op_sum(ctx, node);
+        case GGML_OP_TOKEN_MASK:     return ggml_hrx_op_token_mask(ctx, node);
         case GGML_OP_SSM_CONV:       return ggml_hrx_op_ssm_conv(ctx, node);
         case GGML_OP_MUL_MAT:        return ggml_hrx_op_mul_mat(ctx, node);
         case GGML_OP_MUL_MAT_ID:     return ggml_hrx_op_mul_mat_id(ctx, node);
@@ -912,6 +916,8 @@ static ggml_backend_hrx_context::node_props ggml_hrx_node_props(const ggml_tenso
     std::memcpy(&p.node, node, sizeof(ggml_tensor));
     // All HRX buffers have the same fake base address. Thus keep the buffer of each tensor too.
     p.node.buffer = ggml_hrx_tensor_buffer(node);
+    // Buffer wrapper addresses can be reused while recordings still retain the old HRX allocation.
+    p.buffer_id = ggml_hrx_tensor_on_device(node) ? static_cast<ggml_hrx_buffer_context *>(p.node.buffer->context)->id : 0;
     for (int j = 0; j < GGML_MAX_SRC; ++j) {
         const ggml_tensor * s = node->src[j];
         if (s == nullptr) {
@@ -919,6 +925,7 @@ static ggml_backend_hrx_context::node_props ggml_hrx_node_props(const ggml_tenso
         }
         p.src_data[j] = s->data;
         p.src_buf[j]  = ggml_hrx_tensor_buffer(s);
+        p.src_buffer_id[j] = ggml_hrx_tensor_on_device(s) ? static_cast<ggml_hrx_buffer_context *>(p.src_buf[j]->context)->id : 0;
         std::memcpy(p.src_ne[j], s->ne, sizeof(s->ne));
         std::memcpy(p.src_nb[j], s->nb, sizeof(s->nb));
         p.src_type[j] = s->type;
@@ -1147,6 +1154,7 @@ static bool ggml_backend_hrx_device_supports_op(ggml_backend_dev_t dev, const gg
         case GGML_OP_ARGMAX:         return ggml_hrx_supports_argmax(ctx, op);
         case GGML_OP_CUMSUM:         return ggml_hrx_supports_cumsum(ctx, op);
         case GGML_OP_SUM:            return ggml_hrx_supports_sum(ctx, op);
+        case GGML_OP_TOKEN_MASK:     return ggml_hrx_supports_token_mask(ctx, op);
         case GGML_OP_SSM_CONV:       return ggml_hrx_supports_ssm_conv(ctx, op);
         case GGML_OP_MUL_MAT:        return ggml_hrx_supports_mul_mat(ctx, op);
         case GGML_OP_MUL_MAT_ID:     return ggml_hrx_supports_mul_mat_id(ctx, op);

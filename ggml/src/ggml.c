@@ -4,6 +4,7 @@
 #include "ggml-version.h"
 #include "ggml-backend.h"
 #include "ggml-impl.h"
+#include "ggml-token-mask.h"
 #include "ggml-threading.h"
 #include "ggml-cpu.h"
 #include "ggml.h"
@@ -1224,9 +1225,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "EXL3_MUL_MAT",
     "EXL3_GET_ROWS",
     "EXL3_MUL_MAT_ID",
+    "TOKEN_MASK",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1341,9 +1343,10 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "exl3(X)*y",
     "exl3_get_rows(x)",
     "exl3(X)[ids]*y",
+    "token_mask(x)",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -4133,6 +4136,24 @@ struct ggml_tensor * ggml_get_rows_back(
     result->op     = GGML_OP_GET_ROWS_BACK;
     result->src[0] = a;
     result->src[1] = b;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_token_mask(
+        struct ggml_context * ctx,
+        struct ggml_tensor * logits,
+        struct ggml_tensor * candidate_ids,
+        struct ggml_tensor * mask_payload,
+        struct ggml_tensor * mask_desc) {
+    GGML_ASSERT(ggml_token_mask_valid_layout(logits, candidate_ids, mask_payload, mask_desc));
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, logits->ne[0], logits->ne[1]);
+    result->op     = GGML_OP_TOKEN_MASK;
+    result->src[0] = logits;
+    result->src[1] = candidate_ids;
+    result->src[2] = mask_payload;
+    result->src[3] = mask_desc;
 
     return result;
 }
