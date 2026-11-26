@@ -2366,7 +2366,7 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     }
 
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-    bool use_mul_mat_vec_q = ggml_cuda_should_use_mmvq(src0->type, cc, src1->ne[1]) && !bad_padding_clear &&
+    bool use_mul_mat_vec_q = ggml_cuda_should_use_mmvq(src0->type, cc, src1->ne[1], src0->ne[1], src0->ne[0]) && !bad_padding_clear &&
                              src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32;
     if (ggml_cuda_mmb_r2_packed(src0)) {
         return false;   // repacked in place (MMB_DOWN_R2 / MMB_GLU_R2): MMVQ cannot read it
@@ -2545,7 +2545,7 @@ static bool ggml_cuda_should_fuse_mul_mat_q(const ggml_tensor * up, const ggml_t
     const bool    is_id     = up->op == GGML_OP_MUL_MAT_ID;
     const int64_t ncols     = is_id ? y->ne[2]    : y->ne[1];
     const int64_t nchannels = is_id ? x_up->ne[2] : y->ne[2]*y->ne[3];
-    const bool    use_mmvq  = is_id ? ncols <= get_mmvq_mmid_max_batch(x_up->type, cc) : ggml_cuda_should_use_mmvq(x_up->type, cc, ncols);
+    const bool    use_mmvq  = is_id ? ncols <= get_mmvq_mmid_max_batch(x_up->type, cc) : ggml_cuda_should_use_mmvq(x_up->type, cc, ncols, x_up->ne[1], x_up->ne[0]);
     // do not fuse the matmuls that few-row MMQ takes in ggml_cuda_mul_mat; for MUL_MAT_ID the fused MMQ keeps the expert gate and up
     if (!is_id && ggml_cuda_should_use_mmq_few(x_up, y, nullptr, cc)) {
         return false;
@@ -2606,7 +2606,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
 
     const int64_t mmvf_ncols = ggml_get_op_params_i32(dst, 1) == GGML_HINT_EXACT_BATCH && src0->type == GGML_TYPE_BF16 ? 1 : ne11;
     if (ggml_get_op_params_i32(dst, 1) == GGML_HINT_EXACT_BATCH && ne11 > MMVQ_MAX_BATCH_SIZE &&
-            ggml_cuda_should_use_mmvq(src0->type, cc, 1)) {
+            ggml_cuda_should_use_mmvq(src0->type, cc, 1, src0->ne[1], src0->ne[0])) {
         // Keep the single-column arithmetic when an exact batch exceeds the matvec limit.
         for (int64_t col = 0; col < ne11; ++col) {
             ggml_tensor src1_col = *src1;
@@ -2657,7 +2657,10 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     }
     // from a per-type number of src1 columns up to 24, few-row MMQ is faster than MMVQ and MMQ
     const bool use_mmq_few = ggml_cuda_should_use_mmq_few(src0, src1, nullptr, cc);
-    if (!use_mmq_few && ggml_cuda_should_use_mmvq(src0->type, cc, ne11)) {
+    // an exact batch must give every column the bits of n == 1, which MMVQ does up to its batch limit
+    const bool    exact_batch = ggml_get_op_params_i32(dst, 1) == GGML_HINT_EXACT_BATCH && ne11 <= MMVQ_MAX_BATCH_SIZE;
+    const int64_t mmvq_ncols  = exact_batch ? 1 : ne11;
+    if (!use_mmq_few && ggml_cuda_should_use_mmvq(src0->type, cc, mmvq_ncols, src0->ne[1], src0->ne[0])) {
         ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
         return;
     }

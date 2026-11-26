@@ -343,7 +343,7 @@ int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
     return MMVQ_MAX_BATCH_SIZE;
 }
 
-bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
+bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11, int64_t ne01, int64_t ne00) {
     if (!ggml_is_quantized(type)) {
         return false;
     }
@@ -408,6 +408,26 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
             default:
                 return ne11 <= MMVQ_MAX_BATCH_SIZE;
         }
+    }
+    if (cc == GGML_CUDA_CC_OFFSET_AMD + 0x1151) {
+        // Radeon 8060S (gfx1151), ROCm 10.1, 2026-11-19: MMQ only inside an (ne01, ne00) region where it was at least 3%
+        // faster than the stock choice for every one of the 190 dense weight shapes of 19 common GGUF models in it, and at
+        // least 3 shapes support the region. Small or thin matrices stay on MMVQ: q8_0 ne01=48 ne00=5120 at 8 columns took
+        // 24.3 us on MMQ against 10.0 us. Types with too few shapes keep the stock choice. q4_K at 4-6 columns needs
+        // ne00 >= 2560: at ne00 = 1536 MMQ was faster alone but 2-6% slower inside qwen2.5-1.5B and LFM2-700M. q4_0
+        // keeps the stock choice: its MMQ cells were faster alone but 2% slower inside Qwen3-4B Q4_0 at 7 columns.
+        const int64_t n = ne11, m = ne01, k = ne00;
+        bool mmq = false;
+        switch (type) {
+            case GGML_TYPE_Q8_0:   mmq = n >= 7 && m >= 2048; break;
+            case GGML_TYPE_Q4_K:   mmq = k >= 1024 && ((n >= 7 && m >= 6144) || (k >= 2560 && ((n == 6 && m >= 6144) || (n == 5 && m >= 8192) || (n == 4 && m >= 8192 && m <= 15360)))); break;
+            case GGML_TYPE_Q5_K:   mmq = k >= 2560 && ((n >= 7 && m >= 1024) || (n >= 5 && m >= 2560) || (n == 4 && m >= 4096)); break;
+            case GGML_TYPE_Q6_K:   mmq = k >= 1024 && ((n == 8 && m >= 3840) || (n == 7 && m >= 12288)); break;
+            case GGML_TYPE_IQ4_XS: mmq = n == 8 && m >= 5120 && m <= 17408 && k >= 2560; break;
+            case GGML_TYPE_IQ4_NL: mmq = n == 8 && m >= 5120 && m <= 17408 && k >= 5120; break;
+            default: break;
+        }
+        return !mmq && ne11 <= MMVQ_MAX_BATCH_SIZE;
     }
     if (GGML_CUDA_CC_IS_RDNA3_5(cc)) {
         switch (type) { // tuned on Radeon 8060S (gfx1151)
