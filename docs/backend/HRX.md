@@ -78,6 +78,23 @@ All four rows used llama.cpp commit `f24a6872bbc8f6475d93dd2fb2c5c215aa2615bd` o
 
 Use `Inkling-2-Mini-UD-Q4_K_XL.gguf` (SHA-256 `e64276656f072e9b2197a61723667cbdb71da66a716ffd966e572c21088f3cd3`) and `dspark-Inkling-2-Mini-Q8_0.gguf` (`3da00cf7c31bbe5662b3c0d373ecf782d74d32ef43990acc158ce60c2add72e0`) from the Mainline_Support directory. Set both `--device` and `--device-draft` to the device in the row. Use `-c` as shown, `-b 4096 -ub 4096 -np 1 -ngl 99 -ngld 99 -fa on -ctk f16 -ctv f16 --fit off --backend-sampling --spec-type draft-dspark --spec-draft-n-max 3`, and leave the NPU off. Each request processed the same 32,768 input tokens with prompt caching disabled and generated 128 tokens at temperature 0. The table gives the mean and sample standard deviation across three requests after one warm-up.
 
+### Speed after the PR 326 review fixes
+
+The November 26, 2026 comparison rebuilt the pre-fix revision `f24a6872bbc8f6475d93dd2fb2c5c215aa2615bd` and review-fix revision `79633424c04ed1f1c3a1548a7e4ab8ccda63ecdf` in separate source and build directories on the same Ryzen AI Max+ 395. Both Release builds enabled HRX, disabled CPU native tuning, and used GCC 15.2.0 with the same SDK. The target, draft and request settings match the 32k server comparison above.
+
+At context 1,048,576, each build ran two rounds of one warm-up and five timed requests, with build order reversed in the second round. At context 40,960, each build ran one warm-up and five timed requests. The table includes every timed request and gives mean +/- sample standard deviation.
+
+| Context | Metric | Before fixes | After fixes | Change |
+|---:|---|---:|---:|---:|
+| 1,048,576 | Prefill tokens/s | 1,510.31 +/- 16.03 | 1,471.67 +/- 79.70 | -2.56% |
+| 1,048,576 | DSpark decode tokens/s | 47.94 +/- 0.51 | 47.48 +/- 3.79 | -0.97% |
+| 40,960 | Prefill tokens/s | 1,491.24 +/- 30.26 | 1,506.09 +/- 20.10 | +1.00% |
+| 40,960 | DSpark decode tokens/s | 48.23 +/- 0.35 | 47.49 +/- 1.31 | -1.54% |
+
+One million-context request after the fixes measured 1,267 prefill tokens/s while the busy GPU clock averaged 1.75 GHz, against about 2.2 GHz for the corresponding pre-fix round. In the reversed round, prefill averaged 1,498.24 before and 1,486.44 after (-0.79%), and decode averaged 47.64 before and 47.74 after. All 36 requests, including warm-ups, returned the same 128 output tokens and accepted 90 of 109 draft proposals each.
+
+The standard target-only matrix used `llama-bench -p 1024 -n 128 -d 0,40000 -b 4096 -ub 1024,2048,4096` with five default repeats. At ubatch 4096, prefill changed by +0.38% at depth zero and +0.51% at depth 40,000. Target-only decode at depth 40,000 and ubatch 1024 fell by 3.18%. A separate reverse-order check measured 29.87 +/- 0.17 before and 29.15 +/- 0.15 after (-2.43%). The cause of that smaller-ubatch slowdown remains unresolved.
+
 ### Compare perplexity and KL divergence
 
 Build `llama-perplexity` at the base and candidate revisions in separate build directories. Use the same backend, model, corpus and cache settings in each pair. For example, from the repository root with `target` set to the target GGUF:
