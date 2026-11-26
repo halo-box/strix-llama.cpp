@@ -1470,6 +1470,8 @@ bool llm_graph_input_mem_hybrid_iswa_rel::can_reuse(const llm_graph_params & par
 
     res &= can_reuse_attn_mask(inp_attn->self_attn_mask, attn_ctx->get_base(), params.ubatch, params.cparams);
 
+    res &= self_rel_pos->ne[0] == (inp_attn->self_attn_mask.rows ?
+            attn_ctx->get_base()->get_n_kv_rows() : attn_ctx->get_base()->get_n_kv());
     res &= self_rel_pos->ne[1] == params.ubatch.n_tokens;
 
     // swa tensors may not be allocated if there are no SWA attention layers
@@ -1479,6 +1481,8 @@ bool llm_graph_input_mem_hybrid_iswa_rel::can_reuse(const llm_graph_params & par
 
     res &= can_reuse_attn_mask(inp_attn->self_attn_mask_swa, attn_ctx->get_swa(), params.ubatch, params.cparams);
 
+    res &= self_rel_pos_swa->ne[0] == (inp_attn->self_attn_mask_swa.rows ?
+            attn_ctx->get_swa()->get_n_kv_rows() : attn_ctx->get_swa()->get_n_kv());
     res &= self_rel_pos_swa->ne[1] == params.ubatch.n_tokens;
 
     res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
@@ -3341,9 +3345,9 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             ggml_flash_attn_ext_add_indexed_bias(cur, bias_table, bias_indices);
             const auto dev = model.dev_layer(il);
             const auto reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
-            const bool hrx = reg && strcmp(ggml_backend_reg_name(reg), "HRX") == 0;
-            const bool wide_hrx = hrx && ggml_nelements(bias_indices) >= INT32_MAX;
-            const bool resident_indices = wide_hrx || (hrx && ggml_nbytes(bias_indices) > 1024*1024 &&
+            const bool device_positions = reg && ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_relative_positions");
+            const bool wide_indices = device_positions && ggml_nelements(bias_indices) >= INT32_MAX;
+            const bool resident_indices = wide_indices || (device_positions && ggml_nbytes(bias_indices) > 1024*1024 &&
                     bias_indices->ne[1] > 1 && model.n_devices() == 1 && model.n_gpu_layers() >= hparams.n_layer());
             if (!cparams.offload_kqv || !dev || !ggml_backend_dev_supports_op(dev, cur)) {
                 ggml_flash_attn_ext_add_indexed_bias(cur, nullptr, nullptr);
@@ -3356,7 +3360,7 @@ ggml_tensor * llm_graph_context::build_attn_mha(
                             // HRX builds large index grids in their final device buffer from compact positions.
                             ggml_backend_sched_set_tensor_backend(sched, bias_indices, backend);
                         }
-                        if (kv_rows || wide_hrx) {
+                        if (kv_rows || wide_indices) {
                             // Looped layers can project Q and the bias on a different device from their KV cache.
                             ggml_backend_sched_set_tensor_backend(sched, cur, backend);
                         }

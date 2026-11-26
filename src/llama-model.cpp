@@ -1822,7 +1822,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     if (act_gpu_layers > 0 && (arch == LLM_ARCH_INKLING2_LOOP ||
             (arch == LLM_ARCH_DFLASH && ml.get_tensor_meta("mask_embd.weight")))) {
         const auto first = get_layer_buft_list(i_gpu_start);
-        if (strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(first.dev)), "HRX") == 0) {
+        if (llama_backend_has_feature(first.dev, "DEVICE_TOKEN_EMBEDDINGS")) {
             pimpl->dev_input = first;
         }
     }
@@ -2716,7 +2716,8 @@ llama_split_mode llama_model::split_mode() const {
 }
 
 bool llama_model::graph_depends_on_n_tokens() const {
-    return arch == LLM_ARCH_QWEN4EXP || arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE;
+    return arch == LLM_ARCH_QWEN4EXP || arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE ||
+           arch == LLM_ARCH_INKLING2 || arch == LLM_ARCH_INKLING2_LOOP;
 }
 
 bool llama_model::no_alloc() const {

@@ -19,6 +19,19 @@ struct llama_logger_state {
 
 static llama_logger_state g_logger_state;
 
+bool llama_backend_has_feature(ggml_backend_dev_t dev, const char * name) {
+    const auto reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+    const auto features = reg ? (ggml_backend_get_features_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_get_features") : nullptr;
+    if (features) {
+        for (const auto * f = features(reg); f && f->name; ++f) {
+            if (strcmp(f->name, name) == 0) {
+                return f->value && strcmp(f->value, "1") == 0;
+            }
+        }
+    }
+    return false;
+}
+
 void llama_prefetch_rows(const ggml_tensor * tensor, const int32_t * rows, size_t n_rows) {
     if (!tensor || !tensor->data || !tensor->buffer || !ggml_backend_buffer_is_host(tensor->buffer) || n_rows == 0) {
         return;

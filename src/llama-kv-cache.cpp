@@ -2226,7 +2226,7 @@ void llama_kv_cache::set_input_relative_pos(ggml_tensor * dst, const ggml_tensor
     const auto reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
     using set_relative_positions_t = bool (*)(ggml_tensor *, const int32_t *, size_t, uint32_t);
     const auto set_relative_positions = reg ? reinterpret_cast<set_relative_positions_t>(
-            ggml_backend_reg_get_proc_address(reg, "ggml_backend_hrx_set_relative_positions")) : nullptr;
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_relative_positions")) : nullptr;
     if (set_relative_positions && ubatch->n_tokens > 1) {
         // Each query uses the key positions of its mask strip and KV stream.
         const size_t query_words = 2 * size_t(ubatch->n_tokens);

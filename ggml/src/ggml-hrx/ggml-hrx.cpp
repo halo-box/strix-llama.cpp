@@ -1453,12 +1453,24 @@ static bool ggml_backend_hrx_set_relative_positions(ggml_tensor * dst, const int
 
 static ggml_backend_dev_t ggml_backend_hrx_npu_device();
 
+static ggml_backend_feature * ggml_backend_hrx_get_features(ggml_backend_reg_t) {
+    static ggml_backend_feature features[] = {
+        {"STACKED_DEPTH_MIX", "1"},
+        {"DEVICE_TOKEN_EMBEDDINGS", "1"},
+        {nullptr, nullptr},
+    };
+    return features;
+}
+
 static void * ggml_backend_hrx_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
     if (strcmp(name, "ggml_backend_hrx_npu_device") == 0) {
         return reinterpret_cast<void *>(ggml_backend_hrx_npu_device);
     }
-    if (strcmp(name, "ggml_backend_hrx_set_relative_positions") == 0) {
+    if (strcmp(name, "ggml_backend_get_features") == 0) {
+        return reinterpret_cast<void *>(ggml_backend_hrx_get_features);
+    }
+    if (strcmp(name, "ggml_backend_set_relative_positions") == 0) {
         return reinterpret_cast<void *>(ggml_backend_hrx_set_relative_positions);
     }
     return nullptr;

@@ -190,17 +190,16 @@ ggml_tensor * llama_model_inkling2::graph::mix_stacked(const std::vector<ggml_te
     return ggml_mul_mat(ctx0, ggml_cont(ctx0, ggml_transpose(ctx0, states)), scores);
 }
 
-static bool inkling2_hrx_query(const ggml_tensor * query) {
+static bool prefers_stacked_depth_mix(const ggml_tensor * query) {
     const auto dev = query->buffer ? ggml_backend_buft_get_device(ggml_backend_buffer_get_type(query->buffer)) : nullptr;
-    const auto reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
-    return reg && strcmp(ggml_backend_reg_name(reg), "HRX") == 0;
+    return llama_backend_has_feature(dev, "STACKED_DEPTH_MIX");
 }
 
 // attention over the depth, one [n_embd, n_tokens] tensor per query: per-source norm, one score matmul, elementwise weighted sum (no transpose, no small-k mat-vec)
 std::vector<ggml_tensor *> llama_model_inkling2::graph::mix_split(const std::vector<ggml_tensor *> & blocks, ggml_tensor * cur, ggml_tensor * query) {
     const int64_t nq = query->ne[1];
     // The stacked reduction preserves the qualified HRX logits on gfx1151 at prefill widths.
-    if (n_tokens < kMixSplitMinTokens || inkling2_hrx_query(query)) {
+    if (n_tokens < kMixSplitMinTokens || prefers_stacked_depth_mix(query)) {
         ggml_tensor * mixed = mix_stacked(blocks, cur, query);
         std::vector<ggml_tensor *> out(nq);
         for (int64_t i = 0; i < nq; ++i) {
@@ -345,7 +344,7 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
 
     // attention inputs: SWA layers mix one, full-attention layers one each for Q, K and V
     ggml_tensor * inputs[3] = {cur, cur, cur};
-    if (is_swa && layer.attn_res_query && inkling2_hrx_query(layer.attn_res_query)) {
+    if (is_swa && layer.attn_res_query && prefers_stacked_depth_mix(layer.attn_res_query)) {
         // Separate views keep the three HRX controller inputs on their qualified decode paths.
         ggml_tensor * mixed = mix_stacked(blocks, cur, layer.attn_res_query);
         for (ggml_tensor * & input : inputs) {
