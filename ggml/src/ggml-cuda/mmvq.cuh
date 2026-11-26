@@ -32,9 +32,22 @@ struct ggml_cuda_mmv_group_seg {
     ggml_tensor *       dst  = nullptr;   // F32 [nrows]; the GLU output when gate != nullptr
     ggml_glu_op         glu_op = GGML_GLU_OP_SWIGLU;
     float               glu_limit = 0.0f;
+    const ggml_tensor * set_rows = nullptr;   // K-quant group only: F16 SET_ROWS of dst into a cache row, fused
 };
 bool ggml_cuda_mmv_group_seg_ok(const ggml_tensor * w, const ggml_tensor * y);
 void ggml_cuda_mmv_group(ggml_backend_cuda_context & ctx, const ggml_tensor * y, const ggml_cuda_mmv_group_seg * segs, int nseg);
+
+// RDNA3.5 grouped matvec for Q4_K/Q5_K/Q6_K weights (no gate): one quantize of `y`, one launch for all segments,
+// rows bit-identical to the separate matvecs.
+static constexpr bool ggml_cuda_mmvq_kq_group_type_ok(ggml_type type) {
+    return type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q6_K;
+}
+bool ggml_cuda_mmvq_kq_group_seg_ok(const ggml_tensor * w, const ggml_tensor * y);
+bool ggml_cuda_mmvq_kq_group_set_rows_ok(const ggml_tensor * set_rows, const ggml_tensor * dst);
+// rms_norm != nullptr: y is RMS_NORM(x) * w (the MUL), computed inside the kernel instead of read
+bool ggml_cuda_mmvq_kq_group_rms_norm_ok(const ggml_tensor * rms_norm, const ggml_tensor * mul, const ggml_tensor * y);
+void ggml_cuda_mmvq_kq_group(ggml_backend_cuda_context & ctx, const ggml_tensor * y, const ggml_cuda_mmv_group_seg * segs, int nseg,
+        const ggml_tensor * rms_norm = nullptr);
 
 // RDNA3.5 qwen4exp GDN output projection with the gated per-head norm in the prologue:
 //   y' = sigmoid(z) * (rms_norm_128(attn) * norm_w), then the fused-quantize matvec of dst->src[0] with y'

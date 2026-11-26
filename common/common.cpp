@@ -1545,10 +1545,17 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
         }
         if (llama_model_has_decoder(model)) {
             tmp.resize(std::min(tmp.size(), (size_t) params.n_batch));
-            common_batch batch = common_batch_get_one(lctx, tmp);
             std::vector<float> zeros;
-            common_batch_set_zero_state(batch, model, zeros);
-            llama_process(lctx, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+            {
+                common_batch batch = common_batch_get_one(lctx, tmp);
+                common_batch_set_zero_state(batch, model, zeros);
+                llama_process(lctx, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+            }
+            if (tmp.size() > 1) {
+                common_batch batch = common_batch_get_one(lctx, &tmp.back(), 1);
+                common_batch_set_zero_state(batch, model, zeros);
+                llama_process(lctx, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+            }
         }
         llama_memory_clear(llama_get_memory(lctx), true);
         llama_synchronize(lctx);
@@ -1756,6 +1763,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.n_outputs_max_per_seq = std::max(params.n_outputs_max_per_seq, 0);
     cparams.n_batch           = params.n_batch;
     cparams.n_ubatch          = params.n_ubatch;
+    cparams.n_ubatch_auto     = !params.n_ubatch_explicit;
     cparams.n_threads         = params.cpuparams.n_threads;
     cparams.n_threads_batch   = params.cpuparams_batch.n_threads == -1 ?
                                 params.cpuparams.n_threads : params.cpuparams_batch.n_threads;

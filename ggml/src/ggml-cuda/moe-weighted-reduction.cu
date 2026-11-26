@@ -10,6 +10,7 @@ static __global__ void moe_weighted_reduction_f32(const float * __restrict__ exp
                                                   const float * __restrict__ expert_scale,
                                                   const float * __restrict__ weights,
                                                   float * __restrict__ dst,
+                                                  const float * __restrict__ merge,
                                                   const int64_t n_embd,
                                                   const int     n_expert_used) {
     const int64_t token = blockIdx.x;
@@ -27,6 +28,9 @@ static __global__ void moe_weighted_reduction_f32(const float * __restrict__ exp
         const float   scale = expert_scale != nullptr ? expert_scale[row] : 1.0f;
         sum += (experts[row * n_embd + col] * scale) * weights[row];
     }
+    if (merge) {
+        sum += merge[token * n_embd + col];
+    }
     dst[token * n_embd + col] = sum;
 }
 
@@ -36,6 +40,7 @@ static __global__ void moe_weighted_reduction_f32_v4(const float * __restrict__ 
                                                      const float * __restrict__ expert_scale,
                                                      const float * __restrict__ weights,
                                                      float * __restrict__ dst,
+                                                     const float * __restrict__ merge,
                                                      const int64_t n_embd,
                                                      const int     n_expert_used) {
     const int64_t token = blockIdx.x;
@@ -53,6 +58,7 @@ static __global__ void moe_weighted_reduction_f32_v4(const float * __restrict__ 
         const float4 e = *(const float4 *)(experts + row * n_embd + col4);
         sum.x += (e.x * scale) * w; sum.y += (e.y * scale) * w; sum.z += (e.z * scale) * w; sum.w += (e.w * scale) * w;
     }
+    if (merge) { const float4 m = *(const float4 *)(merge + token * n_embd + col4); sum.x += m.x; sum.y += m.y; sum.z += m.z; sum.w += m.w; }
     *(float4 *)(dst + token * n_embd + col4) = sum;
 }
 
@@ -61,6 +67,7 @@ static __global__ void moe_weighted_reduction_bf16_v4(const uint16_t * __restric
                                                       const float * __restrict__ expert_scale,
                                                       const float * __restrict__ weights,
                                                       float * __restrict__ dst,
+                                                      const float * __restrict__ merge,
                                                       const int64_t n_embd,
                                                       const int     n_expert_used) {
     const int64_t token = blockIdx.x;
@@ -80,6 +87,7 @@ static __global__ void moe_weighted_reduction_bf16_v4(const uint16_t * __restric
         sum.x += (moe_bf2f(h.x) * scale) * w; sum.y += (moe_bf2f(h.y) * scale) * w;
         sum.z += (moe_bf2f(h.z) * scale) * w; sum.w += (moe_bf2f(h.w) * scale) * w;
     }
+    if (merge) { const float4 m = *(const float4 *)(merge + token * n_embd + col4); sum.x += m.x; sum.y += m.y; sum.z += m.z; sum.w += m.w; }
     *(float4 *)(dst + token * n_embd + col4) = sum;
 }
 
@@ -143,20 +151,21 @@ static void launch_moe_weighted_reduction(const float * experts,
                                           const float * expert_scale,
                                           const float * weights,
                                           float *       dst,
+                                          const float * merge,
                                           int64_t       n_embd,
                                           int64_t       n_tokens,
                                           int           n_expert_used,
                                           cudaStream_t  stream) {
     constexpr int threads = 256;
     static const bool use_v4 = true;
-    if (use_v4 && n_embd % 4 == 0 && ((uintptr_t) experts % 16) == 0 && ((uintptr_t) dst % 16) == 0) {
+    if (use_v4 && n_embd % 4 == 0 && ((uintptr_t) experts % 16) == 0 && ((uintptr_t) dst % 16) == 0 && ((uintptr_t) merge % 16) == 0) {
         const dim3 blocks(n_tokens, (n_embd / 4 + threads - 1) / threads, 1);
-        moe_weighted_reduction_f32_v4<<<blocks, threads, 0, stream>>>(experts, expert_scale, weights, dst, n_embd, n_expert_used);
+        moe_weighted_reduction_f32_v4<<<blocks, threads, 0, stream>>>(experts, expert_scale, weights, dst, merge, n_embd, n_expert_used);
         return;
     }
     const dim3 blocks(n_tokens, (n_embd + threads - 1) / threads, 1);
     moe_weighted_reduction_f32
-        <<<blocks, threads, 0, stream>>>(experts, expert_scale, weights, dst, n_embd, n_expert_used);
+        <<<blocks, threads, 0, stream>>>(experts, expert_scale, weights, dst, merge, n_embd, n_expert_used);
 }
 
 void ggml_cuda_op_moe_weighted_reduction(ggml_backend_cuda_context & ctx,
@@ -194,21 +203,21 @@ void ggml_cuda_op_moe_weighted_reduction(ggml_backend_cuda_context & ctx,
         CUDA_CHECK(cudaGetLastError());
         return;
     }
-    GGML_ASSERT(merge == nullptr && "shared-expert merge is only fused on the BF16 output path");
+    GGML_ASSERT(merge == nullptr || (merge->type == GGML_TYPE_F32 && ggml_is_contiguous(merge) && ggml_are_same_shape(merge, dst)));
     if (ggml_cuda_mmb_down16() && ggml_cuda_mmb_is_bf16_only(ctx, experts)) {
-        GGML_ASSERT(n_embd % 4 == 0 && ((uintptr_t) experts->data % 16) == 0 && ((uintptr_t) dst->data % 16) == 0);
+        GGML_ASSERT(n_embd % 4 == 0 && ((uintptr_t) experts->data % 16) == 0 && ((uintptr_t) dst->data % 16) == 0 && ((uintptr_t) mrg % 16) == 0);
         constexpr int threads = 256;
         const dim3 blocks(n_tokens, (n_embd / 4 + threads - 1) / threads, 1);
         moe_weighted_reduction_bf16_v4<<<blocks, threads, 0, stream>>>((const uint16_t *) experts->data,
             expert_scale ? (const float *) expert_scale->data : nullptr, (const float *) weights->data,
-            (float *) dst->data, n_embd, (int) n_expert_used);
+            (float *) dst->data, mrg, n_embd, (int) n_expert_used);
         CUDA_CHECK(cudaGetLastError());
         return;
     }
     launch_moe_weighted_reduction((const float *) experts->data,
                                   expert_scale ? (const float *) expert_scale->data : nullptr,
                                   (const float *) weights->data,
-                                  (float *) dst->data, n_embd, n_tokens, (int) n_expert_used, stream);
+                                  (float *) dst->data, mrg, n_embd, n_tokens, (int) n_expert_used, stream);
     CUDA_CHECK(cudaGetLastError());
 }
 

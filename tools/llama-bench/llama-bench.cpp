@@ -379,6 +379,7 @@ struct cmd_params {
     bool                             no_warmup;
     output_formats                   output_format;
     output_formats                   output_format_stderr;
+    bool                             n_ubatch_auto = false;
 };
 
 static const cmd_params cmd_params_defaults = {
@@ -426,6 +427,7 @@ static const cmd_params cmd_params_defaults = {
     /* no_warmup            */ false,
     /* output_format        */ MARKDOWN,
     /* output_format_stderr */ NONE,
+    /* n_ubatch_auto        */ false,
 };
 
 static void print_usage(int /* argc */, char ** argv) {
@@ -1156,6 +1158,7 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     }
     if (params.n_ubatch.empty()) {
         params.n_ubatch = cmd_params_defaults.n_ubatch;
+        params.n_ubatch_auto = true;
     }
     if (params.type_k.empty()) {
         params.type_k = cmd_params_defaults.type_k;
@@ -1264,6 +1267,7 @@ struct cmd_params_instance {
     bool               repack;
     size_t             fit_target;
     uint32_t           fit_min_ctx;
+    bool               n_ubatch_auto;
 
     llama_model_params to_llama_mparams() const {
         llama_model_params mparams = llama_model_default_params();
@@ -1335,6 +1339,7 @@ struct cmd_params_instance {
         cparams.n_ctx           = n_prompt + n_gen + n_depth;
         cparams.n_batch         = n_batch;
         cparams.n_ubatch        = n_ubatch;
+        cparams.n_ubatch_auto   = n_ubatch_auto;
         cparams.type_k          = type_k;
         cparams.type_v          = type_v;
         cparams.offload_kqv     = !no_kv_offload;
@@ -1421,6 +1426,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .repack                = */ rpk,
                 /* .fit_target            = */ fpt,
                 /* .fit_min_ctx           = */ fpc,
+                /* .n_ubatch_auto         = */ params.n_ubatch_auto,
             };
             instances.push_back(instance);
         }
@@ -1460,6 +1466,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .repack                = */ rpk,
                 /* .fit_target            = */ fpt,
                 /* .fit_min_ctx           = */ fpc,
+                /* .n_ubatch_auto         = */ params.n_ubatch_auto,
             };
             instances.push_back(instance);
         }
@@ -1499,6 +1506,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .repack                = */ rpk,
                 /* .fit_target            = */ fpt,
                 /* .fit_min_ctx           = */ fpc,
+                /* .n_ubatch_auto         = */ params.n_ubatch_auto,
             };
             instances.push_back(instance);
         }
@@ -1560,7 +1568,7 @@ struct test {
         model_size     = llama_model_size(lmodel);
         model_n_params = llama_model_n_params(lmodel);
         n_batch        = inst.n_batch;
-        n_ubatch       = inst.n_ubatch;
+        n_ubatch       = ctx ? std::max<int>(inst.n_ubatch, llama_n_ubatch(ctx)) : inst.n_ubatch;
         n_threads      = inst.n_threads;
         cpu_mask       = inst.cpu_mask;
         cpu_strict     = inst.cpu_strict;

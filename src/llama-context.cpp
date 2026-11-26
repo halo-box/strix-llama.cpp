@@ -219,6 +219,21 @@ static const llm_fused_op_probe llm_fused_op_top_k_mask_probe = {
     /*.n_tokens_per_seq =*/ 1,
 };
 
+static uint32_t llama_n_ubatch_for_device(const llama_model & model) {
+    const auto & hp = model.hparams;
+    if (model.arch != LLM_ARCH_QWEN3MOE || hp.n_expert != 128 || hp.n_expert_used() != 8 || hp.n_ff_exp() != 768) {
+        return 0;
+    }
+    for (const auto & dev : model.devices) {
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev.dev);
+        auto * is_gfx1151 = reg ? (bool (*)(ggml_backend_dev_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_dev_is_gfx1151") : nullptr;
+        if (is_gfx1151 && is_gfx1151(dev.dev)) {
+            return 1024;
+        }
+    }
+    return 0;
+}
+
 llama_context::llama_context(
         const llama_model & model,
               llama_context_params params) :
@@ -435,6 +450,13 @@ llama_context::llama_context(
     cparams.n_batch = cparams.causal_attn ? std::min(cparams.n_ctx, params.n_batch) : params.n_batch;
 
     cparams.n_ubatch = std::min(cparams.n_batch, params.n_ubatch == 0 ? params.n_batch : params.n_ubatch);
+    if (params.n_ubatch_auto && !cparams.embeddings) {
+        const uint32_t n_ubatch_dev = llama_n_ubatch_for_device(model);
+        if (n_ubatch_dev > cparams.n_ubatch) {
+            cparams.n_ubatch = std::min(cparams.n_batch, n_ubatch_dev);
+            LLAMA_LOG_INFO("%s: default n_ubatch raised to %u for this model on this device\n", __func__, cparams.n_ubatch);
+        }
+    }
 
     cparams.n_outputs_max = params.n_outputs_max == 0 || llama_model_has_encoder(&model) ? cparams.n_batch : params.n_outputs_max;
     cparams.n_outputs_max_per_seq = params.n_outputs_max_per_seq == 0 ?
@@ -2207,6 +2229,20 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
         t_alloc = ggml_time_us() - t_alloc_us;
 
+        // a fully offloaded model leaves the CPU backend only the token embedding lookup: more threads gain nothing
+        // there, and their polling after every graph takes power from an integrated GPU
+        cpu_light = false;
+        if (backend_cpu != nullptr) {
+            cpu_light = true;
+            for (int i = 0; i < ggml_graph_n_nodes(gf) && cpu_light; ++i) {
+                ggml_tensor * node = ggml_graph_node(gf, i);
+                if (ggml_backend_sched_get_tensor_backend(sched.get(), node) == backend_cpu) {
+                    cpu_light = node->op == GGML_OP_GET_ROWS || node->op == GGML_OP_NONE || node->op == GGML_OP_VIEW ||
+                        node->op == GGML_OP_RESHAPE || node->op == GGML_OP_PERMUTE || node->op == GGML_OP_TRANSPOSE;
+                }
+            }
+        }
+
         gf_res_prev_active = res;
     }
 
@@ -2230,7 +2266,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
     }
 
-    const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1, cpu_light);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
@@ -3868,7 +3904,8 @@ void llama_context::sched_graph_realloc(ggml_backend_sched_t sched, ggml_cgraph 
 
 ggml_status llama_context::graph_compute(
             ggml_cgraph * gf,
-                   bool   batched) {
+                   bool   batched,
+                   bool   cpu_light) {
     int n_threads        = batched ? cparams.n_threads_batch : cparams.n_threads;
     ggml_threadpool_t tp = batched ? threadpool_batch        : threadpool;
 
@@ -3882,7 +3919,7 @@ ggml_status llama_context::graph_compute(
 
     // set the number of threads for all the backends
     for (const auto & set_n_threads_fn : set_n_threads_fns) {
-        set_n_threads_fn.second(set_n_threads_fn.first, n_threads);
+        set_n_threads_fn.second(set_n_threads_fn.first, cpu_light && set_n_threads_fn.first == backend_cpu ? 1 : n_threads);
     }
 
     copy_experts.reset();
@@ -5194,6 +5231,7 @@ llama_context_params llama_context_default_params() {
         /*.op_offload                  =*/ true,
         /*.swa_full                    =*/ true,
         /*.kv_unified                  =*/ false,
+        /*.n_ubatch_auto               =*/ false,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,

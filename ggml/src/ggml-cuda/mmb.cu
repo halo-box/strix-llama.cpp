@@ -185,6 +185,11 @@ __device__ __forceinline__ void mmb_tile_gemm(const uint8_t * __restrict__ Wbase
     // Q5_1 at BM=128 (routed down): two threads per row, one 24-byte block (32 weights) each. One thread per row left
     // half the CTA idle while the other half decoded 64 weights (~600 VALU per stage against 16 WMMA per wave).
     constexpr bool Q51S = false && WTYPE == 32 + GGML_TYPE_Q5_1 && BM * 2 == MMB_NT && MMB_BK == 64;   // off: measured neutral-to-negative (1678 -> 1668 t/s pp2048)
+    constexpr bool Q4KP = WTYPE == 32 + GGML_TYPE_Q4_K && BM * 2 == MMB_NT && MMB_BK == 64 && !F16;
+    uint4 q4m, q4q;
+    constexpr bool Q6KP = WTYPE == 32 + GGML_TYPE_Q6_K && BM * 2 == MMB_NT && MMB_BK == 64 && !F16;
+    typedef uint32_t q6u32 __attribute__((aligned(2)));
+    uint32_t q6l[8], q6h[8], q6s;
 
     // gfx1151/ROCm 10.1 clang 24: S119 has seven saves/32 bytes with loop-head BF16 row prefetch (2026-10-24); load the last three vectors near the final WMMAs.
     // Remove this schedule when full-row prefetch is spill-free at the measured throughput.
@@ -203,6 +208,29 @@ __device__ __forceinline__ void mmb_tile_gemm(const uint8_t * __restrict__ Wbase
                 const uint2 w0 = p[0], w1 = p[1], w2 = p[2];
                 a0[0] = make_uint4(w0.x, w0.y, w1.x, w1.y); a1[0] = make_uint4(w2.x, w2.y, 0u, 0u);
             } else { a0[0] = a1[0] = make_uint4(0,0,0,0); }   // d = m = 0: zero rows (never stored)
+        }
+        if constexpr (Q4KP) {
+            const int row = tid >> 1;
+            if (row < a_rows) {
+                const uint8_t * p = Wbase + (size_t)row * wrow_bytes + (size_t)(ks / 4) * sizeof(block_q4_K);
+                q4m = *(const uint4 *) p;
+                q4q = *(const uint4 *) (p + 16 + (ks & 3) * 32 + (tid & 1) * 16);
+            } else { q4m = q4q = make_uint4(0, 0, 0, 0); }
+        }
+        if constexpr (Q6KP) {
+            const int row = tid >> 1, h = tid & 1, ip = (ks & 3) >> 1, half = ks & 1;
+            const block_q6_K * x = (const block_q6_K *)(Wbase + (size_t)row * wrow_bytes) + ks / 4;
+            if (row < a_rows) {
+                const q6u32 * ql = (const q6u32 *) (x->ql + 64 * ip + 32 * h), * qh = (const q6u32 *) (x->qh + 32 * ip);
+#pragma unroll
+                for (int i = 0; i < 8; ++i) { q6l[i] = ql[i]; q6h[i] = qh[i]; }
+                const uint8_t * sc = (const uint8_t *) x->scales + 8 * ip + (half ? (h ? 6 : 4) : (h ? 2 : 0));
+                q6s = (uint32_t) sc[0] | ((uint32_t) sc[1] << 8) | ((uint32_t) *(const uint16_t *) &x->d << 16);
+            } else {
+#pragma unroll
+                for (int i = 0; i < 8; ++i) { q6l[i] = 0u; q6h[i] = 0u; }
+                q6s = 0u;
+            }
         }
         if constexpr (Q20T) {
             const int row = tid >> 1;
@@ -281,6 +309,24 @@ __device__ __forceinline__ void mmb_tile_gemm(const uint8_t * __restrict__ Wbase
                 for (int j = 0; j < 8; ++j) v[j] = ((int) ((q20q[r] >> (2 * j)) & 3) - 1) * d;
                 mmb_store8(As + row * MMB_LDS_STRIDE + 8 * (tid & 7), v);
             }
+        } else if constexpr (Q6KP) {
+            const int h = tid & 1, half = weight_ks & 1, sh = 2 * h + 4 * half;
+            const float d = mmb_h2f((uint16_t) (q6s >> 16));
+            uint16_t * dst = As + (tid >> 1) * MMB_LDS_STRIDE + 32 * h;
+#pragma unroll
+            for (int lh = 0; lh < 4; ++lh) {
+                const float sc = (float) (int8_t) ((q6s >> (8 * (lh >> 1))) & 255u);
+                float v[8];
+#pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    const uint32_t l8 = (q6l[2 * lh + j / 4] >> (8 * (j & 3))) & 255u, h8 = (q6h[2 * lh + j / 4] >> (8 * (j & 3))) & 255u;
+                    const int q = (int) ((half ? (l8 >> 4) : (l8 & 15u)) | (((h8 >> sh) & 3u) << 4));
+                    v[j] = d * sc * (float) ((int8_t) q - 32);
+                }
+                mmb_store8(dst + 8 * lh, v);
+            }
+        } else if constexpr (Q4KP) {
+            mmb_dq_q4k_slice<true>(q4q, q4q, q4m, weight_ks & 3, (uint32_t *)(As + (tid >> 1) * MMB_LDS_STRIDE), tid & 1);
         } else if constexpr (WTYPE >= 32 && WTYPE != 32 + GGML_TYPE_Q5_1) mmb_load_quant_tile<WTYPE, BM, MMB_LDS_STRIDE>(Wbase, wrow_bytes, a_rows, weight_ks, As);
         if constexpr (Q51S) {
             mmb_dq_q51_one(a0[0], a1[0], (uint32_t *)(As + (tid >> 1) * MMB_LDS_STRIDE + (tid & 1) * 32));
@@ -2090,7 +2136,7 @@ static bool mmb_act_from_fused_gateup(const ggml_tensor * act, const int n_ff, c
     return false;
 }
 
-bool ggml_cuda_mmb_supported_mmid(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, const ggml_tensor * dst) {
+static bool mmb_supported_mmid_from(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, const ggml_tensor * dst, const int64_t min_t_cap) {
     if (!mmb_enabled(ctx)) return false;
     // Fused gate_up is split into gate/up views, so the SwiGLU fusion never fires and MMB pays BF16 precision with no
     // fused-kernel payoff. gemma-4-26B-A4B / gfx1151 / ROCm 10.0: KL vs master 0.19-0.31, top-1 90-93% (split-tensor
@@ -2114,11 +2160,15 @@ bool ggml_cuda_mmb_supported_mmid(ggml_backend_cuda_context & ctx, const ggml_te
     if (dst->ne[0] != M || dst->ne[1] != n_used || dst->ne[2] != T || dst->ne[3] != 1) return false;
     if (ids->nb[0] != sizeof(int32_t) || ids->ne[2] != 1 || ids->ne[3] != 1) return false;
 #ifdef GGML_USE_TRELLIS
-    if (T < mmb_min_t_for(ctx, src0->type) || n_used > 64 || (T * n_used) >> 16 >= 1024) return false;   // tile index must fit in 16 bits per expert
+    if (T < std::min<int64_t>(mmb_min_t_for(ctx, src0->type), min_t_cap) || n_used > 64 || (T * n_used) >> 16 >= 1024) return false;   // tile index must fit in 16 bits per expert
 #else
-    if (T < mmb_min_t(ctx) || n_used > 64 || (T * n_used) >> 16 >= 1024) return false;   // tile index must fit in 16 bits per expert
+    if (T < std::min<int64_t>(mmb_min_t(ctx), min_t_cap) || n_used > 64 || (T * n_used) >> 16 >= 1024) return false;   // tile index must fit in 16 bits per expert
 #endif
     return true;
+}
+
+bool ggml_cuda_mmb_supported_mmid(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, const ggml_tensor * dst) {
+    return mmb_supported_mmid_from(ctx, src0, src1, ids, dst, ggml_cuda_mmb_down_g2_packed(src0) ? 32 : INT64_MAX);
 }
 
 // geometry ggml_cuda_mul_mat_mmb picks for an F32 weight with M > 64: 5 (32x64) up to M = 1024, else 0 (128x128)
@@ -3389,7 +3439,7 @@ mmb_r2_gemv_kernel(const uint8_t * __restrict__ R, const size_t eb, const char *
 // G2 layout, per tensor, same 144 B per (row, 256-K superblock) as Q4_K: [expert][M/16 row tile][K/256 sb][2304 B]
 //   bytes    0..255 : [16 rows][16 B] the row's Q4_K header (d, dmin, scales[12]), unchanged
 //   bytes 256..2303 : [group g 0..3][piece p 0..1][16 rows][16 B] = qs[32 g + 16 p .. +16) of the row
-// so a wave's code load is 512 contiguous bytes (16 rows x both pieces, see mmb_g2_glu_kernel for the lane mapping).
+// so a wave's code load is 512 contiguous bytes (16 rows x both pieces, see mmb_g2_kernel for the lane mapping).
 // Decode: nibble q placed at f16 mantissa bits [6,10) is the subnormal q*2^-18 exactly, so
 //   v_pk_fma_f16(w, f16(d*sc)*2^18, f16(-dmin*mn)) = RN_f16(q*f16(d*sc) - f16(dmin*mn)),
 // bit-identical to the gluk decode (magic add then fma) as long as f16(d*sc)*2^18 is a finite f16, i.e. d*sc < 0.25
@@ -3466,14 +3516,97 @@ template <bool HI> __device__ __forceinline__ g2_v8u g2_dec(const uint4 c, const
     }
     return f;
 }
+// G6: the G2 tiling for routed Q6_K (same 210 B per (row, 256-K superblock)): [expert][M/16 row tile][K/256 sb][3360 B]
+//   bytes    0..255 : [16 rows][16 B] the row's int8 sub-block scales, unchanged
+//   bytes  256..287 : [16 rows][2 B] d
+//   bytes 288..2335 : [group g 0..3][piece p 0..1][16 rows][16 B] low 4 bits: byte i = code(64 g + 16 p + i) |
+//                     code(64 g + 32 + 16 p + i) << 4, bytes {0,1,2,3} -> {0,2,1,3} in every dword (as G2)
+//   bytes 2336..3359: [g][p][16 rows][8 B] high 2 bits: dword j / 2, bits 8 (j & 1) + [0,2,4,6] (+16 for the odd element
+//                     of a pair) = elements 4 j + {0, 2} of the low plane, then of the high plane
+// Decode: the 6-bit code q in the mantissa of 0x6400 is 1024 + q, so (w - 1056) * f16(d*sc) = RN_f16((q - 32)*f16(d*sc))
+// with one rounding (two packed ops per 2 values, any scale).
+constexpr int G6_TILE = 3360, G6_D = 256, G6_NIB = 288, G6_HB = 2336;
+
+__device__ __forceinline__ uint32_t g6_code(const uint8_t * __restrict__ b, const int k) {   // ggml Q6_K element k, 0..63
+    const int n = k >> 7, rr = k & 127, l = rr & 31, quad = rr >> 5;
+    const uint32_t ql = b[64 * n + l + (quad & 1) * 32], qh = b[128 + 32 * n + l];
+    return ((quad >= 2 ? ql >> 4 : ql) & 15u) | (((qh >> (2 * quad)) & 3u) << 4);
+}
+__global__ void mmb_g6_repack_kernel(const uint8_t * __restrict__ W, uint8_t * __restrict__ R, const size_t n, const int M, const int NSB) {
+    const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;   // (expert, row, superblock) in Q6_K order
+    if (i >= n) return;
+    const size_t per_e = (size_t) M * NSB;
+    const size_t e = i / per_e, rem = i % per_e;
+    const int row = (int) (rem / NSB), sb = (int) (rem % NSB), r = row % 16;
+    const uint8_t * b = W + i * 210;
+    uint8_t * t = R + e * per_e * 210 + ((size_t) (row / 16) * NSB + sb) * G6_TILE;
+    for (int c = 0; c < 16; ++c) t[r * 16 + c] = b[192 + c];
+    t[G6_D + r * 2] = b[208]; t[G6_D + r * 2 + 1] = b[209];
+    for (int g = 0; g < 4; ++g) {
+        for (int p = 0; p < 2; ++p) {
+            const int k0 = 64 * g + 16 * p, k1 = k0 + 32;
+            uint32_t nib[4], hb[2] = {0, 0};
+            for (int j = 0; j < 4; ++j) {
+                uint32_t w = 0;
+                for (int c = 0; c < 4; ++c) w |= ((g6_code(b, k0 + 4 * j + c) & 15u) | ((g6_code(b, k1 + 4 * j + c) & 15u) << 4)) << (8 * c);
+                nib[j] = __builtin_amdgcn_perm(w, w, 0x03010200u);
+                for (int c = 0; c < 4; ++c) {
+                    const int f = 8 * (j & 1) + 16 * (c & 1) + 2 * (c >> 1);
+                    hb[j >> 1] |= ((g6_code(b, k0 + 4 * j + c) >> 4) << f) | ((g6_code(b, k1 + 4 * j + c) >> 4) << (f + 4));
+                }
+            }
+            *(uint4 *) (t + G6_NIB + (g * 2 + p) * 256 + r * 16) = make_uint4(nib[0], nib[1], nib[2], nib[3]);
+            *(uint2 *) (t + G6_HB + (g * 2 + p) * 128 + r * 8) = make_uint2(hb[0], hb[1]);
+        }
+    }
+}
+__device__ __forceinline__ float g6_dsc(const uint16_t d, const int sc) {   // f16(d*sc), the decode's sub-block scale
+    return (float) (_Float16) ((float) __builtin_bit_cast(_Float16, d) * (float) sc);
+}
+// f16(d*sc) pair of sub-block sc (int8 in byte sh / 8 of w)
+__device__ __forceinline__ uint32_t g6_sb(const uint32_t w, const int sh, const uint16_t d) {
+    const uint32_t s = __builtin_bit_cast(uint16_t, (_Float16) g6_dsc(d, (int) (int8_t) ((w >> sh) & 0xffu)));
+    return s | (s << 16);
+}
+template <int SH> __device__ __forceinline__ uint32_t g6_shift(const uint32_t x) { return SH >= 0 ? x << SH : x >> -SH; }
+// 16 K elements of one row (low or high plane of a piece) -> WMMA fragment (natural K order)
+typedef _Float16 g6_h2 __attribute__((ext_vector_type(2)));
+// (1024 + q - 1056) * s on both halves: exact subtract, one rounding
+__device__ __forceinline__ uint32_t g6_qmul(const uint32_t v, const uint32_t S2) {
+    const g6_h2 m = {(_Float16) -1056.0f, (_Float16) -1056.0f};
+    return __builtin_bit_cast(uint32_t, (__builtin_bit_cast(g6_h2, v) + m) * __builtin_bit_cast(g6_h2, S2));
+}
+template <bool HI> __device__ __forceinline__ g2_v8u g6_dec(const uint4 c, const uint2 h, const uint32_t S2) {
+    const uint32_t w[4] = {c.x, c.y, c.z, c.w};
+    constexpr uint32_t M1 = 0x000F000Fu, M2 = 0x00300030u, E = 0x64006400u;
+    g2_v8u f;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const uint32_t D = j < 2 ? h.x : h.y;
+        const uint32_t nx = ((HI ? w[j] >> 4 : w[j]) & M1) | E, ny = ((HI ? w[j] >> 12 : w[j] >> 8) & M1) | E;
+        uint32_t hx, hy;
+        if (j & 1) { hx = g6_shift<HI ? -8 : -4>(D) & M2; hy = g6_shift<HI ? -10 : -6>(D) & M2; }
+        else       { hx = g6_shift<HI ?  0 :  4>(D) & M2; hy = g6_shift<HI ?  -2 :  2>(D) & M2; }
+        f[2 * j] = g6_qmul(nx | hx, S2);
+        f[2 * j + 1] = g6_qmul(ny | hy, S2);
+    }
+    return f;
+}
+
 // bf16 -> f32 -> f16 (RNE), the conversion of the gluk kernel (mmb_gluk_bf2f16)
 __device__ __forceinline__ uint32_t g2_h(const uint32_t fbits) {
     return (uint32_t) __builtin_bit_cast(uint16_t, (_Float16) __uint_as_float(fbits));
 }
-// 8 bf16 activations -> f16
+// bf16 -> f16 of x * 2^-4 (exact unless subnormal): the down input, whose SwiGLU values may exceed the f16 range
+__device__ __forceinline__ uint32_t g2_hs(const uint32_t fbits) {
+    return (uint32_t) __builtin_bit_cast(uint16_t, (_Float16) (__uint_as_float(fbits) * 0.0625f));
+}
+// 8 bf16 activations -> f16 (DOWN: scaled by 2^-4)
+template <bool DOWN = false>
 __device__ __forceinline__ uint4 g2_cvt8(const uint4 v) {
-    return make_uint4(g2_h(v.x << 16) | (g2_h(v.x & 0xffff0000u) << 16), g2_h(v.y << 16) | (g2_h(v.y & 0xffff0000u) << 16),
-                      g2_h(v.z << 16) | (g2_h(v.z & 0xffff0000u) << 16), g2_h(v.w << 16) | (g2_h(v.w & 0xffff0000u) << 16));
+    auto h = [](const uint32_t f) { return DOWN ? g2_hs(f) : g2_h(f); };
+    return make_uint4(h(v.x << 16) | (h(v.x & 0xffff0000u) << 16), h(v.y << 16) | (h(v.y & 0xffff0000u) << 16),
+                      h(v.z << 16) | (h(v.z & 0xffff0000u) << 16), h(v.w << 16) | (h(v.w & 0xffff0000u) << 16));
 }
 
 // (gate, up) f16 (scale*2^18, bias) of sub-block j for this lane's row, packed math on both tiles at once:
@@ -3525,37 +3658,55 @@ __device__ __forceinline__ void g2_sb2(const uint4 hg, const uint4 hu, const uin
 // so lane (r, h) loads and decodes piece (r & 1) ^ h of its row - the used lanes get piece 0 (K 0..15) in place and
 // piece 1 (K 16..31) through one permlanex16, one decode per lane. Accumulator lane (n, h) holds weight rows 2 v + h,
 // token n. TN = 4 keeps 176 VGPRs: two blocks per CU, so streaming small-expert tiles share CUs with WMMA-bound ones.
-template <int K, int TN, int NW = 8>
+// GLU = false (routed down, Wu == Wg): wave w owns the two 16-row tiles 2 w, 2 w + 1 of a 256-column block in place of
+// the gate/up pair; activations enter as x * 2^-4 and the f32 sums leave * 2^4, staged through LDS per token tile.
+// Q6 (down only): the G6 layout of a Q6_K down, one f16 scale per 16-K piece.
+// PL (down mode): a dense Q4_K weight [K, M] in its own layout (the G2 byte swap done in registers), activation rows
+// 0 .. T - 1 in place of routed rows, block b = (token tile b / (M / BM), column block b % (M / BM)), no descriptors.
+template <int K, int TN, bool GLU, bool Q6 = false, bool PL = false, int NW = 8>
 __global__ void __launch_bounds__(NW * 32) __attribute__((amdgpu_waves_per_eu(TN <= 4 ? 8 : 1)))
-mmb_g2_glu_kernel(const uint8_t * __restrict__ Wg, const uint8_t * __restrict__ Wu, const size_t eb, const uint16_t * __restrict__ X,
+mmb_g2_kernel(const uint8_t * __restrict__ Wg, const uint8_t * __restrict__ Wu, const size_t eb, const uint16_t * __restrict__ X,
         const int32_t * __restrict__ ids_src, const int32_t * __restrict__ ids_dst, const uint4 * __restrict__ descs,
-        uint16_t * __restrict__ Dh, float * __restrict__ D, const int M) {
+        uint16_t * __restrict__ Dh, float * __restrict__ D, const int M, const int T) {
 #if defined(__HIP_DEVICE_COMPILE__) && !defined(RDNA3)
     NO_DEVICE_CODE;
 #else
     constexpr int KC = 64, NSB = K / 256, NG = K / 64, BN = 16 * TN, NCH = K / KC, LSB = KC + 8;
-    constexpr int NT = NW * 32, BM = NW * 16;   // threads, output columns per block
+    constexpr int NT = NW * 32, BM = NW * 16 * (GLU ? 1 : 2);   // threads, output columns per block
     constexpr int BPI = BN * KC / 8 / NT;
-    constexpr int SST = BM + 8;
-    constexpr int BSZ = BN * LSB;
+    constexpr int SST = BM + 8, FST = BM + 4;
+    constexpr int BSZ = BN * LSB, BSZA = GLU ? (BSZ > BN * SST / 2 ? BSZ : BN * SST / 2) : (BSZ > 16 * FST ? BSZ : 16 * FST);   // + epilogue staging
     static_assert(K % 256 == 0 && BPI >= 1 && BN * KC % (8 * NT) == 0, "");
-    static_assert(2 * BSZ >= BN * SST, "");
-    __shared__ __align__(16) _Float16 Bs[2][BSZ];
-    const uint4 dsc = descs[blockIdx.x];
-    const int cnt = (int) dsc.w;
-    if (cnt == 0) return;
-    const int e = (int) dsc.x, cb = (int) dsc.y, r0 = (int) dsc.z;
+    static_assert(!(GLU && Q6) && !(PL && (GLU || Q6)), "");
+    constexpr int TILE = Q6 ? G6_TILE : G2_TILE;
+    constexpr int SB_STEP = PL ? 144 : TILE, G_STEP = PL ? 32 : 512;   // bytes per superblock / 64-K group of a lane's row
+    __shared__ __align__(16) _Float16 Bs[2][BSZA];
+    int cnt, e, cb, r0;
+    if constexpr (PL) {
+        const int n_cb = M / BM, tt = (int) blockIdx.x / n_cb;
+        e = 0; cb = (int) blockIdx.x % n_cb; r0 = tt * BN; cnt = min(BN, T - r0);
+    } else {
+        const uint4 dsc = descs[blockIdx.x];
+        cnt = (int) dsc.w;
+        e = (int) dsc.x; cb = (int) dsc.y; r0 = (int) dsc.z;
+    }
+    if (cnt <= 0) return;
     const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5, r = lane & 15, hf = lane >> 4;
-    const size_t hoff = (size_t) e * eb + (size_t) (cb * NW + wave) * NSB * G2_TILE + r * 16;
-    const size_t coff = hoff + 256 + ((r & 1) ^ hf) * 256;
-    const uint8_t * Hg = Wg + hoff, * Hu = Wu + hoff;
-    const uint8_t * Cg = Wg + coff, * Cu = Wu + coff;
+    const int pc = (r & 1) ^ hf;   // the piece this lane decodes
+    const size_t hoff = PL ? ((size_t) (cb * NW + wave) * 32 + r) * NSB * 144
+                           : (size_t) e * eb + (size_t) (cb * NW + wave) * (GLU ? 1 : 2) * NSB * TILE + r * 16;
+    const size_t uoff = GLU ? 0 : PL ? (size_t) 16 * NSB * 144 : (size_t) NSB * TILE;
+    const size_t coff = hoff + (PL ? 16 : Q6 ? G6_NIB : 256) + pc * (PL ? 16 : 256);
+    const uint8_t * Hg = Wg + hoff, * Hu = Wu + hoff + uoff;
+    const uint8_t * Cg = Wg + coff, * Cu = Wu + coff + uoff;
+    const size_t qoff = hoff - r * 16 + G6_HB + pc * 128 + r * 8, doff = hoff - r * 16 + G6_D + r * 2;   // Q6
+    const uint8_t * Qg = Wg + qoff, * Qu = Wu + qoff + uoff;
 
     int bsrc[BPI], bdst[BPI];   // element offsets into X (-1: zero row)
 #pragma unroll
     for (int i = 0; i < BPI; ++i) {
         const int c = tid + i * NT, tok = c / (KC / 8), kp = c % (KC / 8);
-        const int sr = tok < cnt ? ids_src[r0 + tok] : -1;
+        const int sr = tok < cnt ? (PL ? r0 + tok : ids_src[r0 + tok]) : -1;
         bsrc[i] = sr >= 0 ? sr * K + kp * 8 : -1;
         bdst[i] = tok * LSB + kp * 8;
     }
@@ -3566,12 +3717,22 @@ mmb_g2_glu_kernel(const uint8_t * __restrict__ Wg, const uint8_t * __restrict__ 
     };
     auto storeB = [&](int buf) {
 #pragma unroll
-        for (int i = 0; i < BPI; ++i) *(uint4 *) (&Bs[buf][bdst[i]]) = g2_cvt8(breg[i]);
+        for (int i = 0; i < BPI; ++i) *(uint4 *) (&Bs[buf][bdst[i]]) = g2_cvt8<!GLU>(breg[i]);
     };
     uint4 ac[1][2];   // next group's codes [gate, up]
+    uint2 aq[2];      // Q6: their high bits
     auto loadA = [&](uint4 (&a)[2], int gi) {
-        const size_t off = (size_t) (gi >> 2) * G2_TILE + (gi & 3) * 512;   // 64-K group gi
+        const size_t off = (size_t) (gi >> 2) * SB_STEP + (gi & 3) * G_STEP;   // 64-K group gi
         a[0] = *(const uint4 *) (Cg + off); a[1] = *(const uint4 *) (Cu + off);
+        if constexpr (PL) {
+#pragma unroll
+            for (int t = 0; t < 2; ++t) a[t] = make_uint4(__builtin_amdgcn_perm(a[t].x, a[t].x, 0x03010200u), __builtin_amdgcn_perm(a[t].y, a[t].y, 0x03010200u),
+                                                          __builtin_amdgcn_perm(a[t].z, a[t].z, 0x03010200u), __builtin_amdgcn_perm(a[t].w, a[t].w, 0x03010200u));
+        }
+        if constexpr (Q6) {
+            const size_t qo = (size_t) (gi >> 2) * TILE + (gi & 3) * 256;
+            aq[0] = *(const uint2 *) (Qg + qo); aq[1] = *(const uint2 *) (Qu + qo);
+        }
     };
     v8f acc[2][TN];
 #pragma unroll
@@ -3583,6 +3744,8 @@ mmb_g2_glu_kernel(const uint8_t * __restrict__ Wg, const uint8_t * __restrict__ 
     uint4 hn0 = *(const uint4 *) Hg, hn1 = *(const uint4 *) Hu;
     uint4 hc0 = hn0, hc1 = hn1;
     uint32_t D2 = 0, M2 = 0;
+    [[maybe_unused]] uint16_t dn0 = 0, dn1 = 0, dc0 = 0, dc1 = 0;   // Q6: d of the next / current superblock
+    if constexpr (Q6) { dn0 = *(const uint16_t *) (Wg + doff); dn1 = *(const uint16_t *) (Wu + doff + uoff); }
     loadB(0); storeB(0);
     loadA(ac[0], 0);
     __syncthreads();
@@ -3591,20 +3754,35 @@ mmb_g2_glu_kernel(const uint8_t * __restrict__ Wg, const uint8_t * __restrict__ 
         const int gg = gi & 3;
         if (gg == 0) {
             hc0 = hn0; hc1 = hn1;
-            if (gi + 4 < NG) { hn0 = *(const uint4 *) (Hg + (size_t) ((gi >> 2) + 1) * G2_TILE); hn1 = *(const uint4 *) (Hu + (size_t) ((gi >> 2) + 1) * G2_TILE); }
-            D2 = __builtin_amdgcn_perm(hc1.x, hc0.x, 0x05040100u);
-            M2 = __builtin_amdgcn_perm(hc1.x, hc0.x, 0x07060302u) ^ 0x80008000u;
+            if (gi + 4 < NG) { hn0 = *(const uint4 *) (Hg + (size_t) ((gi >> 2) + 1) * SB_STEP); hn1 = *(const uint4 *) (Hu + (size_t) ((gi >> 2) + 1) * SB_STEP); }
+            if constexpr (Q6) {
+                dc0 = dn0; dc1 = dn1;
+                if (gi + 4 < NG) { dn0 = *(const uint16_t *) (Wg + doff + (size_t) ((gi >> 2) + 1) * TILE); dn1 = *(const uint16_t *) (Wu + doff + uoff + (size_t) ((gi >> 2) + 1) * TILE); }
+            } else {
+                D2 = __builtin_amdgcn_perm(hc1.x, hc0.x, 0x05040100u);
+                M2 = __builtin_amdgcn_perm(hc1.x, hc0.x, 0x07060302u) ^ 0x80008000u;
+            }
         }
         if (gi + 1 < NCH) loadB(gi + 1);
         const uint4 cg = ac[0][0], cu = ac[0][1];
+        [[maybe_unused]] const uint2 qg = aq[0], qu = aq[1];
         if (gi + 1 < NG) loadA(ac[0], gi + 1);
         const _Float16 * bbase = &Bs[gi & 1][r * LSB];
 #pragma unroll
         for (int h = 0; h < 2; ++h) {
             uint32_t Sg, Bg, Su, Bu;
-            g2_sb2(hc0, hc1, D2, M2, 2 * gg + h, Sg, Bg, Su, Bu);
-            const g2_v8u xg = h ? g2_dec<true>(cg, Sg, Bg) : g2_dec<false>(cg, Sg, Bg);
-            const g2_v8u xu = h ? g2_dec<true>(cu, Su, Bu) : g2_dec<false>(cu, Su, Bu);
+            g2_v8u xg, xu;
+            if constexpr (Q6) {
+                const uint32_t wg = gg == 0 ? hc0.x : gg == 1 ? hc0.y : gg == 2 ? hc0.z : hc0.w;
+                const uint32_t wu = gg == 0 ? hc1.x : gg == 1 ? hc1.y : gg == 2 ? hc1.z : hc1.w;
+                Sg = g6_sb(wg, 8 * (2 * h + pc), dc0); Su = g6_sb(wu, 8 * (2 * h + pc), dc1);
+                xg = h ? g6_dec<true>(cg, qg, Sg) : g6_dec<false>(cg, qg, Sg);
+                xu = h ? g6_dec<true>(cu, qu, Su) : g6_dec<false>(cu, qu, Su);
+            } else {
+                g2_sb2(hc0, hc1, D2, M2, 2 * gg + h, Sg, Bg, Su, Bu);
+                xg = h ? g2_dec<true>(cg, Sg, Bg) : g2_dec<false>(cg, Sg, Bg);
+                xu = h ? g2_dec<true>(cu, Su, Bu) : g2_dec<false>(cu, Su, Bu);
+            }
             const g2_v8u yg = g2_xhalf(xg), yu = g2_xhalf(xu);
             const _Float16 * bp = bbase + h * 32;
 #pragma unroll
@@ -3621,6 +3799,30 @@ mmb_g2_glu_kernel(const uint8_t * __restrict__ Wg, const uint8_t * __restrict__ 
             }
         }
         if (gi + 1 < NCH) { storeB((gi + 1) & 1); __syncthreads(); }
+    }
+    if constexpr (!GLU) {
+        float * stg = (float *) &Bs[0][0];
+#pragma unroll
+        for (int j = 0; j < TN; ++j) {
+            if (j >= njt) break;
+            __syncthreads();
+#pragma unroll
+            for (int i = 0; i < 2; ++i)
+#pragma unroll
+                for (int v = 0; v < 8; ++v) stg[r * FST + wave * 32 + i * 16 + 2 * v + hf] = acc[i][j][v] * 16.0f;
+            __syncthreads();
+            for (int idx = tid; idx < 16 * (BM / 4); idx += NT) {
+                const int tok = j * 16 + idx / (BM / 4), part = idx % (BM / 4);
+                if (tok >= cnt) break;
+                const int dr = PL ? r0 + tok : ids_dst[r0 + tok];
+                if (dr < 0) continue;
+                const float4 v = *(const float4 *) (stg + (idx / (BM / 4)) * FST + part * 4);
+                const size_t o = (size_t) dr * M + cb * BM + part * 4;
+                if (D) *(float4 *) (D + o) = v;
+                if (Dh) *(uint2 *) (Dh + o) = make_uint2(mmb_pack2(v.x, v.y), mmb_pack2(v.z, v.w));
+            }
+        }
+        return;
     }
     const int col = cb * BM + wave * 16 + hf;   // + 2 v
     if (D) {
@@ -3775,6 +3977,61 @@ mmb_g2_gemv_kernel(const uint8_t * __restrict__ Wg, const uint8_t * __restrict__
     }
 }
 
+// f32 GEMV over the G6 layout (Q6_K down outside the G2 WMMA kernel): mmb_g2_gemv_kernel<false> with the G6 decode
+__global__ void __launch_bounds__(256)
+mmb_g6_gemv_kernel(const uint8_t * __restrict__ W, const size_t eb, const char * __restrict__ x,
+        const size_t nb11, const size_t nb12, const int ne11, const char * __restrict__ ids, const size_t ids_nb0, const size_t ids_nb1,
+        char * __restrict__ dst, const size_t nb1, const size_t nb2, const int M, const int E, const int K) {
+    extern __shared__ float g2_xs[];
+    __shared__ float red[16][17];
+    const int ct = blockIdx.x, i = blockIdx.y, t = blockIdx.z;
+    const float * xr = (const float *) (x + (size_t) t * nb12 + (size_t) (i % ne11) * nb11);
+    for (int k = threadIdx.x; k < K; k += blockDim.x) g2_xs[k] = xr[k];
+    __syncthreads();
+    const int e = *(const int32_t *) (ids + (size_t) t * ids_nb1 + (size_t) i * ids_nb0);
+    if (e < 0 || e >= E) return;
+    const int r = threadIdx.x & 15, q = threadIdx.x >> 4;
+    const int NSB = K / 256, NU = NSB * 4;
+    float acc = 0.0f;
+    for (int u = q; u < NU; u += 16) {
+        const int sb = u >> 2, g = u & 3;
+        const uint8_t * base = W + (size_t) e * eb + ((size_t) ct * NSB + sb) * G6_TILE;
+        const uint4 sc = *(const uint4 *) (base + r * 16);
+        const uint32_t w = g == 0 ? sc.x : g == 1 ? sc.y : g == 2 ? sc.z : sc.w;
+        const uint16_t d = *(const uint16_t *) (base + G6_D + r * 2);
+        const float * xb = g2_xs + sb * 256 + g * 64;
+#pragma unroll
+        for (int pp = 0; pp < 2; ++pp) {
+            const uint4 c = *(const uint4 *) (base + G6_NIB + (g * 2 + pp) * 256 + r * 16);
+            const uint2 hb = *(const uint2 *) (base + G6_HB + (g * 2 + pp) * 128 + r * 8);
+            const uint32_t cw[4] = {c.x, c.y, c.z, c.w};
+            float s0 = 0.0f, s1 = 0.0f;
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const uint32_t D = j < 2 ? hb.x : hb.y;
+#pragma unroll
+                for (int cc = 0; cc < 4; ++cc) {
+                    const uint32_t byte = (cw[j] >> (8 * (cc == 1 ? 2 : cc == 2 ? 1 : cc))) & 0xffu;   // repacked byte order {0,2,1,3}
+                    const int f = 8 * (j & 1) + 16 * (cc & 1) + 2 * (cc >> 1);
+                    const int q0 = (int) ((byte & 15u) | (((D >> f) & 3u) << 4)) - 32;
+                    const int q1 = (int) ((byte >> 4) | (((D >> (f + 4)) & 3u) << 4)) - 32;
+                    s0 += (float) q0 * xb[16 * pp + 4 * j + cc];
+                    s1 += (float) q1 * xb[32 + 16 * pp + 4 * j + cc];
+                }
+            }
+            acc += g6_dsc(d, (int) (int8_t) ((w >> (8 * pp)) & 0xffu)) * s0 + g6_dsc(d, (int) (int8_t) ((w >> (8 * (2 + pp))) & 0xffu)) * s1;
+        }
+    }
+    red[q][r] = acc;
+    __syncthreads();
+    if (threadIdx.x < 16) {
+        float a = 0.0f;
+#pragma unroll
+        for (int j = 0; j < 16; ++j) a += red[j][r];
+        *(float *) (dst + (size_t) t * nb2 + (size_t) i * nb1 + (size_t) (ct * 16 + r) * sizeof(float)) = a;
+    }
+}
+
 static bool mmb_r2_eligible(const ggml_tensor * w) {
     return w && w->type == GGML_TYPE_Q5_1 && w->op == GGML_OP_NONE && w->view_src == nullptr && w->data && w->buffer &&
            ggml_backend_buffer_get_usage(w->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS && ggml_is_contiguous(w) && w->ne[3] == 1 &&
@@ -3795,17 +4052,25 @@ static bool mmb_g2_eligible(const ggml_tensor * w) {
            (w->ne[0] == 2048 || w->ne[0] == 2560 || w->ne[0] == 4096) && w->ne[1] % G2_BM == 0 && w->ne[2] >= 1 && w->ne[2] <= 1024 &&
            w->nb[2] == (size_t) w->ne[1] * (w->ne[0] / 256) * 144;
 }
+// routed Q4_K down [K = 768, M, E]: the G2 WMMA down kernel takes 256 output columns per block
+static constexpr int G2_DOWN_K = 768, G2_DOWN_BM = 2 * G2_BM;
+static bool mmb_g2_down_eligible(const ggml_tensor * w) {
+    return w && (w->type == GGML_TYPE_Q4_K || w->type == GGML_TYPE_Q6_K) && w->op == GGML_OP_NONE && w->view_src == nullptr && w->data && w->buffer &&
+           ggml_backend_buffer_get_usage(w->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS && ggml_is_contiguous(w) && w->ne[3] == 1 &&
+           w->ne[0] == G2_DOWN_K && w->ne[1] % G2_DOWN_BM == 0 && w->ne[2] >= 1 && w->ne[2] <= 1024 &&
+           w->nb[2] == (size_t) w->ne[1] * (w->ne[0] / 256) * (w->type == GGML_TYPE_Q6_K ? 210 : 144);
+}
 } // namespace
 
-bool ggml_cuda_mmb_r2_packed(const ggml_tensor * w) {   // any routed repacked layout (R2 Q5_1 down, G2 Q4_K gate/up)
-    if (!w || !w->data || (w->type != GGML_TYPE_Q5_1 && w->type != GGML_TYPE_Q4_K)) return false;
+bool ggml_cuda_mmb_r2_packed(const ggml_tensor * w) {   // any routed repacked layout (R2 Q5_1 down, G2 Q4_K, G6 Q6_K)
+    if (!w || !w->data || (w->type != GGML_TYPE_Q5_1 && w->type != GGML_TYPE_Q4_K && w->type != GGML_TYPE_Q6_K)) return false;
     std::lock_guard<std::mutex> lock(g_r2_mutex);
     const auto & m = w->type == GGML_TYPE_Q5_1 ? g_r2_packed : g_g2_packed;
     return !m.empty() && m.count((const char *) w->data) > 0;
 }
 
 bool ggml_cuda_mmb_g2_packed(const ggml_tensor * w) {
-    if (!w || w->type != GGML_TYPE_Q4_K || !w->data) return false;
+    if (!w || (w->type != GGML_TYPE_Q4_K && w->type != GGML_TYPE_Q6_K) || !w->data) return false;
     std::lock_guard<std::mutex> lock(g_r2_mutex);
     return !g_g2_packed.empty() && g_g2_packed.count((const char *) w->data) > 0;
 }
@@ -3830,6 +4095,48 @@ void ggml_cuda_mmb_r2_forget(const void * base, const size_t size) {
             if (*it >= lo && *it < hi) it = failed->erase(it); else ++it;
         }
     }
+}
+
+// whole-tensor read of a G2 / G6 tensor: the device bytes, converted back to the Q4_K / Q6_K layout on the host
+bool ggml_cuda_mmb_g2_read(const ggml_tensor * t, void * data, const size_t offset, const size_t size) {
+    if (offset != 0 || size != ggml_nbytes(t) || !ggml_cuda_mmb_g2_packed(t)) return false;
+    const bool q6 = t->type == GGML_TYPE_Q6_K;
+    const int M = (int) t->ne[1], NSB = (int) (t->ne[0] / 256), E = (int) t->ne[2];
+    const size_t eb = t->nb[2], bsz = q6 ? 210 : 144, tile = q6 ? G6_TILE : G2_TILE;
+    std::vector<uint8_t> src(size);
+    CUDA_CHECK(cudaMemcpy(src.data(), t->data, size, cudaMemcpyDeviceToHost));
+    uint8_t * out = (uint8_t *) data;
+    auto unswap = [](const uint8_t * b, const int i) { return b[(i & ~3) | ((i & 3) == 1 ? 2 : (i & 3) == 2 ? 1 : (i & 3))]; };
+    for (int e = 0; e < E; ++e) for (int row = 0; row < M; ++row) for (int sb = 0; sb < NSB; ++sb) {
+        const uint8_t * ti = src.data() + (size_t) e * eb + ((size_t) (row / 16) * NSB + sb) * tile;
+        uint8_t * o = out + (size_t) e * eb + ((size_t) row * NSB + sb) * bsz;
+        const int r = row % 16;
+        if (!q6) {
+            memcpy(o, ti + r * 16, 16);
+            for (int c = 0; c < 8; ++c) for (int i = 0; i < 16; ++i) o[16 + c * 16 + i] = unswap(ti + 256 + c * 256 + r * 16, i);
+            continue;
+        }
+        memset(o, 0, 192);
+        memcpy(o + 192, ti + r * 16, 16);
+        memcpy(o + 208, ti + G6_D + r * 2, 2);
+        for (int g = 0; g < 4; ++g) for (int pp = 0; pp < 2; ++pp) {
+            const uint8_t * nb = ti + G6_NIB + (g * 2 + pp) * 256 + r * 16;
+            uint32_t hb[2];
+            memcpy(hb, ti + G6_HB + (g * 2 + pp) * 128 + r * 8, 8);
+            for (int i = 0; i < 16; ++i) {
+                const int j = i / 4, c = i % 4, f = 8 * (j & 1) + 16 * (c & 1) + 2 * (c >> 1);
+                const uint32_t byte = unswap(nb, i);
+                for (int h = 0; h < 2; ++h) {
+                    const int k = 64 * g + 32 * h + 16 * pp + i;
+                    const uint32_t q = ((byte >> (4 * h)) & 15u) | (((hb[j >> 1] >> (f + 4 * h)) & 3u) << 4);
+                    const int n = k >> 7, rr = k & 127, l = rr & 31, quad = rr >> 5;
+                    o[64 * n + l + (quad & 1) * 32] |= (uint8_t) ((q & 15u) << (quad >= 2 ? 4 : 0));
+                    o[128 + 32 * n + l] |= (uint8_t) ((q >> 4) << (2 * quad));
+                }
+            }
+        }
+    }
+    return true;
 }
 
 const char * ggml_cuda_mmb_r2_layout(const void * base, const size_t size) {
@@ -3891,7 +4198,7 @@ void ggml_cuda_mmb_down_r2_prepare(ggml_backend_cuda_context & ctx, const ggml_t
 static bool mmb_down_r2_launch(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const uint16_t * xhp, uint16_t * Dh, float * D,
         const int32_t * ids_src1, const int32_t * ids_dst, const int32_t * bounds, const int E, const int M, const int K,
         const int n_rows, cudaStream_t prep_stream, const bool xp) {
-    if (!ggml_cuda_mmb_r2_packed(src0)) return false;
+    if (src0->type != GGML_TYPE_Q5_1 || !ggml_cuda_mmb_r2_packed(src0)) return false;
     GGML_ASSERT(K == 640 && M % R2_BM == 0 && E <= 1024 && (Dh || D));
     const int n_rt = M / R2_BM;
     const int n_max = n_rt * (n_rows / R2_BN + E + 1);
@@ -3921,8 +4228,54 @@ void ggml_cuda_mul_mat_id_r2_gemv(ggml_backend_cuda_context & ctx, const ggml_te
     CUDA_CHECK(cudaGetLastError());
 }
 
-// GLU R2: in-place repack of a routed Q4_K gate/up pair [K, M, E] to the G2 layout (same size, no extra memory
-// beyond a 16-expert temporary). Both tensors pass the scale check or neither is repacked.
+// In-place repack of routed Q4_K tensors [K, M, E] (same shape) to the G2 layout (same size, no extra memory beyond a
+// 16-expert temporary). All tensors pass the scale check or none is repacked.
+static void mmb_g2_repack(ggml_backend_cuda_context & ctx, const std::vector<const ggml_tensor *> & ws) {
+    const ggml_tensor * w0 = ws[0];
+    const bool q6 = w0->type == GGML_TYPE_Q6_K;
+    const int M = (int) w0->ne[1], NSB = (int) (w0->ne[0] / 256), E = (int) w0->ne[2];
+    const size_t bsz = q6 ? 210 : 144, eb = w0->nb[2], bytes = (size_t) E * eb, n = bytes / bsz;
+    cudaStream_t stream = ctx.stream();
+    ggml_cuda_pool_alloc<int> bad(ctx.pool(), 1);
+    CUDA_CHECK(cudaMemsetAsync(bad.get(), 0, sizeof(int), stream));
+    int hbad = 0;
+    if (!q6) {   // the G6 decode takes any scale
+        for (const ggml_tensor * w : ws) {
+            mmb_g2_check_kernel<<<(unsigned) ((n + 255) / 256), 256, 0, stream>>>((const uint8_t *) w->data, n, bad.get());
+            CUDA_CHECK(cudaGetLastError());
+        }
+        CUDA_CHECK(cudaMemcpyAsync(&hbad, bad.get(), sizeof(int), cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+    }
+    if (hbad) {
+        GGML_LOG_WARN("mmb_g2: %s has a Q4_K sub-block scale d*sc >= 0.25; it keeps the Q4_K layout\n", w0->name);
+        std::lock_guard<std::mutex> lock(g_r2_mutex);
+        for (const ggml_tensor * w : ws) g_g2_failed.insert((const char *) w->data);
+        return;
+    }
+    constexpr int CHUNK = 16;   // experts per temporary copy
+    ggml_cuda_set_device(ctx.device);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    {
+        ggml_cuda_pool_alloc<uint8_t> tmp(ctx.pool(), (size_t) CHUNK * eb);
+        for (const ggml_tensor * w : ws) {
+            for (int e0 = 0; e0 < E; e0 += CHUNK) {
+                const int ne = std::min(CHUNK, E - e0);
+                uint8_t * dst = (uint8_t *) w->data + (size_t) e0 * eb;
+                CUDA_CHECK(cudaMemcpyAsync(tmp.get(), dst, (size_t) ne * eb, cudaMemcpyDeviceToDevice, stream));
+                const size_t nb = (size_t) ne * eb / bsz;
+                if (q6) mmb_g6_repack_kernel<<<(unsigned) ((nb + 255) / 256), 256, 0, stream>>>(tmp.get(), dst, nb, M, NSB);
+                else    mmb_g2_repack_kernel<<<(unsigned) ((nb + 255) / 256), 256, 0, stream>>>(tmp.get(), dst, nb, M, NSB);
+                CUDA_CHECK(cudaGetLastError());
+            }
+        }
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+    }
+    std::lock_guard<std::mutex> lock(g_r2_mutex);
+    for (const ggml_tensor * w : ws) g_g2_packed[(const char *) w->data] = bytes;
+}
+
+// GLU R2: a routed Q4_K gate/up pair to the G2 layout; the pair is packed together or not at all
 void ggml_cuda_mmb_glu_r2_prepare(ggml_backend_cuda_context & ctx, const ggml_tensor * gw, const ggml_tensor * uw) {
     if (!mmb_enabled(ctx)) return;
     if (!mmb_g2_eligible(gw) || !mmb_g2_eligible(uw) || gw->data == uw->data || !ggml_are_same_shape(gw, uw) || gw->nb[2] != uw->nb[2]) return;
@@ -3934,44 +4287,86 @@ void ggml_cuda_mmb_glu_r2_prepare(ggml_backend_cuda_context & ctx, const ggml_te
         if (g_g2_packed.count(kg) && g_g2_packed.count(ku)) return;
         GGML_ASSERT(!g_g2_packed.count(kg) && !g_g2_packed.count(ku));   // a pair is packed together
     }
-    const int M = (int) gw->ne[1], NSB = (int) (gw->ne[0] / 256), E = (int) gw->ne[2];
-    const size_t eb = gw->nb[2], bytes = (size_t) E * eb, n = bytes / 144;
+    mmb_g2_repack(ctx, {gw, uw});
+}
+
+// dense Q4_K GEMM on the G2 decode, weights in their own layout (no repack): [K, M] x [K, T], K in {2048, 4096}
+bool ggml_cuda_mmb_g2_dense_supported(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
+    if (!mmb_enabled(ctx) || src0->type != GGML_TYPE_Q4_K || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) return false;
+    const int64_t K = src0->ne[0], M = src0->ne[1];
+    if (!((K == 2048 && (M == 4096 || M == 512)) || (K == 4096 && M == 2048))) return false;
+    if (src0->ne[1] % G2_DOWN_BM != 0 || src0->ne[2] != 1 || src0->ne[3] != 1 || !ggml_is_contiguous(src0)) return false;
+    if (!ggml_is_contiguous(src1) || !ggml_is_contiguous(dst) || src1->ne[0] != src0->ne[0] || dst->ne[0] != src0->ne[1]) return false;
+    if (ggml_cuda_mmb_r2_packed(src0) || ggml_cuda_mmb_dq_packed(src0)) return false;
+    const int64_t T = src1->ne[1] * src1->ne[2] * src1->ne[3];
+    return T >= 64 && T <= INT32_MAX / 4096 && ggml_nrows(dst) == T && (size_t) src0->nb[1] == (size_t) (src0->ne[0] / 256) * 144;
+}
+
+void ggml_cuda_mul_mat_g2_dense(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     cudaStream_t stream = ctx.stream();
-    ggml_cuda_pool_alloc<int> bad(ctx.pool(), 1);
-    CUDA_CHECK(cudaMemsetAsync(bad.get(), 0, sizeof(int), stream));
-    for (const ggml_tensor * w : {gw, uw}) {
-        mmb_g2_check_kernel<<<(unsigned) ((n + 255) / 256), 256, 0, stream>>>((const uint8_t *) w->data, n, bad.get());
-        CUDA_CHECK(cudaGetLastError());
-    }
-    int hbad = 0;
-    CUDA_CHECK(cudaMemcpyAsync(&hbad, bad.get(), sizeof(int), cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-    if (hbad) {
-        GGML_LOG_WARN("mmb_glu_r2: %s / %s have a Q4_K sub-block scale d*sc >= 0.25; they keep the Q4_K layout\n", gw->name, uw->name);
-        std::lock_guard<std::mutex> lock(g_r2_mutex);
-        g_g2_failed.insert((const char *) gw->data); g_g2_failed.insert((const char *) uw->data);
-        return;
-    }
-    constexpr int CHUNK = 16;   // experts per temporary copy
-    ggml_cuda_set_device(ctx.device);
-    CUDA_CHECK(cudaDeviceSynchronize());
+    const int K = (int) src0->ne[0], M = (int) src0->ne[1];
+    const int T = (int) (src1->ne[1] * src1->ne[2] * src1->ne[3]);
+    const uint16_t * xhp = mmb_bf16_activation(ctx, src1, (size_t) T * K, stream);
+    uint16_t * Dh = ggml_cuda_mmb_is_bf16_only(ctx, dst) ? (uint16_t *) dst->data : nullptr;
+    float * D = Dh ? nullptr : (float *) dst->data;
+    const uint8_t * W = (const uint8_t *) src0->data;
+    auto launch = [&](auto kt, auto tn) {
+        constexpr int KK = decltype(kt)::value, TN = decltype(tn)::value;
+        const int nb = (M / G2_DOWN_BM) * ((T + 16 * TN - 1) / (16 * TN));
+        mmb_g2_kernel<KK, TN, false, false, true><<<nb, 256, 0, stream>>>(W, W, 0, xhp, nullptr, nullptr, nullptr, Dh, D, M, T);
+    };
+    if (K == 2048) launch(std::integral_constant<int, 2048>{}, std::integral_constant<int, 4>{});
+    else           launch(std::integral_constant<int, 4096>{}, std::integral_constant<int, 4>{});
+    CUDA_CHECK(cudaGetLastError());
+}
+
+bool ggml_cuda_mmb_down_g2_wanted(ggml_backend_cuda_context & ctx, const ggml_tensor * t) {
+    return t && t->op == GGML_OP_MUL_MAT_ID && mmb_g2_down_eligible(t->src[0]) && t->src[2] &&
+           mmb_supported_mmid_from(ctx, t->src[0], t->src[1], t->src[2], t, 1);
+}
+
+// G2 down: a routed Q4_K / Q6_K down [768, M, E] to the G2 / G6 layout (mmb_g2_kernel<768, *, false, Q6>)
+void ggml_cuda_mmb_down_g2_prepare(ggml_backend_cuda_context & ctx, const ggml_tensor * w) {
+    if (!mmb_enabled(ctx) || !mmb_g2_down_eligible(w)) return;
+    std::lock_guard<std::mutex> repack_lock(g_repack_mutex);
     {
-        ggml_cuda_pool_alloc<uint8_t> tmp(ctx.pool(), (size_t) CHUNK * eb);
-        for (const ggml_tensor * w : {gw, uw}) {
-            for (int e0 = 0; e0 < E; e0 += CHUNK) {
-                const int ne = std::min(CHUNK, E - e0);
-                uint8_t * dst = (uint8_t *) w->data + (size_t) e0 * eb;
-                CUDA_CHECK(cudaMemcpyAsync(tmp.get(), dst, (size_t) ne * eb, cudaMemcpyDeviceToDevice, stream));
-                const size_t nb = (size_t) ne * eb / 144;
-                mmb_g2_repack_kernel<<<(unsigned) ((nb + 255) / 256), 256, 0, stream>>>(tmp.get(), dst, nb, M, NSB);
-                CUDA_CHECK(cudaGetLastError());
-            }
-        }
-        CUDA_CHECK(cudaStreamSynchronize(stream));
+        std::lock_guard<std::mutex> lock(g_r2_mutex);
+        if (g_g2_failed.count((const char *) w->data) || g_g2_packed.count((const char *) w->data)) return;
     }
-    std::lock_guard<std::mutex> lock(g_r2_mutex);
-    g_g2_packed[(const char *) gw->data] = bytes;
-    g_g2_packed[(const char *) uw->data] = bytes;
+    mmb_g2_repack(ctx, {w});
+}
+
+bool ggml_cuda_mmb_down_g2_packed(const ggml_tensor * w) {
+    return w && (w->type == GGML_TYPE_Q4_K || w->type == GGML_TYPE_Q6_K) && w->ne[0] == G2_DOWN_K && w->ne[1] % G2_DOWN_BM == 0 &&
+           ggml_cuda_mmb_g2_packed(w);
+}
+
+// G2 routed down (MMB path). Returns false (nothing launched) for a tensor that is not repacked.
+static bool mmb_down_g2_launch(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const uint16_t * xhp, uint16_t * Dh, float * D,
+        const int32_t * ids_src1, const int32_t * ids_dst, const int32_t * bounds, const int E, const int M, const int K,
+        const int n_rows, cudaStream_t prep_stream, const bool xp) {
+    if (!ggml_cuda_mmb_down_g2_packed(src0)) return false;
+    GGML_ASSERT(K == G2_DOWN_K && M % G2_DOWN_BM == 0 && E <= 1024 && (Dh || D));
+    constexpr int TN = 4;
+    const int BN = 16 * TN, n_cb = M / G2_DOWN_BM;
+    const int n_max = n_cb * (n_rows / BN + E + 1);
+    ggml_cuda_pool_alloc<uint4> desc(ctx.pool(), n_max);
+    mmb_g2_build_desc<<<1, 1024, 0, prep_stream>>>(bounds, desc.get(), E, n_cb, BN, n_max);
+    cudaStream_t stream = prep_stream;
+    if (xp) {
+        const cudaEvent_t eprep = mmb_event(mmb_state(ctx).prep_ev);
+        CUDA_CHECK(cudaEventRecord(eprep, prep_stream));
+        CUDA_CHECK(cudaStreamWaitEvent(ctx.stream(), eprep, 0));
+        stream = ctx.stream();
+    }
+    const uint8_t * W = (const uint8_t *) src0->data;
+    if (src0->type == GGML_TYPE_Q6_K) {
+        mmb_g2_kernel<G2_DOWN_K, TN, false, true><<<n_max, 256, 0, stream>>>(W, W, (size_t) src0->nb[2], xhp, ids_src1, ids_dst, desc.get(), Dh, D, M, 0);
+    } else {
+        mmb_g2_kernel<G2_DOWN_K, TN, false><<<n_max, 256, 0, stream>>>(W, W, (size_t) src0->nb[2], xhp, ids_src1, ids_dst, desc.get(), Dh, D, M, 0);
+    }
+    CUDA_CHECK(cudaGetLastError());
+    return true;
 }
 
 // G2 routed gate/up + SwiGLU (MMB path): one launch over the device-built tile list, any T.
@@ -3988,7 +4383,7 @@ static void mmb_glu_r2_launch(ggml_backend_cuda_context & ctx, const ggml_tensor
     const size_t eb = gw->nb[2];
     auto launch = [&](auto kt) {
         constexpr int KK = decltype(kt)::value;
-        mmb_g2_glu_kernel<KK, TN><<<n_max, 256, 0, stream>>>(Wg, Wu, eb, xhp, ids_src1, ids_dst, desc.get(), Dh, D, M);
+        mmb_g2_kernel<KK, TN, true><<<n_max, 256, 0, stream>>>(Wg, Wu, eb, xhp, ids_src1, ids_dst, desc.get(), Dh, D, M, 0);
     };
     if (K == 2560) launch(std::integral_constant<int, 2560>{});
     else if (K == 2048) launch(std::integral_constant<int, 2048>{});
@@ -4007,7 +4402,12 @@ static void mmb_g2_gemv_launch(ggml_backend_cuda_context & ctx, const ggml_tenso
     GGML_ASSERT(dst->ne[0] == M && dst->ne[1] == n_used && dst->ne[2] == T && T <= 65535 && n_used <= 65535);
     const dim3 grid(M / 16, n_used, T);
     const size_t shm = (size_t) K * sizeof(float);
-    if (uw) mmb_g2_gemv_kernel<true><<<grid, 256, shm, ctx.stream()>>>((const uint8_t *) gw->data, (const uint8_t *) uw->data, gw->nb[2],
+    if (gw->type == GGML_TYPE_Q6_K) {
+        GGML_ASSERT(!uw);
+        mmb_g6_gemv_kernel<<<grid, 256, shm, ctx.stream()>>>((const uint8_t *) gw->data, gw->nb[2],
+            (const char *) src1->data, src1->nb[1], src1->nb[2], (int) src1->ne[1], (const char *) ids->data, ids->nb[0], ids->nb[1],
+            (char *) dst->data, dst->nb[1], dst->nb[2], M, E, K);
+    } else if (uw) mmb_g2_gemv_kernel<true><<<grid, 256, shm, ctx.stream()>>>((const uint8_t *) gw->data, (const uint8_t *) uw->data, gw->nb[2],
         (const char *) src1->data, src1->nb[1], src1->nb[2], (int) src1->ne[1], (const char *) ids->data, ids->nb[0], ids->nb[1],
         (char *) dst->data, dst->nb[1], dst->nb[2], M, E, K);
     else    mmb_g2_gemv_kernel<false><<<grid, 256, shm, ctx.stream()>>>((const uint8_t *) gw->data, (const uint8_t *) gw->data, gw->nb[2],
@@ -4065,7 +4465,8 @@ void ggml_cuda_mul_mat_id_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor
     }
     {   // down R2: Q5_1 down experts with a repacked shadow -> one interleaved launch (no big/small tier split)
         uint16_t * Dh_r2 = ggml_cuda_mmb_is_bf16_only(ctx, dst) ? (uint16_t *) dst->data : nullptr;
-        if (mmb_down_r2_launch(ctx, src0, xhp, Dh_r2, Dh_r2 ? nullptr : (float *) dst->data, ids_src1_p, ids_dst_p, bounds_p, E, M, K, n_rows, stream, xp)) {
+        if (mmb_down_r2_launch(ctx, src0, xhp, Dh_r2, Dh_r2 ? nullptr : (float *) dst->data, ids_src1_p, ids_dst_p, bounds_p, E, M, K, n_rows, stream, xp) ||
+            mmb_down_g2_launch(ctx, src0, xhp, Dh_r2, Dh_r2 ? nullptr : (float *) dst->data, ids_src1_p, ids_dst_p, bounds_p, E, M, K, n_rows, stream, xp)) {
             mmb_join_pending(ctx);   // the pending side (small GLU tier) must be joined before the reduction
             mmb_hold_release(ctx);
             return;
@@ -4114,7 +4515,7 @@ void ggml_cuda_mul_mat_id_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor
     CUDA_CHECK(cudaGetLastError());
 }
 
-bool ggml_cuda_mmb_supported_glu(ggml_backend_cuda_context & ctx, const ggml_tensor * gw, const ggml_tensor * uw, const ggml_tensor * src1, const ggml_tensor * ids, const ggml_tensor * glu) {
+static bool mmb_glu_from(ggml_backend_cuda_context & ctx, const ggml_tensor * gw, const ggml_tensor * uw, const ggml_tensor * src1, const ggml_tensor * ids, const ggml_tensor * glu, const bool any_t) {
     if (!mmb_enabled(ctx) || !gw || !uw || !src1 || !ids || !glu) return false;
     if (!mmb_quant_type_routed(gw->type) || uw->type != gw->type) return false;
     if (!ggml_are_same_shape(gw, uw) || gw->nb[1] != uw->nb[1] || gw->nb[2] != uw->nb[2]) return false;
@@ -4123,7 +4524,16 @@ bool ggml_cuda_mmb_supported_glu(ggml_backend_cuda_context & ctx, const ggml_ten
     if (glu->src[0]->op != GGML_OP_MUL_MAT_ID || glu->src[1]->op != GGML_OP_MUL_MAT_ID) return false;
     if (glu->src[0]->src[0] != gw || glu->src[1]->src[0] != uw || glu->src[0]->src[1] != src1 || glu->src[1]->src[1] != src1 || glu->src[0]->src[2] != ids || glu->src[1]->src[2] != ids) return false;
     if (ggml_nelements(glu) != ggml_nelements(glu->src[0]) || glu->ne[0] != gw->ne[1]) return false;
-    return ggml_cuda_mmb_supported_mmid(ctx, gw, src1, ids, glu->src[0]) && ggml_cuda_mmb_supported_mmid(ctx, uw, src1, ids, glu->src[1]);
+    const int64_t min_t = any_t ? 1 : ggml_cuda_mmb_g2_packed(gw) && ggml_cuda_mmb_g2_packed(uw) ? 32 : INT64_MAX;
+    return mmb_supported_mmid_from(ctx, gw, src1, ids, glu->src[0], min_t) && mmb_supported_mmid_from(ctx, uw, src1, ids, glu->src[1], min_t);
+}
+
+bool ggml_cuda_mmb_supported_glu(ggml_backend_cuda_context & ctx, const ggml_tensor * gw, const ggml_tensor * uw, const ggml_tensor * src1, const ggml_tensor * ids, const ggml_tensor * glu) {
+    return mmb_glu_from(ctx, gw, uw, src1, ids, glu, false);
+}
+
+bool ggml_cuda_mmb_glu_r2_wanted(ggml_backend_cuda_context & ctx, const ggml_tensor * gw, const ggml_tensor * uw, const ggml_tensor * src1, const ggml_tensor * ids, const ggml_tensor * glu) {
+    return mmb_glu_from(ctx, gw, uw, src1, ids, glu, true);
 }
 
 static constexpr bool mmb_gluk_type(ggml_type type) {
