@@ -434,25 +434,7 @@ On Linux it is possible to use unified memory architecture (UMA) to share main m
 
 This provides GPU acceleration on AMD RDNA3, RDNA3.5 and RDNA4 GPUs (gfx1100, gfx1101, gfx1102, gfx1103, gfx1150, gfx1151, gfx1152, gfx1200, gfx1201) through the HRX runtime. The backend is experimental. Kernels are written in Loom and compiled for the GPU at first use, so ROCm is not required.
 
-Build and install the HRX SDK v0.2.0 from the [hrx-system release](https://github.com/ROCm/hrx-system/releases/tag/v0.2.0) source:
-
-```bash
-curl -L https://github.com/ROCm/hrx-system/archive/refs/tags/v0.2.0.tar.gz | tar xz
-cd hrx-system-0.2.0
-python3 dev.py cmake setup
-source .venv/bin/activate
-cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DBUILD_SHARED_LIBS=OFF -DIREE_ENABLE_WERROR_FLAG=OFF \
-      -DLIBHRX_BUILD=ON -DLIBHRX_BUILD_HIP_BINDING=OFF -DLIBHRX_BUILD_PASSTHROUGH=OFF -DLIBHRX_BUILD_CTS=OFF
-cmake --build build --target hrx hrx-info loomc_shared
-cmake --install build --prefix /path/to/hrx-sdk --component HrxPublicDist
-```
-
-Then build llama.cpp with:
-
-```bash
-cmake -B build -DGGML_HRX=ON -DCMAKE_PREFIX_PATH=/path/to/hrx-sdk
-cmake --build build --config Release
-```
+See the [Linux HRX build and verification guide](backend/HRX.md) for the pinned SDK, Release build, portable package and Strix Halo tests.
 
 The devices are named `HRX0`, `HRX1`, ... Use `--list-devices` to show them and `--device HRX0` to select one.
 

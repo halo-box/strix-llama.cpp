@@ -1,0 +1,94 @@
+name: HRX backend
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/hrx.yml'
+      - 'scripts/hrx/**'
+      - 'scripts/serve-inkling2-dspark-hrx.sh'
+      - 'docs/backend/HRX.md'
+      - 'CMakeLists.txt'
+      - 'cmake/**'
+      - 'ggml/**'
+      - 'common/**'
+      - 'include/**'
+      - 'src/**'
+      - 'tools/server/**'
+      - 'tests/**'
+  push:
+    branches: [master, ship/hrx-optimized]
+    paths:
+      - '.github/workflows/hrx.yml'
+      - 'scripts/hrx/**'
+      - 'scripts/serve-inkling2-dspark-hrx.sh'
+      - 'docs/backend/HRX.md'
+      - 'CMakeLists.txt'
+      - 'cmake/**'
+      - 'ggml/**'
+      - 'common/**'
+      - 'include/**'
+      - 'src/**'
+      - 'tools/server/**'
+      - 'tests/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build Linux x86-64 HRX release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      CMAKE_BUILD_PARALLEL_LEVEL: '3'
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@v6
+        with:
+          repository: ROCm/hrx-system
+          ref: 0cd370f2baaa0cfef47cc23007f1a109906f8a52 # v0.2.0
+          path: hrx-sdk-source
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Build and package
+        run: scripts/hrx/build-release.sh hrx-sdk-source "$RUNNER_TEMP/hrx-build"
+      - name: Check the unpacked server on the hosted runner
+        run: |
+          mkdir "$RUNNER_TEMP/hrx-check"
+          tar -xzf "$RUNNER_TEMP/hrx-build/llama-hrx-linux-x86_64.tar.gz" -C "$RUNNER_TEMP/hrx-check"
+          env -u LD_LIBRARY_PATH "$RUNNER_TEMP/hrx-check/llama-hrx/bin/llama-server" --version
+      - uses: actions/upload-artifact@v4
+        with:
+          name: llama-hrx-linux-x86_64
+          path: ${{ runner.temp }}/hrx-build/llama-hrx-linux-x86_64.tar.gz
+          if-no-files-found: error
+
+  gpu:
+    name: Verify optimized kernels on Strix Halo
+    needs: build
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, Linux, devlab-dispatch, strix-halo]
+    timeout-minutes: 30
+    concurrency:
+      group: bench-gfx1151-devlab
+      cancel-in-progress: false
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: llama-hrx-linux-x86_64
+          path: ${{ runner.temp }}/hrx-artifact
+      - name: Verify the packaged backend
+        working-directory: ${{ runner.temp }}/hrx-artifact
+        run: |
+          tar -xzf llama-hrx-linux-x86_64.tar.gz
+          env -u LD_LIBRARY_PATH bash llama-hrx/scripts/verify.sh llama-hrx/bin "$RUNNER_TEMP/hrx-logs"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: hrx-gfx1151-logs
+          path: ${{ runner.temp }}/hrx-logs/
