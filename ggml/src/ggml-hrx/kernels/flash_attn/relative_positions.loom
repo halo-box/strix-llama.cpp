@@ -1,0 +1,53 @@
+target.decl @ggml_wave32
+
+kernel.def target(@ggml_wave32) export("ggml_hrx_relative_positions") @ggml_hrx_relative_positions(%tiles: index, %rows: index) {
+  %one = index.constant 1 : index
+  %lanes = index.constant 256 : index
+  kernel.launch.config workgroups(%tiles, %rows, %one) workgroup_size(%lanes, %one, %one) : index
+} launch(%n_kv_in: index, %count_in: index, %extent: index, %src: buffer, %dst: buffer) {
+  %n_kv = index.assume %n_kv_in [range(%n_kv_in, 1, 2147483392)] : index
+  %count = index.assume %count_in [range(%count_in, 1, 536870911)] : index
+  %zero = index.constant 0 : offset
+  %four = index.constant 4 : offset
+  %one = index.constant 1 : index
+  %two = index.constant 2 : index
+  %lanes = index.constant 256 : index
+  %zero_i32 = scalar.constant 0 : i32
+  %end = index.cast %extent : index to i32
+
+  %row = kernel.workgroup.id<y> : index
+  %tile = kernel.workgroup.id<x> : index
+  %lane = kernel.workitem.id<x> : index
+  %first = index.mul %tile, %lanes : index
+  %col0 = index.add %first, %lane : index
+  %valid = index.cmp ult, %col0, %n_kv : index
+  scf.if %valid {
+    %col = index.assume %col0 [lt(%col0, %n_kv)] : index
+    %src_view = buffer.view %src[%zero] : buffer -> view<[%count]xi32>
+    %query0 = index.mul %row, %two : index
+    %offset0 = index.add %query0, %one : index
+    %query_idx = index.assume %query0 [lt(%query0, %count)] : index
+    %offset_idx = index.assume %offset0 [lt(%offset0, %count)] : index
+    %query = view.load %src_view[%query_idx] : view<[%count]xi32> -> i32
+    %base_i32 = view.load %src_view[%offset_idx] : view<[%count]xi32> -> i32
+    %base = index.cast %base_i32 : i32 to index
+    %key0 = index.add %base, %col : index
+    %key_idx = index.assume %key0 [range(%key0, 0, 536870910), lt(%key0, %count)] : index
+    %key = view.load %src_view[%key_idx] : view<[%count]xi32> -> i32
+
+    %used = scalar.cmpi sge, %key, %zero_i32 : i32
+    %past = scalar.cmpi sge, %query, %key : i32
+    %distance = scalar.subi %query, %key : i32
+    %near = scalar.cmpi slt, %distance, %end : i32
+    %present = scalar.andi %used, %past : i1
+    %in_range = scalar.andi %present, %near : i1
+    %bucket = scf.select %in_range, %distance, %end : i32
+
+    // The row start can exceed a 32-bit element index.
+    %row_bytes = index.scale %n_kv, %four : index, offset -> offset
+    %dst_offset = index.scale %row, %row_bytes : index, offset -> offset
+    %dst_view = buffer.view %dst[%dst_offset] : buffer -> view<[%n_kv]xi32>
+    view.store %bucket, %dst_view[%col] : i32, view<[%n_kv]xi32>
+  }
+  kernel.return
+}

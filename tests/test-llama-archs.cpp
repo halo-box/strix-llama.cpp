@@ -178,6 +178,7 @@ static void usage(char ** argv) {
     LOG("  -o, --out <dir>          Save generated test models to <dir> instead of running backend tests\n");
     LOG("  -v <N>                   Set log verbosity level\n");
     LOG("  -b, --backend <backend>  Run only on the given backend device\n");
+    LOG("  --hrx-devices           Check automatic and explicit Inkling device placement\n");
     LOG("  --mtp-cache-only        Test Qwen4Exp MTP cache growth on CPU and on the first ROCm and Vulkan devices\n");
     LOG("  --qwen4exp-merged       Test that a Qwen4Exp file with merged shared-input weights gives the logits of the separate weights\n");
     LOG("  --qwen35-merged         The same for a Qwen3.5 file\n");
@@ -971,6 +972,43 @@ static int test_mtp_cache_only(const size_t seed, const float stdev) {
                 test_mtp_cache_only_dev(dev, seed, stdev);
                 break;
             }
+        }
+    }
+    return 0;
+}
+
+static int test_hrx_devices() {
+    auto * hrx = ggml_backend_reg_by_name("HRX");
+    if (!hrx || ggml_backend_reg_dev_count(hrx) == 0) {
+        throw std::runtime_error("HRX device unavailable");
+    }
+    auto meta = get_gguf_ctx(LLM_ARCH_INKLING2_LOOP, false);
+    llama_model_params params = llama_model_default_params();
+    params.vocab_only = true;
+    auto load = [&] {
+        return llama_model_ptr(llama_model_init_from_user(meta.get(), set_tensor_data, nullptr, params));
+    };
+    auto model = load();
+    if (!model || size_t(llama_model_n_devices(model.get())) != ggml_backend_reg_dev_count(hrx) ||
+            llama_model_get_device(model.get(), 0) != ggml_backend_reg_dev_get(hrx, 0)) {
+        throw std::runtime_error("Inkling auto-selection did not select HRX");
+    }
+    ggml_backend_dev_t selected[] = { nullptr, nullptr };
+    params.devices = selected;
+    model = load();
+    if (!model || llama_model_n_devices(model.get()) != 0) {
+        throw std::runtime_error("Inkling ignored explicit CPU placement");
+    }
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        auto * dev = ggml_backend_dev_get(i);
+        const auto type = ggml_backend_dev_type(dev);
+        if (ggml_backend_dev_backend_reg(dev) == hrx || (type != GGML_BACKEND_DEVICE_TYPE_GPU && type != GGML_BACKEND_DEVICE_TYPE_IGPU)) {
+            continue;
+        }
+        selected[0] = dev;
+        model = load();
+        if (!model || llama_model_n_devices(model.get()) != 1 || llama_model_get_device(model.get(), 0) != dev) {
+            throw std::runtime_error("Inkling ignored explicit GPU placement");
         }
     }
     return 0;
@@ -2110,6 +2148,7 @@ int main(int argc, char ** argv) {
     float stdev = 0.1f;
     std::string out;
     const char * target_backend = nullptr;
+    bool hrx_devices = false;
     bool mtp_cache_only = false;
     bool qwen4exp_merged = false;
     bool qwen35_merged = false;
@@ -2140,6 +2179,8 @@ int main(int argc, char ** argv) {
                 usage(argv);
                 return 1;
             }
+        } else if (strcmp(argv[i], "--hrx-devices") == 0) {
+            hrx_devices = true;
         } else if (strcmp(argv[i], "--mtp-cache-only") == 0) {
             mtp_cache_only = true;
         } else if (strcmp(argv[i], "--qwen4exp-merged") == 0) {
@@ -2204,6 +2245,10 @@ int main(int argc, char ** argv) {
     init_normal_pool(seed, stdev);
 
     try {
+        if (hrx_devices) {
+            ggml_backend_load_all();
+            return test_hrx_devices();
+        }
         if (mtp_cache_only) {
             return test_mtp_cache_only(seed, stdev);
         }

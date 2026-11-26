@@ -2198,18 +2198,77 @@ bool llama_kv_cache::has_cell_ext() const {
     return hparams.n_pos_per_embd() > 1 || hparams.ple_n_heads > 0;
 }
 
-void llama_kv_cache::set_input_relative_pos(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const {
+void llama_kv_cache::set_input_relative_pos(ggml_tensor * dst, const ggml_tensor * rows, const llama_ubatch * ubatch, uint32_t extent) const {
     GGML_ASSERT(dst->type == GGML_TYPE_I32);
     const int64_t n_kv = dst->ne[0];
-    std::vector<int32_t> data(n_kv * ubatch->n_tokens);
-    for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
+    GGML_ASSERT(!rows || (rows->ne[0] == n_kv && ggml_backend_buffer_is_host(rows->buffer)));
+    const int64_t n_tps = ubatch->n_tokens / (rows ? rows->ne[1] : 1);
+    const auto fill_row = [&](uint32_t i, int32_t * data) {
         const auto & cells = v_cells.at(seq_to_stream.at(ubatch->seq_id[i][0]));
+        const int32_t * list = rows ? (const int32_t *) rows->data + (i/n_tps)*n_kv : nullptr;
         for (int64_t j = 0; j < n_kv; ++j) {
-            const int64_t distance = cells.is_empty(j) ? -1 : int64_t(ubatch->pos[i]) - cells.pos_get(j);
-            data[i*n_kv + j] = distance >= 0 && distance < extent ? distance : extent;
+            const int64_t cell = list ? list[j] : j;
+            const int64_t distance = cell < 0 || cells.is_empty(cell) ? -1 : int64_t(ubatch->pos[i]) - cells.pos_get(cell);
+            data[j] = distance >= 0 && distance < extent ? distance : extent;
+        }
+    };
+
+    if (ggml_backend_buffer_is_host(dst->buffer)) {
+        llama_host_write(dst);
+        for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
+            fill_row(i, (int32_t *) dst->data + i*n_kv);
+        }
+        return;
+    }
+
+    constexpr size_t staging_bytes = 16*1024*1024;
+    const auto dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(dst->buffer));
+    const auto reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+    using set_relative_positions_t = bool (*)(ggml_tensor *, const int32_t *, size_t, uint32_t);
+    const auto set_relative_positions = reg ? reinterpret_cast<set_relative_positions_t>(
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_relative_positions")) : nullptr;
+    if (set_relative_positions && ubatch->n_tokens > 1) {
+        // Each query uses the key positions of its mask strip and KV stream.
+        const size_t query_words = 2 * size_t(ubatch->n_tokens);
+        std::vector<int32_t> positions(query_words);
+        std::map<std::pair<int64_t, uint32_t>, size_t> key_offsets;
+        const size_t max_words = std::min(staging_bytes, ggml_nbytes(dst)) / sizeof(int32_t);
+        for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
+            const auto strip = i / n_tps;
+            const auto stream = seq_to_stream.at(ubatch->seq_id[i][0]);
+            const auto entry = key_offsets.emplace(std::make_pair(strip, stream), positions.size());
+            if (entry.second) {
+                if (positions.size() + n_kv >= max_words) {
+                    positions.clear();
+                    break;
+                }
+                const auto & cells = v_cells.at(stream);
+                const int32_t * list = rows ? (const int32_t *) rows->data + strip*n_kv : nullptr;
+                const size_t offset = positions.size();
+                positions.resize(offset + n_kv);
+                for (int64_t j = 0; j < n_kv; ++j) {
+                    const int64_t cell = list ? list[j] : j;
+                    positions[offset + j] = cell < 0 || cells.is_empty(cell) ? -1 : cells.pos_get(cell);
+                }
+            }
+            positions[2*size_t(i)] = ubatch->pos[i];
+            positions[2*size_t(i) + 1] = entry.first->second;
+        }
+        if (!positions.empty() && set_relative_positions(dst, positions.data(), positions.size(), extent)) {
+            return;
         }
     }
-    ggml_backend_tensor_set(dst, data.data(), 0, ggml_nbytes(dst));
+
+    const uint32_t chunk = std::min<size_t>(ubatch->n_tokens, std::max<size_t>(1, staging_bytes / dst->nb[1]));
+    std::vector<int32_t> data(chunk*n_kv);
+    for (uint32_t i = 0; i < ubatch->n_tokens; ) {
+        const uint32_t count = std::min(chunk, ubatch->n_tokens - i);
+        for (uint32_t r = 0; r < count; ++r) {
+            fill_row(i + r, data.data() + r*n_kv);
+        }
+        ggml_backend_tensor_set(dst, data.data(), i*dst->nb[1], count*dst->nb[1]);
+        i += count;
+    }
 }
 
 void llama_kv_cache::get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const {
@@ -3348,8 +3407,8 @@ void llama_kv_cache_context::set_input_pos_bucket(ggml_tensor * dst, const llama
     kv->set_input_pos_bucket(dst, ubatch);
 }
 
-void llama_kv_cache_context::set_input_relative_pos(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const {
-    kv->set_input_relative_pos(dst, ubatch, extent);
+void llama_kv_cache_context::set_input_relative_pos(ggml_tensor * dst, const ggml_tensor * rows, const llama_ubatch * ubatch, uint32_t extent) const {
+    kv->set_input_relative_pos(dst, rows, ubatch, extent);
 }
 
 void llama_kv_cache_context::get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const {

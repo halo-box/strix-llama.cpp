@@ -1,0 +1,228 @@
+// Classes of the 32-key tiles of FLASH_ATTN_EXT for blocks of 16 query rows (rows of one head % ne2 and sequence % ne3).
+// For block b and word w the kernel writes four bit masks at element r_off of the range buffer, bit t for tile 32 w + t:
+// act at b n_words + w (a row of the block sees a key of the tile: a finite mask value), mix at R + b n_words + w (the tile is
+// not plain), toe at 2 R + b n_words + w (the tile is Toeplitz) and full at 3 R + b n_words + w (all keys of the tile are below
+// n_kv and have mask 0 in all rows), with R = n_blocks n_words. A plain tile is full and has the bias index n_bins - 1 for all
+// its keys, thus the same bias for all of them. In a Toeplitz tile all finite mask values are 0 and row i, key j of the tile has
+// the bias index e + i - j for all keys with a finite mask value. e is at 4 R + 32 (b n_words + w) + t.
+
+target.decl @ggml_wave32
+
+config.decl @ggml.flash_attn.bias : %value: index where [range(%value, 0, 1)]
+
+kernel.def target(@ggml_wave32) export("ggml_flash_attn_ext_range_f16") @ggml_flash_attn_ext_range_f16(%n_blocks: index, %n_words: index) {
+  %one = index.constant 1 : index
+  %wg_size = index.constant 256 : index
+  kernel.launch.config workgroups(%n_blocks, %n_words, %one) workgroup_size(%wg_size, %one, %one) : index
+} launch(%n_kv_in: index, %n_q_in: index, %m_ne2_in: index, %m_s1_in: index, %m_s2_in: index, %m_s3_in: index, %m_span_in: index, %i_s1_in: index, %i_span_in: index, %n_bins_in: index, %n_rowsb_in: index, %n_words_in: index, %r_off_in: index, %r_span_in: index, %mask: buffer, %bias_i: buffer, %range: buffer) {
+  // The caller checks these ranges.
+  %n_kv = index.assume %n_kv_in [range(%n_kv_in, 1, 2147483647)] : index
+  %n_q = index.assume %n_q_in [range(%n_q_in, 1, 2147483647)] : index
+  %m_ne2 = index.assume %m_ne2_in [range(%m_ne2_in, 1, 2147483647)] : index
+  %m_s1 = index.assume %m_s1_in [range(%m_s1_in, 0, 2147483647)] : index
+  %m_s2 = index.assume %m_s2_in [range(%m_s2_in, 0, 2147483647)] : index
+  %m_s3 = index.assume %m_s3_in [range(%m_s3_in, 0, 2147483647)] : index
+  %m_span = index.assume %m_span_in [range(%m_span_in, 1, 2147483647)] : index
+  %i_s1 = index.assume %i_s1_in [range(%i_s1_in, 0, 2147483647)] : index
+  %i_span = index.assume %i_span_in [range(%i_span_in, 1, 2147483647)] : index
+  %n_bins = index.assume %n_bins_in [range(%n_bins_in, 1, 2147483647)] : index
+  %n_rowsb = index.assume %n_rowsb_in [range(%n_rowsb_in, 1, 2147483647)] : index
+  %n_words = index.assume %n_words_in [range(%n_words_in, 1, 2147483647)] : index
+  %r_off = index.assume %r_off_in [range(%r_off_in, 0, 2147483647)] : index
+  %r_span = index.assume %r_span_in [range(%r_span_in, 2, 2147483647)] : index
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c4 = index.constant 4 : index
+  %c8 = index.constant 8 : index
+  %c15 = index.constant 15 : index
+  %c16 = index.constant 16 : index
+  %c32 = index.constant 32 : index
+  %c256 = index.constant 256 : index
+  %zero = index.constant 0 : offset
+  %zero_i32 = scalar.constant 0 : i32
+  %one_i32 = scalar.constant 1 : i32
+  %two_i32 = scalar.constant 2 : i32
+  %four_i32 = scalar.constant 4 : i32
+  %eight_i32 = scalar.constant 8 : i32
+  %neg_large = scalar.constant -1e+30 : f32
+  %zero_f32 = scalar.constant 0.0 : f32
+  %false = scalar.constant false : i1
+  %true = scalar.constant true : i1
+  %e_hi = scalar.constant 2147483647 : i32
+  %e_lo = scalar.constant -2147483647 : i32
+  %bias_cfg = config.get @ggml.flash_attn.bias : index
+  %bias_on = index.cmp ne, %bias_cfg, %c0 : index
+  %blk_all = kernel.workgroup.id<x> : index
+  %w = kernel.workgroup.id<y> : index
+  %t0 = kernel.workitem.id<x> : index
+  %t = index.assume %t0 [range(%t0, 0, 255)] : index
+  %wave = index.div %t, %c32 : index
+  %lane = index.rem %t, %c32 : index
+  %m_view = buffer.view %mask[%zero] : buffer -> view<[%m_span]xf16>
+  %i_view = buffer.view %bias_i[%zero] : buffer -> view<[%i_span]xi32>
+  %i32_bytes = index.constant 4 : offset
+  %r_off_b = index.scale %r_off, %i32_bytes : index, offset -> offset
+  %r_view = buffer.view %range[%r_off_b] : buffer -> view<[%r_span]xi32>
+  %bins_m1 = index.sub %n_bins, %c1 : index
+  %bins_last = index.cast %bins_m1 : index to i32
+  %m_top = index.sub %m_span, %c1 : index
+  %i_top = index.sub %i_span, %c1 : index
+  %lane_i32 = index.cast %lane : index to i32
+
+  // Block row (query block, head % ne2, sequence % ne3) of this workgroup.
+  %q_round = index.add %n_q, %c15 : index
+  %n_qb = index.div %q_round, %c16 : index
+  %qb = index.rem %blk_all, %n_qb : index
+  %b23 = index.div %blk_all, %n_qb : index
+  %i2 = index.rem %b23, %m_ne2 : index
+  %i3 = index.div %b23, %m_ne2 : index
+  %o2 = index.mul %i2, %m_s2 : index
+  %o3 = index.mul %i3, %m_s3 : index
+  %o23 = index.add %o2, %o3 : index
+  %qb16 = index.mul %qb, %c16 : index
+  %tf = index.mul %i3, %n_q : index
+  %a0 = index.mul %blk_all, %n_words : index
+  %a1 = index.add %a0, %w : index
+  %rs = index.mul %n_rowsb, %n_words : index
+  %rs4 = index.mul %rs, %c4 : index
+  %e_row0 = index.mul %a1, %c32 : index
+  %e_row = index.add %e_row0, %rs4 : index
+
+  // Wave v takes tiles 4 v .. 4 v + 3 of the word, lane j key j of the tile, and loops over the 16 rows. Rows past n_q leave
+  // the classes as they are. The lane bits: 1 active, 2 not plain, 4 not full, 8 a finite mask value that is not 0.
+  %w32 = index.mul %w, %c32 : index
+  %v4 = index.mul %wave, %c4 : index
+  %wa, %wm, %wt, %wf = scf.for %tq = [%c0 to %c4 step %c1](%ba = %zero_i32 : i32, %bm = %zero_i32 : i32, %bt = %zero_i32 : i32, %bf = %zero_i32 : i32) -> (i32, i32, i32, i32) {
+    %ti = index.add %v4, %tq : index
+    %kt = index.add %w32, %ti : index
+    %k0 = index.mul %kt, %c32 : index
+    %k = index.add %k0, %lane : index
+    %in = index.cmp ult, %k, %n_kv : index
+    %act, %plain, %full, %zfin, %emin, %emax = scf.for %i = [%c0 to %c16 step %c1](%a = %false : i1, %p = %true : i1, %f = %true : i1, %z = %true : i1, %lo = %e_hi : i32, %hi = %e_lo : i32) -> (i1, i1, i1, i1, i32, i32) unroll(%c4) {
+      %tok = index.add %qb16, %i : index
+      %rv = index.cmp ult, %tok, %n_q : index
+      %ao, %po, %fo, %zo, %lo_o, %hi_o = scf.if %rv -> (i1, i1, i1, i1, i32, i32) {
+        %mb1 = index.mul %tok, %m_s1 : index
+        %mb = index.add %mb1, %o23 : index
+        %mi0 = index.add %mb, %k : index
+        %mi1 = index.assume %mi0 [range(%mi0, 0, 2147483646)] : index
+        %mi2 = index.min %mi1, %m_top : index
+        %mi = index.assume %mi2 [lt(%mi2, %m_span)] : index
+        %h = view.load %m_view[%mi] : view<[%m_span]xf16> -> f16
+        %mf = scalar.extf %h : f16 to f32
+        %bin = scf.if %bias_on -> (i32) {
+          %q_flat = index.add %tf, %tok : index
+          %ib = index.mul %q_flat, %i_s1 : index
+          %ii0 = index.add %ib, %k : index
+          %ii1 = index.assume %ii0 [range(%ii0, 0, 2147483646)] : index
+          %ii2 = index.min %ii1, %i_top : index
+          %ii = index.assume %ii2 [lt(%ii2, %i_span)] : index
+          %bl = view.load %i_view[%ii] : view<[%i_span]xi32> -> i32
+          scf.yield %bl : i32
+        } else {
+          scf.yield %bins_last : i32
+        }
+        %fin0 = scalar.cmpf ogt, %mf, %neg_large : f32
+        %fin = scalar.andi %fin0, %in : i1
+        %zr0 = scalar.cmpf oeq, %mf, %zero_f32 : f32
+        %zr = scalar.andi %zr0, %in : i1
+        %far = scalar.cmpi eq, %bin, %bins_last : i32
+        %pl_k = scalar.andi %zr, %far : i1
+        %i_i32 = index.cast %i : index to i32
+        %e0 = scalar.addi %bin, %lane_i32 : i32
+        %e = scalar.subi %e0, %i_i32 : i32
+        %e_lo_k = scf.select %fin, %e, %e_hi : i32
+        %e_hi_k = scf.select %fin, %e, %e_lo : i32
+        %nz = scalar.xori %zr, %true : i1
+        %bad = scalar.andi %fin, %nz : i1
+        %ok = scalar.xori %bad, %true : i1
+        %a_n = scalar.ori %a, %fin : i1
+        %p_n = scalar.andi %p, %pl_k : i1
+        %f_n = scalar.andi %f, %zr : i1
+        %z_n = scalar.andi %z, %ok : i1
+        %lo_n = scalar.minsi %lo, %e_lo_k : i32
+        %hi_n = scalar.maxsi %hi, %e_hi_k : i32
+        scf.yield %a_n, %p_n, %f_n, %z_n, %lo_n, %hi_n : i1, i1, i1, i1, i32, i32
+      } else {
+        scf.yield %a, %p, %f, %z, %lo, %hi : i1, i1, i1, i1, i32, i32
+      }
+      scf.yield %ao, %po, %fo, %zo, %lo_o, %hi_o : i1, i1, i1, i1, i32, i32
+    }
+    %np = scalar.xori %plain, %true : i1
+    %nf = scalar.xori %full, %true : i1
+    %nz = scalar.xori %zfin, %true : i1
+    %la = scf.select %act, %one_i32, %zero_i32 : i32
+    %lp = scf.select %np, %two_i32, %zero_i32 : i32
+    %lf = scf.select %nf, %four_i32, %zero_i32 : i32
+    %lz = scf.select %nz, %eight_i32, %zero_i32 : i32
+    %l01 = scalar.ori %la, %lp : i32
+    %l23 = scalar.ori %lf, %lz : i32
+    %lbits = scalar.ori %l01, %l23 : i32
+    %tbits = kernel.subgroup.reduce<ori> %lbits : i32
+    %tlo = kernel.subgroup.reduce<minsi> %emin : i32
+    %thi = kernel.subgroup.reduce<maxsi> %emax : i32
+    %ta0 = scalar.andi %tbits, %one_i32 : i32
+    %tp0 = scalar.andi %tbits, %two_i32 : i32
+    %tf0 = scalar.andi %tbits, %four_i32 : i32
+    %tz0 = scalar.andi %tbits, %eight_i32 : i32
+    %t_act = scalar.cmpi ne, %ta0, %zero_i32 : i32
+    %t_mix = scalar.cmpi ne, %tp0, %zero_i32 : i32
+    %t_full = scalar.cmpi eq, %tf0, %zero_i32 : i32
+    %t_zfin = scalar.cmpi eq, %tz0, %zero_i32 : i32
+    %t_eq = scalar.cmpi eq, %tlo, %thi : i32
+    %t_toe0 = scalar.andi %t_zfin, %t_eq : i1
+    %t_toe = scalar.andi %t_toe0, %t_act : i1
+    // e of the tile, from lane 0.
+    %lane0 = index.cmp eq, %lane, %c0 : index
+    %e_i0 = index.add %e_row, %ti : index
+    %e_ok0 = index.cmp ult, %e_i0, %r_span : index
+    %e_ok = scalar.andi %e_ok0, %lane0 : i1
+    scf.if %e_ok {
+      %e_i = index.assume %e_i0 [lt(%e_i0, %r_span)] : index
+      view.store %tlo, %r_view[%e_i] : i32, view<[%r_span]xi32>
+    }
+    %ti_i32 = index.cast %ti : index to i32
+    %bit = scalar.shli %one_i32, %ti_i32 : i32
+    %xa = scf.select %t_act, %bit, %zero_i32 : i32
+    %xm = scf.select %t_mix, %bit, %zero_i32 : i32
+    %xt = scf.select %t_toe, %bit, %zero_i32 : i32
+    %xf = scf.select %t_full, %bit, %zero_i32 : i32
+    %na = scalar.ori %ba, %xa : i32
+    %nm = scalar.ori %bm, %xm : i32
+    %nt = scalar.ori %bt, %xt : i32
+    %nf2 = scalar.ori %bf, %xf : i32
+    scf.yield %na, %nm, %nt, %nf2 : i32, i32, i32, i32
+  }
+
+  // One word per class: lane 0 of each wave holds the bits of its tiles.
+  %lane0w = index.cmp eq, %lane, %c0 : index
+  %ca = scf.select %lane0w, %wa, %zero_i32 : i32
+  %cm = scf.select %lane0w, %wm, %zero_i32 : i32
+  %ct = scf.select %lane0w, %wt, %zero_i32 : i32
+  %cf = scf.select %lane0w, %wf, %zero_i32 : i32
+  %a_word = kernel.workgroup.reduce<ori> %ca : i32
+  %m_word = kernel.workgroup.reduce<ori> %cm : i32
+  %t_word = kernel.workgroup.reduce<ori> %ct : i32
+  %f_word = kernel.workgroup.reduce<ori> %cf : i32
+  %is_first = index.cmp eq, %t, %c0 : index
+  scf.if %is_first {
+    %m1 = index.add %a1, %rs : index
+    %t1 = index.add %m1, %rs : index
+    %f1 = index.add %t1, %rs : index
+    %f_ok = index.cmp ult, %f1, %r_span : index
+    scf.if %f_ok {
+      %ai = index.assume %a1 [lt(%a1, %r_span)] : index
+      %mi = index.assume %m1 [lt(%m1, %r_span)] : index
+      %tix = index.assume %t1 [lt(%t1, %r_span)] : index
+      %fi = index.assume %f1 [lt(%f1, %r_span)] : index
+      view.store %a_word, %r_view[%ai] : i32, view<[%r_span]xi32>
+      view.store %m_word, %r_view[%mi] : i32, view<[%r_span]xi32>
+      view.store %t_word, %r_view[%tix] : i32, view<[%r_span]xi32>
+      view.store %f_word, %r_view[%fi] : i32, view<[%r_span]xi32>
+    }
+  }
+
+
+  kernel.return
+}

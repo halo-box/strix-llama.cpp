@@ -1,0 +1,98 @@
+// Sum of all values of an f32 tensor into one value. One workgroup. Strides are in elements.
+
+// 1: the tensor is contiguous and the lanes load 4 values at a time.
+config.decl @ggml.sum.contig : %value: index where [range(%value, 0, 1)]
+config.decl @ggml.sum.wg_size : %value: index where [range(%value, 64, 1024), multiple_of(%value, 64)]
+
+target.decl @ggml_wave64
+
+kernel.def target(@ggml_wave64) export("ggml_sum_f32") @ggml_sum_f32(%unit: index) {
+  %one = index.constant 1 : index
+  %wg_size = config.get @ggml.sum.wg_size : index
+  kernel.launch.config workgroups(%unit, %one, %one) workgroup_size(%wg_size, %one, %one) : index
+} launch(%n_in: index, %ne0_in: index, %ne1_in: index, %ne2_in: index, %s0_in: index, %s1_in: index, %s2_in: index, %s3_in: index, %src_span_in: index, %src: buffer, %dst: buffer) {
+  // supports_sum checks these ranges.
+  %n = index.assume %n_in [range(%n_in, 1, 2147483647)] : index
+  %ne0 = index.assume %ne0_in [range(%ne0_in, 1, 2147483647)] : index
+  %ne1 = index.assume %ne1_in [range(%ne1_in, 1, 2147483647)] : index
+  %ne2 = index.assume %ne2_in [range(%ne2_in, 1, 2147483647)] : index
+  %s0 = index.assume %s0_in [range(%s0_in, 0, 2147483647)] : index
+  %s1 = index.assume %s1_in [range(%s1_in, 0, 2147483647)] : index
+  %s2 = index.assume %s2_in [range(%s2_in, 0, 2147483647)] : index
+  %s3 = index.assume %s3_in [range(%s3_in, 0, 2147483647)] : index
+  %src_span = index.assume %src_span_in [range(%src_span_in, 1, 2147483647)] : index
+  %contig = config.get @ggml.sum.contig : index
+  %wg_size = config.get @ggml.sum.wg_size : index
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c4 = index.constant 4 : index
+  %zero = index.constant 0 : offset
+  %c0_f32 = scalar.constant 0.0 : f32
+  %item = kernel.workitem.id<x> : index
+  %src_view = buffer.view %src[%zero] : buffer -> view<[%src_span]xf32>
+  %is_contig = index.cmp eq, %contig, %c1 : index
+  %top1 = index.sub %src_span, %c1 : index
+
+  // Contiguous: 4 values at a time up to n / 4 * 4, then the rest one at a time.
+  %n4_all = index.div %n, %c4 : index
+  %n4_vec = index.mul %n4_all, %c4 : index
+  %n4 = scf.select %is_contig, %n4_vec, %c0 : index
+  %vec_sum = scf.if %is_contig -> (f32) {
+    // supports_sum checks that a contiguous tensor holds at least 4 values here.
+    %span4 = index.assume %src_span [range(%src_span, 4, 2147483647)] : index
+    %top = index.sub %span4, %c4 : index
+    %step = index.mul %wg_size, %c4 : index
+    %first = index.mul %item, %c4 : index
+    %s = scf.for %c = [%first to %n4 step %step](%acc = %c0_f32 : f32) -> (f32) unroll(%c4) {
+      %idx_c = index.min %c, %top : index
+      %idx = index.assume %idx_c [range(%idx_c, 0, 2147483643), le(%idx_c, %top)] : index
+      %v = vector.load %src_view[%idx] : view<[%src_span]xf32> -> vector<4xf32>
+      %x0 = vector.extract %v[0] : vector<4xf32> -> f32
+      %x1 = vector.extract %v[1] : vector<4xf32> -> f32
+      %x2 = vector.extract %v[2] : vector<4xf32> -> f32
+      %x3 = vector.extract %v[3] : vector<4xf32> -> f32
+      %a01 = scalar.addf %x0, %x1 : f32
+      %a23 = scalar.addf %x2, %x3 : f32
+      %a = scalar.addf %a01, %a23 : f32
+      %next = scalar.addf %acc, %a : f32
+      scf.yield %next : f32
+    }
+    scf.yield %s : f32
+  } else {
+    scf.yield %c0_f32 : f32
+  }
+
+  %tail_first = index.add %n4, %item : index
+  %partial = scf.for %i = [%tail_first to %n step %wg_size](%acc = %vec_sum : f32) -> (f32) {
+    %i0 = index.rem %i, %ne0 : index
+    %q0 = index.div %i, %ne0 : index
+    %i1 = index.rem %q0, %ne1 : index
+    %q1 = index.div %q0, %ne1 : index
+    %i2 = index.rem %q1, %ne2 : index
+    %i3 = index.div %q1, %ne2 : index
+    %o0 = index.mul %i0, %s0 : index
+    %o1 = index.mul %i1, %s1 : index
+    %o2 = index.mul %i2, %s2 : index
+    %o3 = index.mul %i3, %s3 : index
+    %o01 = index.add %o0, %o1 : index
+    %o23 = index.add %o2, %o3 : index
+    %strided = index.add %o01, %o23 : index
+    %raw = scf.select %is_contig, %i, %strided : index
+    %clamped = index.min %raw, %top1 : index
+    %off0 = index.assume %clamped [range(%clamped, 0, 2147483646)] : index
+    %off = index.assume %off0 [lt(%off0, %src_span)] : index
+    %x = view.load %src_view[%off] : view<[%src_span]xf32> -> f32
+    %ok = index.cmp ule, %raw, %top1 : index
+    %xv = scf.select %ok, %x, %c0_f32 : f32
+    %next = scalar.addf %acc, %xv : f32
+    scf.yield %next : f32
+  }
+
+  %sum = kernel.workgroup.reduce<addf> %partial : f32
+  %is_first = index.cmp eq, %item, %c0 : index
+  scf.if %is_first {
+    %dst_view = buffer.view %dst[%zero] : buffer -> view<1xf32>
+    view.store %sum, %dst_view[0] : f32, view<1xf32>
+  }
+  kernel.return
+}

@@ -1,0 +1,2305 @@
+// FLASH_ATTN_EXT for large batches with matrix ops, d_k = d_v = 128, wave32.
+// A workgroup takes qt tiles of 16 queries of hg heads that share one KV head: one wave for each tile and head.
+// The waves load each 32-key tile of K and V once into LDS. A wave computes S^T = K Q^T, so that each lane holds the scores of one
+// query: lanes l and l + 16 hold the even and the odd keys. Thus the softmax needs one lane exchange and P stays in registers.
+// The output is O^T = V^T P^T. With a mask, the loop visits the 32-key tiles that a row of the workgroup sees
+// (flash_attn_ext_range_f16.loom). A wave whose rows do not see a tile gets -inf for its keys, and a plain tile (mask 0 and the last
+// bin for all its keys) needs no mask or index loads: its keys get the bias of the last bin. With toep, a Toeplitz tile (bias index
+// e + i - j for row i and key j, mask 0 for the keys seen) gets its bias from 3 matrix products with f16 inputs of 48 rows of w
+// and r of the 16 queries. Key j of query q takes row 31 + q - j: the values cross lanes in LDS.
+// The keys of the mask that are -inf get p = 0. Their V values must be finite, as in a KV cache.
+
+target.decl @ggml_wave32
+
+// 1 means that the lanes load the mask and the indices of 16 keys at once. The host checks the alignment and that the rows
+// hold the keys up to the next multiple of 32.
+config.decl @ggml.flash_attn.head_first : %value: index where [range(%value, 0, 1)]
+config.decl @ggml.flash_attn.vec_mask : %value: index where [range(%value, 0, 1)]
+// 1 means that the host fused the MUL_MAT that makes the bias table: the table binding holds w [16, n_bins] and bias_r holds r
+// [16, heads, queries]. The kernel computes the table value of a key from its bin.
+config.decl @ggml.flash_attn.bias_mm : %value: index where [range(%value, 0, 1)]
+// 1 means that the node has a mask.
+config.decl @ggml.flash_attn.mask : %value: index where [range(%value, 0, 1)]
+// 1 means that the node has an indexed bias (motifs/fa_bias.loom).
+config.decl @ggml.flash_attn.bias : %value: index where [range(%value, 0, 1)]
+// 1 means that the host fused a SUB(table, s) into the node. The kernel subtracts s of the row from the table values.
+config.decl @ggml.flash_attn.bias_sub : %value: index where [range(%value, 0, 1)]
+// Heads and 16-query tiles of a workgroup. hg divides the heads of a KV head.
+config.decl @ggml.flash_attn.hg : %value: index where [range(%value, 1, 8)]
+config.decl @ggml.flash_attn.qt : %value: index where [range(%value, 1, 8)]
+// 1 means that waves 0-7 load the K tile and waves 8-15 the V tile of the next tile into registers while all waves compute.
+// The workgroup has at least 16 waves.
+config.decl @ggml.flash_attn.prefetch : %value: index where [range(%value, 0, 1)]
+// 1 means that Toeplitz tiles get the bias from matrix products. Needs bias_mm, the tile classes and at most 18 waves.
+config.decl @ggml.flash_attn.toep : %value: index where [range(%value, 0, 1)]
+
+// Mask and indexed bias of key kc of the row, -1e30 if ok is false. mb, ib and tb point to the rows of a valid query and kc < n_kv,
+// thus the mask and index loads are in their bindings. The bin is clamped into the table row.
+// The sum is rounded to f16, as in motifs/fa_bias.loom.
+func.def inline @ggml_hrx_fat_key(%m_view: view<[%m_span]xf16>, %m_span: index, %i_view: view<[%i_span]xi32>, %i_span: index, %t_view: view<[%t_span]xf32>, %t_span: index, %mask_on: i1, %bias_on: i1, %bins_top: index, %mb: index, %ib: index, %tb: index, %kc: index, %ok: i1, %s: f32) -> (f32) {
+  %zero_f32 = scalar.constant 0.0 : f32
+  %neg_large = scalar.constant -1e+30 : f32
+  %m = scf.if %mask_on -> (f32) {
+    %mi0 = index.add %mb, %kc : index
+    %mi = index.assume %mi0 [range(%mi0, 0, 2147483646), lt(%mi0, %m_span)] : index
+    %h = view.load %m_view[%mi] : view<[%m_span]xf16> -> f16
+    %f = scalar.extf %h : f16 to f32
+    scf.yield %f : f32
+  } else {
+    scf.yield %zero_f32 : f32
+  }
+  %r = scf.if %bias_on -> (f32) {
+    %ii0 = index.add %ib, %kc : index
+    %ii = index.assume %ii0 [range(%ii0, 0, 2147483646), lt(%ii0, %i_span)] : index
+    %bin_i32 = view.load %i_view[%ii] : view<[%i_span]xi32> -> i32
+    %bin0 = index.cast %bin_i32 : i32 to index
+    %c0 = index.constant 0 : index
+    %bin1 = index.max %bin0, %c0 : index
+    %bin = index.min %bin1, %bins_top : index
+    %ti0 = index.add %tb, %bin : index
+    %ti = index.assume %ti0 [range(%ti0, 0, 2147483646), lt(%ti0, %t_span)] : index
+    %b = view.load %t_view[%ti] : view<[%t_span]xf32> -> f32
+    %bs = scalar.subf %b, %s : f32
+    %sum = scalar.addf %m, %bs : f32
+    %sh = scalar.fptrunc %sum : f32 to f16
+    %sr = scalar.extf %sh : f16 to f32
+    scf.yield %sr : f32
+  } else {
+    scf.yield %m : f32
+  }
+  %v = scf.select %ok, %r, %neg_large : f32
+  func.return %v : f32
+}
+
+// table[tb + bin] - s added to the mask value m, rounded to f16. The bin is clamped into the table row.
+func.def inline @ggml_hrx_fat_table(%t_view: view<[%t_span]xf32>, %t_span: index, %bins_top: index, %tb: index, %bin_i32: i32, %m: f32, %s: f32) -> (f32) {
+  %c0 = index.constant 0 : index
+  %bin0 = index.cast %bin_i32 : i32 to index
+  %bin1 = index.max %bin0, %c0 : index
+  %bin = index.min %bin1, %bins_top : index
+  %ti0 = index.add %tb, %bin : index
+  %ti = index.assume %ti0 [range(%ti0, 0, 2147483646), lt(%ti0, %t_span)] : index
+  %b = view.load %t_view[%ti] : view<[%t_span]xf32> -> f32
+  %bs = scalar.subf %b, %s : f32
+  %sum = scalar.addf %m, %bs : f32
+  %sh = scalar.fptrunc %sum : f32 to f16
+  %sr = scalar.extf %sh : f16 to f32
+  func.return %sr : f32
+}
+
+// The bias as a product: sum over 16 k of w[bin][k] * r[k] in k order with fma, as ggml_mul_mat_small_k sums it, then - s
+// added to the mask value m and rounded to f16. The bin is clamped into w. Rows of w are 16-byte aligned.
+func.def inline @ggml_hrx_fat_mm(%w_view: view<[%w_span]xf32>, %w_span: index, %bins_top: index, %w_s1: index, %bin_i32: i32, %r: vector<16xf32>, %m: f32, %s: f32) -> (f32) {
+  %c0 = index.constant 0 : index
+  %c4 = index.constant 4 : index
+  %c8 = index.constant 8 : index
+  %c12 = index.constant 12 : index
+  %zero_f32 = scalar.constant 0.0 : f32
+  %bin0 = index.cast %bin_i32 : i32 to index
+  %bin1 = index.max %bin0, %c0 : index
+  %bin = index.min %bin1, %bins_top : index
+  %w_top = index.sub %w_span, %c4 : index
+  %wbase = index.mul %bin, %w_s1 : index
+  %wb0 = index.assume %wbase [range(%wbase, 0, 2147483640), multiple_of(%wbase, 4), le(%wbase, %w_top)] : index
+  %wv0 = vector.load %w_view[%wb0] : view<[%w_span]xf32> -> vector<4xf32>
+  %wb1_0 = index.add %wbase, %c4 : index
+  %wb1 = index.assume %wb1_0 [range(%wb1_0, 0, 2147483640), multiple_of(%wb1_0, 4), le(%wb1_0, %w_top)] : index
+  %wv1 = vector.load %w_view[%wb1] : view<[%w_span]xf32> -> vector<4xf32>
+  %wb2_0 = index.add %wbase, %c8 : index
+  %wb2 = index.assume %wb2_0 [range(%wb2_0, 0, 2147483640), multiple_of(%wb2_0, 4), le(%wb2_0, %w_top)] : index
+  %wv2 = vector.load %w_view[%wb2] : view<[%w_span]xf32> -> vector<4xf32>
+  %wb3_0 = index.add %wbase, %c12 : index
+  %wb3 = index.assume %wb3_0 [range(%wb3_0, 0, 2147483640), multiple_of(%wb3_0, 4), le(%wb3_0, %w_top)] : index
+  %wv3 = vector.load %w_view[%wb3] : view<[%w_span]xf32> -> vector<4xf32>
+  %w0 = vector.extract %wv0[0] : vector<4xf32> -> f32
+  %r0 = vector.extract %r[0] : vector<16xf32> -> f32
+  %a0 = scalar.fmaf %w0, %r0, %zero_f32 : f32
+  %w1 = vector.extract %wv0[1] : vector<4xf32> -> f32
+  %r1 = vector.extract %r[1] : vector<16xf32> -> f32
+  %a1 = scalar.fmaf %w1, %r1, %a0 : f32
+  %w2 = vector.extract %wv0[2] : vector<4xf32> -> f32
+  %r2 = vector.extract %r[2] : vector<16xf32> -> f32
+  %a2 = scalar.fmaf %w2, %r2, %a1 : f32
+  %w3 = vector.extract %wv0[3] : vector<4xf32> -> f32
+  %r3 = vector.extract %r[3] : vector<16xf32> -> f32
+  %a3 = scalar.fmaf %w3, %r3, %a2 : f32
+  %w4 = vector.extract %wv1[0] : vector<4xf32> -> f32
+  %r4 = vector.extract %r[4] : vector<16xf32> -> f32
+  %a4 = scalar.fmaf %w4, %r4, %a3 : f32
+  %w5 = vector.extract %wv1[1] : vector<4xf32> -> f32
+  %r5 = vector.extract %r[5] : vector<16xf32> -> f32
+  %a5 = scalar.fmaf %w5, %r5, %a4 : f32
+  %w6 = vector.extract %wv1[2] : vector<4xf32> -> f32
+  %r6 = vector.extract %r[6] : vector<16xf32> -> f32
+  %a6 = scalar.fmaf %w6, %r6, %a5 : f32
+  %w7 = vector.extract %wv1[3] : vector<4xf32> -> f32
+  %r7 = vector.extract %r[7] : vector<16xf32> -> f32
+  %a7 = scalar.fmaf %w7, %r7, %a6 : f32
+  %w8 = vector.extract %wv2[0] : vector<4xf32> -> f32
+  %r8 = vector.extract %r[8] : vector<16xf32> -> f32
+  %a8 = scalar.fmaf %w8, %r8, %a7 : f32
+  %w9 = vector.extract %wv2[1] : vector<4xf32> -> f32
+  %r9 = vector.extract %r[9] : vector<16xf32> -> f32
+  %a9 = scalar.fmaf %w9, %r9, %a8 : f32
+  %w10 = vector.extract %wv2[2] : vector<4xf32> -> f32
+  %r10 = vector.extract %r[10] : vector<16xf32> -> f32
+  %a10 = scalar.fmaf %w10, %r10, %a9 : f32
+  %w11 = vector.extract %wv2[3] : vector<4xf32> -> f32
+  %r11 = vector.extract %r[11] : vector<16xf32> -> f32
+  %a11 = scalar.fmaf %w11, %r11, %a10 : f32
+  %w12 = vector.extract %wv3[0] : vector<4xf32> -> f32
+  %r12 = vector.extract %r[12] : vector<16xf32> -> f32
+  %a12 = scalar.fmaf %w12, %r12, %a11 : f32
+  %w13 = vector.extract %wv3[1] : vector<4xf32> -> f32
+  %r13 = vector.extract %r[13] : vector<16xf32> -> f32
+  %a13 = scalar.fmaf %w13, %r13, %a12 : f32
+  %w14 = vector.extract %wv3[2] : vector<4xf32> -> f32
+  %r14 = vector.extract %r[14] : vector<16xf32> -> f32
+  %a14 = scalar.fmaf %w14, %r14, %a13 : f32
+  %w15 = vector.extract %wv3[3] : vector<4xf32> -> f32
+  %r15 = vector.extract %r[15] : vector<16xf32> -> f32
+  %a15 = scalar.fmaf %w15, %r15, %a14 : f32
+  %bs = scalar.subf %a15, %s : f32
+  %sum = scalar.addf %m, %bs : f32
+  %sh = scalar.fptrunc %sum : f32 to f16
+  %sr = scalar.extf %sh : f16 to f32
+  func.return %sr : f32
+}
+
+// The value of the other lane of the query (lane xor 16).
+func.def inline @ggml_hrx_fat_partner8(%x: vector<8xf32>) -> (vector<8xf32>) {
+  %exchange = scalar.constant 16 : i32
+  %width = scalar.constant 32 : i32
+  %x0 = vector.extract %x[0] : vector<8xf32> -> f32
+  %y0, %u0 = kernel.subgroup.shuffle<xor> %x0, %exchange, %width : f32, i32, i32
+  %x1 = vector.extract %x[1] : vector<8xf32> -> f32
+  %y1, %u1 = kernel.subgroup.shuffle<xor> %x1, %exchange, %width : f32, i32, i32
+  %x2 = vector.extract %x[2] : vector<8xf32> -> f32
+  %y2, %u2 = kernel.subgroup.shuffle<xor> %x2, %exchange, %width : f32, i32, i32
+  %x3 = vector.extract %x[3] : vector<8xf32> -> f32
+  %y3, %u3 = kernel.subgroup.shuffle<xor> %x3, %exchange, %width : f32, i32, i32
+  %x4 = vector.extract %x[4] : vector<8xf32> -> f32
+  %y4, %u4 = kernel.subgroup.shuffle<xor> %x4, %exchange, %width : f32, i32, i32
+  %x5 = vector.extract %x[5] : vector<8xf32> -> f32
+  %y5, %u5 = kernel.subgroup.shuffle<xor> %x5, %exchange, %width : f32, i32, i32
+  %x6 = vector.extract %x[6] : vector<8xf32> -> f32
+  %y6, %u6 = kernel.subgroup.shuffle<xor> %x6, %exchange, %width : f32, i32, i32
+  %x7 = vector.extract %x[7] : vector<8xf32> -> f32
+  %y7, %u7 = kernel.subgroup.shuffle<xor> %x7, %exchange, %width : f32, i32, i32
+  %y = vector.from_elements %y0, %y1, %y2, %y3, %y4, %y5, %y6, %y7 : vector<8xf32>
+  func.return %y : vector<8xf32>
+}
+
+func.def inline @ggml_hrx_fat_partner1(%x: f32) -> (f32) {
+  %exchange = scalar.constant 16 : i32
+  %width = scalar.constant 32 : i32
+  %y, %u = kernel.subgroup.shuffle<xor> %x, %exchange, %width : f32, i32, i32
+  func.return %y : f32
+}
+
+// P^T fragment of 16 keys from the p values of the lane (keys of its parity) and of its partner.
+func.def inline @ggml_hrx_fat_pt(%p: vector<8xf32>, %hi_half: i1) -> (vector<16xf16>) {
+  %c16 = index.constant 16 : index
+  %q = func.call @ggml_hrx_fat_partner8(%p) : (vector<8xf32>) -> (vector<8xf32>)
+  %even = scf.select %hi_half, %q, %p : vector<8xf32>
+  %odd = scf.select %hi_half, %p, %q : vector<8xf32>
+  %pf = vector.interleave<0> %even, %odd : vector<8xf32>, vector<8xf32> -> vector<16xf32>
+  %ph = vector.fptrunc %pf : vector<16xf32> to vector<16xf16>
+  %pt = vector.fragment<rhs> %ph shape [%c16, %c16] : vector<16xf16>
+  func.return %pt : vector<16xf16>
+}
+
+// 16 values of a row from base, scaled. The loads are clamped into the binding. A row past n_q gets 0.
+func.def inline @ggml_hrx_fat_load16(%q_view: view<[%q_span]xf32>, %q_span: index, %q_top: index, %base: index, %rv: i1, %scale: f32) -> (vector<16xf32>) {
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c3 = index.constant 3 : index
+  %c4 = index.constant 4 : index
+  %c5 = index.constant 5 : index
+  %c6 = index.constant 6 : index
+  %c7 = index.constant 7 : index
+  %c8 = index.constant 8 : index
+  %c9 = index.constant 9 : index
+  %c10 = index.constant 10 : index
+  %c11 = index.constant 11 : index
+  %c12 = index.constant 12 : index
+  %c13 = index.constant 13 : index
+  %c14 = index.constant 14 : index
+  %c15 = index.constant 15 : index
+  %r0_1 = index.assume %base [range(%base, 0, 2147483646)] : index
+  %r0_2 = index.min %r0_1, %q_top : index
+  %r0 = index.assume %r0_2 [lt(%r0_2, %q_span)] : index
+  %x0 = view.load %q_view[%r0] : view<[%q_span]xf32> -> f32
+  %s0 = scalar.mulf %x0, %scale : f32
+  %r1_0 = index.add %base, %c1 : index
+  %r1_1 = index.assume %r1_0 [range(%r1_0, 0, 2147483646)] : index
+  %r1_2 = index.min %r1_1, %q_top : index
+  %r1 = index.assume %r1_2 [lt(%r1_2, %q_span)] : index
+  %x1 = view.load %q_view[%r1] : view<[%q_span]xf32> -> f32
+  %s1 = scalar.mulf %x1, %scale : f32
+  %r2_0 = index.add %base, %c2 : index
+  %r2_1 = index.assume %r2_0 [range(%r2_0, 0, 2147483646)] : index
+  %r2_2 = index.min %r2_1, %q_top : index
+  %r2 = index.assume %r2_2 [lt(%r2_2, %q_span)] : index
+  %x2 = view.load %q_view[%r2] : view<[%q_span]xf32> -> f32
+  %s2 = scalar.mulf %x2, %scale : f32
+  %r3_0 = index.add %base, %c3 : index
+  %r3_1 = index.assume %r3_0 [range(%r3_0, 0, 2147483646)] : index
+  %r3_2 = index.min %r3_1, %q_top : index
+  %r3 = index.assume %r3_2 [lt(%r3_2, %q_span)] : index
+  %x3 = view.load %q_view[%r3] : view<[%q_span]xf32> -> f32
+  %s3 = scalar.mulf %x3, %scale : f32
+  %r4_0 = index.add %base, %c4 : index
+  %r4_1 = index.assume %r4_0 [range(%r4_0, 0, 2147483646)] : index
+  %r4_2 = index.min %r4_1, %q_top : index
+  %r4 = index.assume %r4_2 [lt(%r4_2, %q_span)] : index
+  %x4 = view.load %q_view[%r4] : view<[%q_span]xf32> -> f32
+  %s4 = scalar.mulf %x4, %scale : f32
+  %r5_0 = index.add %base, %c5 : index
+  %r5_1 = index.assume %r5_0 [range(%r5_0, 0, 2147483646)] : index
+  %r5_2 = index.min %r5_1, %q_top : index
+  %r5 = index.assume %r5_2 [lt(%r5_2, %q_span)] : index
+  %x5 = view.load %q_view[%r5] : view<[%q_span]xf32> -> f32
+  %s5 = scalar.mulf %x5, %scale : f32
+  %r6_0 = index.add %base, %c6 : index
+  %r6_1 = index.assume %r6_0 [range(%r6_0, 0, 2147483646)] : index
+  %r6_2 = index.min %r6_1, %q_top : index
+  %r6 = index.assume %r6_2 [lt(%r6_2, %q_span)] : index
+  %x6 = view.load %q_view[%r6] : view<[%q_span]xf32> -> f32
+  %s6 = scalar.mulf %x6, %scale : f32
+  %r7_0 = index.add %base, %c7 : index
+  %r7_1 = index.assume %r7_0 [range(%r7_0, 0, 2147483646)] : index
+  %r7_2 = index.min %r7_1, %q_top : index
+  %r7 = index.assume %r7_2 [lt(%r7_2, %q_span)] : index
+  %x7 = view.load %q_view[%r7] : view<[%q_span]xf32> -> f32
+  %s7 = scalar.mulf %x7, %scale : f32
+  %r8_0 = index.add %base, %c8 : index
+  %r8_1 = index.assume %r8_0 [range(%r8_0, 0, 2147483646)] : index
+  %r8_2 = index.min %r8_1, %q_top : index
+  %r8 = index.assume %r8_2 [lt(%r8_2, %q_span)] : index
+  %x8 = view.load %q_view[%r8] : view<[%q_span]xf32> -> f32
+  %s8 = scalar.mulf %x8, %scale : f32
+  %r9_0 = index.add %base, %c9 : index
+  %r9_1 = index.assume %r9_0 [range(%r9_0, 0, 2147483646)] : index
+  %r9_2 = index.min %r9_1, %q_top : index
+  %r9 = index.assume %r9_2 [lt(%r9_2, %q_span)] : index
+  %x9 = view.load %q_view[%r9] : view<[%q_span]xf32> -> f32
+  %s9 = scalar.mulf %x9, %scale : f32
+  %r10_0 = index.add %base, %c10 : index
+  %r10_1 = index.assume %r10_0 [range(%r10_0, 0, 2147483646)] : index
+  %r10_2 = index.min %r10_1, %q_top : index
+  %r10 = index.assume %r10_2 [lt(%r10_2, %q_span)] : index
+  %x10 = view.load %q_view[%r10] : view<[%q_span]xf32> -> f32
+  %s10 = scalar.mulf %x10, %scale : f32
+  %r11_0 = index.add %base, %c11 : index
+  %r11_1 = index.assume %r11_0 [range(%r11_0, 0, 2147483646)] : index
+  %r11_2 = index.min %r11_1, %q_top : index
+  %r11 = index.assume %r11_2 [lt(%r11_2, %q_span)] : index
+  %x11 = view.load %q_view[%r11] : view<[%q_span]xf32> -> f32
+  %s11 = scalar.mulf %x11, %scale : f32
+  %r12_0 = index.add %base, %c12 : index
+  %r12_1 = index.assume %r12_0 [range(%r12_0, 0, 2147483646)] : index
+  %r12_2 = index.min %r12_1, %q_top : index
+  %r12 = index.assume %r12_2 [lt(%r12_2, %q_span)] : index
+  %x12 = view.load %q_view[%r12] : view<[%q_span]xf32> -> f32
+  %s12 = scalar.mulf %x12, %scale : f32
+  %r13_0 = index.add %base, %c13 : index
+  %r13_1 = index.assume %r13_0 [range(%r13_0, 0, 2147483646)] : index
+  %r13_2 = index.min %r13_1, %q_top : index
+  %r13 = index.assume %r13_2 [lt(%r13_2, %q_span)] : index
+  %x13 = view.load %q_view[%r13] : view<[%q_span]xf32> -> f32
+  %s13 = scalar.mulf %x13, %scale : f32
+  %r14_0 = index.add %base, %c14 : index
+  %r14_1 = index.assume %r14_0 [range(%r14_0, 0, 2147483646)] : index
+  %r14_2 = index.min %r14_1, %q_top : index
+  %r14 = index.assume %r14_2 [lt(%r14_2, %q_span)] : index
+  %x14 = view.load %q_view[%r14] : view<[%q_span]xf32> -> f32
+  %s14 = scalar.mulf %x14, %scale : f32
+  %r15_0 = index.add %base, %c15 : index
+  %r15_1 = index.assume %r15_0 [range(%r15_0, 0, 2147483646)] : index
+  %r15_2 = index.min %r15_1, %q_top : index
+  %r15 = index.assume %r15_2 [lt(%r15_2, %q_span)] : index
+  %x15 = view.load %q_view[%r15] : view<[%q_span]xf32> -> f32
+  %s15 = scalar.mulf %x15, %scale : f32
+  %v = vector.from_elements %s0, %s1, %s2, %s3, %s4, %s5, %s6, %s7, %s8, %s9, %s10, %s11, %s12, %s13, %s14, %s15 : vector<16xf32>
+  %zero16 = vector.splatf 0.0 : vector<16xf32>
+  %vz = scf.select %rv, %v, %zero16 : vector<16xf32>
+  func.return %vz : vector<16xf32>
+}
+
+// 16 channels of a query, scaled and rounded to f16.
+func.def inline @ggml_hrx_fat_q16(%q_view: view<[%q_span]xf32>, %q_span: index, %q_top: index, %base: index, %rv: i1, %scale: f32) -> (vector<16xf16>) {
+  %v = func.call @ggml_hrx_fat_load16(%q_view, %q_span, %q_top, %base, %rv, %scale) : (view<[%q_span]xf32>, index, index, index, i1, f32) -> (vector<16xf32>)
+  %h = vector.fptrunc %v : vector<16xf32> to vector<16xf16>
+  func.return %h : vector<16xf16>
+}
+
+// 8 channels of a K or V row from d0, or 0 if valid is false. The caller clamps the key.
+func.def inline @ggml_hrx_fat_row8(%buf: buffer, %head: index, %s1: index, %key: index, %d0: index, %valid: i1) -> (vector<8xf16>) {
+  %f16_bytes = index.constant 2 : offset
+  %r1 = index.mul %key, %s1 : index
+  %r2 = index.add %head, %r1 : index
+  %off = index.scale %r2, %f16_bytes : index, offset -> offset
+  %row = buffer.view %buf[%off] : buffer -> view<128xf16>
+  %x = vector.load %row[%d0] : view<128xf16> -> vector<8xf16>
+  %zero8h = vector.splatf 0.0 : vector<8xf16>
+  %r = scf.select %valid, %x, %zero8h : vector<8xf16>
+  func.return %r : vector<8xf16>
+}
+
+// Word w of the class bits of the block row at row_base (n_words words a row). The load is clamped into the binding.
+func.def inline @ggml_hrx_fat_cls(%c_view: view<[%c_span]xi32>, %c_span: index, %row_base: index, %w: index) -> (i32) {
+  %c1 = index.constant 1 : index
+  %i0 = index.add %row_base, %w : index
+  %i1 = index.assume %i0 [range(%i0, 0, 2147483646)] : index
+  %top = index.sub %c_span, %c1 : index
+  %i2 = index.min %i1, %top : index
+  %i = index.assume %i2 [lt(%i2, %c_span)] : index
+  %v = view.load %c_view[%i] : view<[%c_span]xi32> -> i32
+  func.return %v : i32
+}
+
+// The first tile from kt on that a block row of the workgroup sees, or n_kt. The union bits of the workgroup are in LDS from
+// element 1024. Without classes all tiles.
+func.def inline @ggml_hrx_fat_next(%cls_on: i1, %l_view: view<2112xi32>, %kt: index, %n_kt: index) -> (index) {
+  %c1 = index.constant 1 : index
+  %c32 = index.constant 32 : index
+  %c63 = index.constant 63 : index
+  %c1024 = index.constant 1024 : index
+  %zero_i32 = scalar.constant 0 : i32
+  %one_i32 = scalar.constant 1 : i32
+  %r = scf.if %cls_on -> (index) {
+    %t_end, %t_sh = scf.while(%t0w = %kt : index) -> (index, i32) {
+      %t = index.assume %t0w [range(%t0w, 0, 1073741824)] : index
+      %in = index.cmp ult, %t, %n_kt : index
+      %w0 = index.div %t, %c32 : index
+      %w1 = index.min %w0, %c63 : index
+      %wi = index.add %w1, %c1024 : index
+      %wl = view.load %l_view[%wi] : view<2112xi32> -> i32
+      %wd = scf.select %in, %wl, %zero_i32 : i32
+      %b = index.rem %t, %c32 : index
+      %b_i32 = index.cast %b : index to i32
+      %sh = scalar.shrui %wd, %b_i32 : i32
+      %bit = scalar.andi %sh, %one_i32 : i32
+      %found = scalar.cmpi ne, %bit, %zero_i32 : i32
+      %nf = scalar.xori %found, %in : i1
+      %more = scalar.andi %nf, %in : i1
+      scf.condition %more, %t, %sh : i1, index, i32
+    } do(%tt0: index, %shh: i32) {
+      %tt = index.assume %tt0 [range(%tt0, 0, 1073741824)] : index
+      // A word without more set bits moves to the next word.
+      %empty = scalar.cmpi eq, %shh, %zero_i32 : i32
+      %t1 = index.add %tt, %c1 : index
+      %tw0 = index.add %tt, %c32 : index
+      %tw1 = index.div %tw0, %c32 : index
+      %tw = index.mul %tw1, %c32 : index
+      %tn = scf.select %empty, %tw, %t1 : index
+      scf.yield %tn : index
+    }
+    %tc = index.min %t_end, %n_kt : index
+    scf.yield %tc : index
+  } else {
+    %tk = index.min %kt, %n_kt : index
+    scf.yield %tk : index
+  }
+  func.return %r : index
+}
+
+// Row clamp(row, 0, bins_top) of w rounded to f16, as an lhs fragment. Rows of w are 16-byte aligned.
+func.def inline @ggml_hrx_fat_wfrag32(%w_view: view<[%w_span]xf32>, %w_span: index, %bins_top: index, %w_s1: index, %row_i32: i32) -> (vector<16xf16>) {
+  %c0 = index.constant 0 : index
+  %c4 = index.constant 4 : index
+  %c8 = index.constant 8 : index
+  %c12 = index.constant 12 : index
+  %c16 = index.constant 16 : index
+  %row0 = index.cast %row_i32 : i32 to index
+  %row1 = index.max %row0, %c0 : index
+  %row = index.min %row1, %bins_top : index
+  %w_top = index.sub %w_span, %c4 : index
+  %wbase = index.mul %row, %w_s1 : index
+  %wb0 = index.assume %wbase [range(%wbase, 0, 2147483640), multiple_of(%wbase, 4), le(%wbase, %w_top)] : index
+  %wv0 = vector.load %w_view[%wb0] : view<[%w_span]xf32> -> vector<4xf32>
+  %wb1_0 = index.add %wbase, %c4 : index
+  %wb1 = index.assume %wb1_0 [range(%wb1_0, 0, 2147483640), multiple_of(%wb1_0, 4), le(%wb1_0, %w_top)] : index
+  %wv1 = vector.load %w_view[%wb1] : view<[%w_span]xf32> -> vector<4xf32>
+  %wb2_0 = index.add %wbase, %c8 : index
+  %wb2 = index.assume %wb2_0 [range(%wb2_0, 0, 2147483640), multiple_of(%wb2_0, 4), le(%wb2_0, %w_top)] : index
+  %wv2 = vector.load %w_view[%wb2] : view<[%w_span]xf32> -> vector<4xf32>
+  %wb3_0 = index.add %wbase, %c12 : index
+  %wb3 = index.assume %wb3_0 [range(%wb3_0, 0, 2147483640), multiple_of(%wb3_0, 4), le(%wb3_0, %w_top)] : index
+  %wv3 = vector.load %w_view[%wb3] : view<[%w_span]xf32> -> vector<4xf32>
+  %we0 = vector.extract %wv0[0] : vector<4xf32> -> f32
+  %we1 = vector.extract %wv0[1] : vector<4xf32> -> f32
+  %we2 = vector.extract %wv0[2] : vector<4xf32> -> f32
+  %we3 = vector.extract %wv0[3] : vector<4xf32> -> f32
+  %we4 = vector.extract %wv1[0] : vector<4xf32> -> f32
+  %we5 = vector.extract %wv1[1] : vector<4xf32> -> f32
+  %we6 = vector.extract %wv1[2] : vector<4xf32> -> f32
+  %we7 = vector.extract %wv1[3] : vector<4xf32> -> f32
+  %we8 = vector.extract %wv2[0] : vector<4xf32> -> f32
+  %we9 = vector.extract %wv2[1] : vector<4xf32> -> f32
+  %we10 = vector.extract %wv2[2] : vector<4xf32> -> f32
+  %we11 = vector.extract %wv2[3] : vector<4xf32> -> f32
+  %we12 = vector.extract %wv3[0] : vector<4xf32> -> f32
+  %we13 = vector.extract %wv3[1] : vector<4xf32> -> f32
+  %we14 = vector.extract %wv3[2] : vector<4xf32> -> f32
+  %we15 = vector.extract %wv3[3] : vector<4xf32> -> f32
+  %wf = vector.from_elements %we0, %we1, %we2, %we3, %we4, %we5, %we6, %we7, %we8, %we9, %we10, %we11, %we12, %we13, %we14, %we15 : vector<16xf32>
+  %wh = vector.fptrunc %wf : vector<16xf32> to vector<16xf16>
+  %fr = vector.fragment<lhs> %wh shape [%c16, %c16] : vector<16xf16>
+  func.return %fr : vector<16xf16>
+}
+
+kernel.def target(@ggml_wave32) export("ggml_flash_attn_ext_f32_f16_tile") @ggml_flash_attn_ext_f32_f16_tile(%n_tiles: index, %n_groups: index, %n_z: index) {
+  %one = index.constant 1 : index
+  %c32 = index.constant 32 : index
+  %hg = config.get @ggml.flash_attn.hg : index
+  %qt = config.get @ggml.flash_attn.qt : index
+  %waves = index.mul %hg, %qt : index
+  %wg_size = index.mul %waves, %c32 : index
+  %head_first = config.get @ggml.flash_attn.head_first : index
+  %x_heads = index.cmp eq, %head_first, %one : index
+  %gx = scf.select %x_heads, %n_groups, %n_tiles : index
+  %gy = scf.select %x_heads, %n_tiles, %n_groups : index
+  kernel.launch.config workgroups(%gx, %gy, %n_z) workgroup_size(%wg_size, %one, %one) : index
+} launch(%n_q_in: index, %n_head_in: index, %n_kv_in: index, %ratio_in: index, %r3_in: index, %q_s1_in: index, %q_s2_in: index, %q_s3_in: index, %q_span_in: index, %k_s1_in: index, %k_s2_in: index, %k_s3_in: index, %v_s1_in: index, %v_s2_in: index, %v_s3_in: index, %m_ne2_in: index, %m_ne3_in: index, %m_s1_in: index, %m_s2_in: index, %m_s3_in: index, %m_span_in: index, %dst_span_in: index, %scale_bits: index, %has_sinks: index, %s_span_in: index, %n_bins_in: index, %i_s1_in: index, %t_span_in: index, %i_span_in: index, %bs_s1_in: index, %bs_s2_in: index, %bs_span_in: index, %has_cls: index, %r_off_in: index, %r_span_in: index, %n_qb_in: index, %n_rowsb_in: index, %n_words_in: index, %w_s1_in: index, %rr_s1_in: index, %rr_s2_in: index, %rr_span_in: index, %q: buffer, %k: buffer, %v: buffer, %mask: buffer, %sinks: buffer, %dst: buffer, %range: buffer, %bias_t: buffer, %bias_i: buffer, %bias_s: buffer, %bias_r: buffer) {
+  // The caller checks these ranges and the K/V alignment.
+  %n_q = index.assume %n_q_in [range(%n_q_in, 1, 2147483647)] : index
+  %n_head = index.assume %n_head_in [range(%n_head_in, 1, 2147483647)] : index
+  %n_kv = index.assume %n_kv_in [range(%n_kv_in, 1, 2147483647)] : index
+  %ratio = index.assume %ratio_in [range(%ratio_in, 1, 2147483647)] : index
+  %r3 = index.assume %r3_in [range(%r3_in, 1, 2147483647)] : index
+  %q_s1 = index.assume %q_s1_in [range(%q_s1_in, 0, 2147483647)] : index
+  %q_s2 = index.assume %q_s2_in [range(%q_s2_in, 0, 2147483647)] : index
+  %q_s3 = index.assume %q_s3_in [range(%q_s3_in, 0, 2147483647)] : index
+  %q_span = index.assume %q_span_in [range(%q_span_in, 1, 2147483647)] : index
+  %k_s1 = index.assume %k_s1_in [range(%k_s1_in, 0, 16777216), multiple_of(%k_s1_in, 8)] : index
+  %k_s2 = index.assume %k_s2_in [range(%k_s2_in, 0, 2147483647), multiple_of(%k_s2_in, 8)] : index
+  %k_s3 = index.assume %k_s3_in [range(%k_s3_in, 0, 2147483647), multiple_of(%k_s3_in, 8)] : index
+  %v_s1 = index.assume %v_s1_in [range(%v_s1_in, 0, 16777216), multiple_of(%v_s1_in, 8)] : index
+  %v_s2 = index.assume %v_s2_in [range(%v_s2_in, 0, 2147483647), multiple_of(%v_s2_in, 8)] : index
+  %v_s3 = index.assume %v_s3_in [range(%v_s3_in, 0, 2147483647), multiple_of(%v_s3_in, 8)] : index
+  %m_ne2 = index.assume %m_ne2_in [range(%m_ne2_in, 1, 2147483647)] : index
+  %m_ne3 = index.assume %m_ne3_in [range(%m_ne3_in, 1, 2147483647)] : index
+  %m_s1 = index.assume %m_s1_in [range(%m_s1_in, 0, 2147483647)] : index
+  %m_s2 = index.assume %m_s2_in [range(%m_s2_in, 0, 2147483647)] : index
+  %m_s3 = index.assume %m_s3_in [range(%m_s3_in, 0, 2147483647)] : index
+  %m_span = index.assume %m_span_in [range(%m_span_in, 1, 2147483647)] : index
+  %dst_span = index.assume %dst_span_in [range(%dst_span_in, 1, 2147483647)] : index
+  %s_span = index.assume %s_span_in [range(%s_span_in, 1, 2147483647)] : index
+  %n_bins = index.assume %n_bins_in [range(%n_bins_in, 1, 2147483647)] : index
+  %i_s1 = index.assume %i_s1_in [range(%i_s1_in, 0, 2147483647)] : index
+  %t_span = index.assume %t_span_in [range(%t_span_in, 1, 2147483647)] : index
+  %i_span = index.assume %i_span_in [range(%i_span_in, 1, 2147483647)] : index
+  %bs_s1 = index.assume %bs_s1_in [range(%bs_s1_in, 0, 2147483647)] : index
+  %bs_s2 = index.assume %bs_s2_in [range(%bs_s2_in, 0, 2147483647)] : index
+  %bs_span = index.assume %bs_span_in [range(%bs_span_in, 1, 2147483647)] : index
+  %r_off = index.assume %r_off_in [range(%r_off_in, 0, 2147483647)] : index
+  %r_span = index.assume %r_span_in [range(%r_span_in, 2, 2147483647)] : index
+  %n_qb = index.assume %n_qb_in [range(%n_qb_in, 1, 2147483647)] : index
+  %n_rowsb = index.assume %n_rowsb_in [range(%n_rowsb_in, 1, 2147483647)] : index
+  %n_words = index.assume %n_words_in [range(%n_words_in, 1, 2147483647)] : index
+  %w_s1 = index.assume %w_s1_in [range(%w_s1_in, 0, 2147483647), multiple_of(%w_s1_in, 4)] : index
+  %rr_s1 = index.assume %rr_s1_in [range(%rr_s1_in, 0, 2147483647)] : index
+  %rr_s2 = index.assume %rr_s2_in [range(%rr_s2_in, 0, 2147483647)] : index
+  %rr_span = index.assume %rr_span_in [range(%rr_span_in, 1, 2147483647)] : index
+
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c8 = index.constant 8 : index
+  %c15 = index.constant 15 : index
+  %c16 = index.constant 16 : index
+  %c31 = index.constant 31 : index
+  %c32 = index.constant 32 : index
+  %c128 = index.constant 128 : index
+  %c256 = index.constant 256 : index
+  %c0_d = index.constant 0 : index
+  %c0_r = index.constant 0 : index
+  %c16_d = index.constant 16 : index
+  %c16_r = index.constant 16 : index
+  %c32_d = index.constant 32 : index
+  %c48_d = index.constant 48 : index
+  %c64_d = index.constant 64 : index
+  %c80_d = index.constant 80 : index
+  %c96_d = index.constant 96 : index
+  %c112_d = index.constant 112 : index
+  %c0_vr = index.constant 0 : index
+  %c1_vr = index.constant 1 : index
+  %c2_vr = index.constant 2 : index
+  %c3_vr = index.constant 3 : index
+  %c4_vr = index.constant 4 : index
+  %c5_vr = index.constant 5 : index
+  %c6_vr = index.constant 6 : index
+  %c7_vr = index.constant 7 : index
+  %c63_ow = index.constant 63 : index
+  %c64_ow = index.constant 64 : index
+  %c511_ow = index.constant 511 : index
+  %c512_ow = index.constant 512 : index
+  %c1088_ow = index.constant 1088 : index
+  %c1600_ow = index.constant 1600 : index
+  %zero = index.constant 0 : offset
+  %f16_bytes = index.constant 2 : offset
+  %f32_bytes = index.constant 4 : offset
+  %zero_f32 = scalar.constant 0.0 : f32
+  %one_f32 = scalar.constant 1.0 : f32
+  %zero_f16 = scalar.constant 0.0 : f16
+  // This value replaces -inf. Thus exp(s - max) stays finite for fully masked rows.
+  %neg_large = scalar.constant -1e+30 : f32
+  %neg8 = vector.splatf -1e+30 : vector<8xf32>
+  %zero8 = vector.splatf 0.0 : vector<8xf32>
+  %zero16h = vector.splatf 0.0 : vector<16xf16>
+  %init = vector.fragment<init> %zero8 shape [%c16, %c16] : vector<8xf32>
+
+  %hg0 = config.get @ggml.flash_attn.hg : index
+  %hg = index.assume %hg0 [range(%hg0, 1, 8)] : index
+  %qt0 = config.get @ggml.flash_attn.qt : index
+  %qt = index.assume %qt0 [range(%qt0, 1, 8)] : index
+  %waves = index.mul %hg, %qt : index
+  %wg_size = index.mul %waves, %c32 : index
+  %gx = kernel.workgroup.id<x> : index
+  %gy = kernel.workgroup.id<y> : index
+  %head_first = config.get @ggml.flash_attn.head_first : index
+  %x_heads = index.cmp eq, %head_first, %c1 : index
+  %tile = scf.select %x_heads, %gy, %gx : index
+  %group = scf.select %x_heads, %gx, %gy : index
+  %iq3 = kernel.workgroup.id<z> : index
+  %t0 = kernel.workitem.id<x> : index
+  %t = index.assume %t0 [range(%t0, 0, 1023)] : index
+  %wave0 = kernel.subgroup.id : index
+  %wave_i32 = index.cast %wave0 : index to i32
+  %wave_u32 = kernel.subgroup.broadcast.first %wave_i32 : i32
+  %wave1 = index.cast %wave_u32 : i32 to index
+  %wave = index.assume %wave1 [range(%wave1, 0, 31)] : index
+  %lane0 = kernel.subgroup.lane.id : index
+  %lane = index.assume %lane0 [range(%lane0, 0, 31)] : index
+  %lane_col = index.rem %lane, %c16 : index
+  %lane_half = index.div %lane, %c16 : index
+  %hi_half = index.cmp ne, %lane_half, %c0 : index
+
+  %scale_i32 = index.cast %scale_bits : index to i32
+  %scale_ivec = vector.from_elements %scale_i32 : vector<1xi32>
+  %scale_fvec = vector.bitcast %scale_ivec : vector<1xi32> to vector<1xf32>
+  %scale = vector.extract %scale_fvec[0] : vector<1xf32> -> f32
+
+  %q_noalias, %k_noalias, %v_noalias, %mask_noalias, %dst_noalias = buffer.assume.noalias %q, %k, %v, %mask, %dst : buffer, buffer, buffer, buffer, buffer
+  %k_aligned = buffer.assume.alignment %k_noalias {minimum_alignment = 16} : buffer
+  %v_aligned = buffer.assume.alignment %v_noalias {minimum_alignment = 16} : buffer
+  %q_view = buffer.view %q_noalias[%zero] : buffer -> view<[%q_span]xf32>
+  %m_view = buffer.view %mask_noalias[%zero] : buffer -> view<[%m_span]xf16>
+  %dst_view = buffer.view %dst_noalias[%zero] : buffer -> view<[%dst_span]xf32>
+  %sink_view = buffer.view %sinks[%zero] : buffer -> view<[%s_span]xf32>
+  %t_view = buffer.view %bias_t[%zero] : buffer -> view<[%t_span]xf32>
+  %i_view = buffer.view %bias_i[%zero] : buffer -> view<[%i_span]xi32>
+  %bs_view = buffer.view %bias_s[%zero] : buffer -> view<[%bs_span]xf32>
+  %r_off_b = index.scale %r_off, %f32_bytes : index, offset -> offset
+  %cls_view = buffer.view %range[%r_off_b] : buffer -> view<[%r_span]xi32>
+
+  // K [32 x 128] and V^T [128 x 32] tiles, rows padded by 8 halves.
+  %k_bytes = index.constant 8704 : offset
+  %k_lds = buffer.alloca<workgroup> align(16) %k_bytes : buffer
+  %k_view = buffer.view %k_lds[%zero] : buffer -> view<32x136xf16>
+  %vt_bytes = index.constant 10240 : offset
+  %vt_lds = buffer.alloca<workgroup> align(16) %vt_bytes : buffer
+  %vt_view = buffer.view %vt_lds[%zero] : buffer -> view<128x40xf16>
+  %vtw_view = buffer.view %vt_lds[%zero] : buffer -> view<128x20xi32>
+
+  // The wave's head and query tile. The lane's query is tok.
+  %hl = index.rem %wave, %hg : index
+  %sub = index.div %wave, %hg : index
+  %h0 = index.mul %group, %hg : index
+  %head = index.add %h0, %hl : index
+  %ik2 = index.div %h0, %ratio : index
+  %ik3 = index.div %iq3, %r3 : index
+  %tq0 = index.mul %tile, %qt : index
+  %tq1 = index.add %tq0, %sub : index
+  %tok0 = index.mul %tq1, %c16 : index
+  %tok = index.add %tok0, %lane_col : index
+  %rv = index.cmp ult, %tok, %n_q : index
+
+  // Q^T fragments: the lane loads 16 channels of its query, scaled and rounded to f16.
+  %q_o1 = index.mul %tok, %q_s1 : index
+  %q_o2 = index.mul %head, %q_s2 : index
+  %q_o3 = index.mul %iq3, %q_s3 : index
+  %q_o12 = index.add %q_o1, %q_o2 : index
+  %q_base = index.add %q_o12, %q_o3 : index
+  %q_top = index.sub %q_span, %c1 : index
+  %qd0 = index.constant 0 : index
+  %qb0 = index.add %q_base, %qd0 : index
+  %qh0 = func.call @ggml_hrx_fat_q16(%q_view, %q_span, %q_top, %qb0, %rv, %scale) : (view<[%q_span]xf32>, index, index, index, i1, f32) -> (vector<16xf16>)
+  %qf0 = vector.fragment<rhs> %qh0 shape [%c16, %c16] : vector<16xf16>
+  %qd1 = index.constant 16 : index
+  %qb1 = index.add %q_base, %qd1 : index
+  %qh1 = func.call @ggml_hrx_fat_q16(%q_view, %q_span, %q_top, %qb1, %rv, %scale) : (view<[%q_span]xf32>, index, index, index, i1, f32) -> (vector<16xf16>)
+  %qf1 = vector.fragment<rhs> %qh1 shape [%c16, %c16] : vector<16xf16>
+  %qd2 = index.constant 32 : index
+  %qb2 = index.add %q_base, %qd2 : index
+  %qh2 = func.call @ggml_hrx_fat_q16(%q_view, %q_span, %q_top, %qb2, %rv, %scale) : (view<[%q_span]xf32>, index, index, index, i1, f32) -> (vector<16xf16>)
+  %qf2 = vector.fragment<rhs> %qh2 shape [%c16, %c16] : vector<16xf16>
+  %qd3 = index.constant 48 : index
+  %qb3 = index.add %q_base, %qd3 : index
+  %qh3 = func.call @ggml_hrx_fat_q16(%q_view, %q_span, %q_top, %qb3, %rv, %scale) : (view<[%q_span]xf32>, index, index, index, i1, f32) -> (vector<16xf16>)
+  %qf3 = vector.fragment<rhs> %qh3 shape [%c16, %c16] : vector<16xf16>
+  %qd4 = index.constant 64 : index
+  %qb4 = index.add %q_base, %qd4 : index
+  %qh4 = func.call @ggml_hrx_fat_q16(%q_view, %q_span, %q_top, %qb4, %rv, %scale) : (view<[%q_span]xf32>, index, index, index, i1, f32) -> (vector<16xf16>)
+  %qf4 = vector.fragment<rhs> %qh4 shape [%c16, %c16] : vector<16xf16>
+  %qd5 = index.constant 80 : index
+  %qb5 = index.add %q_base, %qd5 : index
+  %qh5 = func.call @ggml_hrx_fat_q16(%q_view, %q_span, %q_top, %qb5, %rv, %scale) : (view<[%q_span]xf32>, index, index, index, i1, f32) -> (vector<16xf16>)
+  %qf5 = vector.fragment<rhs> %qh5 shape [%c16, %c16] : vector<16xf16>
+  %qd6 = index.constant 96 : index
+  %qb6 = index.add %q_base, %qd6 : index
+  %qh6 = func.call @ggml_hrx_fat_q16(%q_view, %q_span, %q_top, %qb6, %rv, %scale) : (view<[%q_span]xf32>, index, index, index, i1, f32) -> (vector<16xf16>)
+  %qf6 = vector.fragment<rhs> %qh6 shape [%c16, %c16] : vector<16xf16>
+  %qd7 = index.constant 112 : index
+  %qb7 = index.add %q_base, %qd7 : index
+  %qh7 = func.call @ggml_hrx_fat_q16(%q_view, %q_span, %q_top, %qb7, %rv, %scale) : (view<[%q_span]xf32>, index, index, index, i1, f32) -> (vector<16xf16>)
+  %qf7 = vector.fragment<rhs> %qh7 shape [%c16, %c16] : vector<16xf16>
+
+  // Mask row of the lane's query and head, bias rows of the query and head. The queries of all sequences are flattened.
+  %mask_cfg = config.get @ggml.flash_attn.mask : index
+  %mask_on = index.cmp ne, %mask_cfg, %c0 : index
+  %bias_cfg = config.get @ggml.flash_attn.bias : index
+  %bias_on = index.cmp ne, %bias_cfg, %c0 : index
+  %im2 = index.rem %head, %m_ne2 : index
+  %im3 = index.rem %iq3, %m_ne3 : index
+  %nq_top = index.sub %n_q, %c1 : index
+  %tok_c = index.min %tok, %nq_top : index
+  %bins_top = index.sub %n_bins, %c1 : index
+  %vec_cfg = config.get @ggml.flash_attn.vec_mask : index
+  %vec_on = index.cmp ne, %vec_cfg, %c0 : index
+  %m_top16 = index.sub %m_span, %c16 : index
+  %i_top16 = index.sub %i_span, %c16 : index
+  %mb_t = index.mul %tok_c, %m_s1 : index
+  %mb_h = index.mul %im2, %m_s2 : index
+  %mb_s = index.mul %im3, %m_s3 : index
+  %mb_th = index.add %mb_t, %mb_h : index
+  %mb = index.add %mb_th, %mb_s : index
+  %qf_s = index.mul %iq3, %n_q : index
+  %q_flat = index.add %qf_s, %tok_c : index
+  %ib = index.mul %q_flat, %i_s1 : index
+  %tb_q = index.mul %q_flat, %n_head : index
+  %tb_qh = index.add %tb_q, %head : index
+  %tb = index.mul %tb_qh, %n_bins : index
+  %bsub_cfg = config.get @ggml.flash_attn.bias_sub : index
+  %bsub_on = index.cmp ne, %bsub_cfg, %c0 : index
+  %s_row = scf.if %bsub_on -> (f32) {
+    %bs_q = index.mul %q_flat, %bs_s2 : index
+    %bs_h = index.mul %head, %bs_s1 : index
+    %bs_raw0 = index.add %bs_q, %bs_h : index
+    %bs_raw = index.assume %bs_raw0 [range(%bs_raw0, 0, 2147483646)] : index
+    %bs_top = index.sub %bs_span, %c1 : index
+    %bs_idx0 = index.min %bs_raw, %bs_top : index
+    %bs_idx = index.assume %bs_idx0 [lt(%bs_idx0, %bs_span)] : index
+    %sv0 = view.load %bs_view[%bs_idx] : view<[%bs_span]xf32> -> f32
+    scf.yield %sv0 : f32
+  } else {
+    scf.yield %zero_f32 : f32
+  }
+
+  %bmm_cfg = config.get @ggml.flash_attn.bias_mm : index
+  %bmm_on = index.cmp ne, %bmm_cfg, %c0 : index
+  %zero16f = vector.splatf 0.0 : vector<16xf32>
+  %rr_view = buffer.view %bias_r[%zero] : buffer -> view<[%rr_span]xf32>
+  %rr_q = index.mul %q_flat, %rr_s2 : index
+  %rr_h = index.mul %head, %rr_s1 : index
+  %rr_b = index.add %rr_q, %rr_h : index
+  %rr_top = index.sub %rr_span, %c1 : index
+  %rq = scf.if %bmm_on -> (vector<16xf32>) {
+    %rq16 = func.call @ggml_hrx_fat_load16(%rr_view, %rr_span, %rr_top, %rr_b, %rv, %one_f32) : (view<[%rr_span]xf32>, index, index, index, i1, f32) -> (vector<16xf32>)
+    scf.yield %rq16 : vector<16xf32>
+  } else {
+    scf.yield %zero16f : vector<16xf32>
+  }
+
+  // Tile classes: the wave's own block row, and the block rows of the workgroup.
+  %kv_round = index.add %n_kv, %c31 : index
+  %n_kt = index.div %kv_round, %c32 : index
+  %cls_on = index.cmp ne, %has_cls, %c0 : index
+  %own_r0 = index.mul %im3, %m_ne2 : index
+  %own_r1 = index.add %own_r0, %im2 : index
+  %own_r2 = index.mul %own_r1, %n_qb : index
+  %own_r3 = index.add %own_r2, %tq1 : index
+  %own_row = index.mul %own_r3, %n_words : index
+  %mix_base = index.mul %n_rowsb, %n_words : index
+  %own_mrow = index.add %own_row, %mix_base : index
+  %wqb0 = index.mul %tile, %qt : index
+  // The class words of the workgroup's block rows in LDS: act of row s at 64 s, mix at 512 + 64 s, the union of act at 1024,
+  // toe at 1088 + 64 s, full at 1600 + 64 s. The host checks one mask head row and at most 64 words.
+  %cls_bytes = index.constant 8448 : offset
+  %cls_lds = buffer.alloca<workgroup> align(16) %cls_bytes : buffer
+  %l_view = buffer.view %cls_lds[%zero] : buffer -> view<2112xi32>
+  %c64w = index.constant 64 : index
+  %c63w = index.constant 63 : index
+  %c511w = index.constant 511 : index
+  %c512w = index.constant 512 : index
+  %c1024w = index.constant 1024 : index
+  %c1088w = index.constant 1088 : index
+  %c1600w = index.constant 1600 : index
+  %zero_i32c = scalar.constant 0 : i32
+  scf.if %cls_on {
+    %fill_n = index.mul %qt, %n_words : index
+    scf.for %e = [%t to %fill_n step %wg_size] {
+      %fs = index.div %e, %n_words : index
+      %fw = index.rem %e, %n_words : index
+      %fqb = index.add %wqb0, %fs : index
+      %fin = index.cmp ult, %fqb, %n_qb : index
+      %fr0 = index.mul %im3, %n_qb : index
+      %fr1 = index.add %fr0, %fqb : index
+      %frow = index.mul %fr1, %n_words : index
+      %fmrow = index.add %frow, %mix_base : index
+      %ftrow = index.add %fmrow, %mix_base : index
+      %ffrow = index.add %ftrow, %mix_base : index
+      %fa0 = func.call @ggml_hrx_fat_cls(%cls_view, %r_span, %frow, %fw) : (view<[%r_span]xi32>, index, index, index) -> (i32)
+      %fm0 = func.call @ggml_hrx_fat_cls(%cls_view, %r_span, %fmrow, %fw) : (view<[%r_span]xi32>, index, index, index) -> (i32)
+      %ft0 = func.call @ggml_hrx_fat_cls(%cls_view, %r_span, %ftrow, %fw) : (view<[%r_span]xi32>, index, index, index) -> (i32)
+      %ff0 = func.call @ggml_hrx_fat_cls(%cls_view, %r_span, %ffrow, %fw) : (view<[%r_span]xi32>, index, index, index) -> (i32)
+      %fa = scf.select %fin, %fa0, %zero_i32c : i32
+      %fm = scf.select %fin, %fm0, %zero_i32c : i32
+      %ft = scf.select %fin, %ft0, %zero_i32c : i32
+      %ff = scf.select %fin, %ff0, %zero_i32c : i32
+      %fo0 = index.mul %fs, %c64w : index
+      %fo1 = index.add %fo0, %fw : index
+      %fo = index.min %fo1, %c511w : index
+      %fmo = index.add %fo, %c512w : index
+      view.store %fa, %l_view[%fo] : i32, view<2112xi32>
+      view.store %fm, %l_view[%fmo] : i32, view<2112xi32>
+      %fto = index.add %fo, %c1088w : index
+      %ffo = index.add %fo, %c1600w : index
+      view.store %ft, %l_view[%fto] : i32, view<2112xi32>
+      view.store %ff, %l_view[%ffo] : i32, view<2112xi32>
+    }
+    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+    scf.for %uw = [%t to %n_words step %wg_size] {
+      %un = scf.for %us = [%c0 to %qt step %c1](%uacc = %zero_i32c : i32) -> (i32) {
+        %uo0 = index.mul %us, %c64w : index
+        %uo1 = index.add %uo0, %uw : index
+        %uo = index.min %uo1, %c511w : index
+        %uv = view.load %l_view[%uo] : view<2112xi32> -> i32
+        %uor = scalar.ori %uacc, %uv : i32
+        scf.yield %uor : i32
+      }
+      %uwc = index.min %uw, %c63w : index
+      %ui = index.add %uwc, %c1024w : index
+      view.store %un, %l_view[%ui] : i32, view<2112xi32>
+    }
+    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+  }
+  %bins_top_i32 = index.cast %bins_top : index to i32
+  // The bias of a plain tile: the last bin, mask 0.
+  %crow = scf.if %bias_on -> (f32) {
+    %cb = scf.if %bmm_on -> (f32) {
+      %cm = func.call @ggml_hrx_fat_mm(%t_view, %t_span, %bins_top, %w_s1, %bins_top_i32, %rq, %zero_f32, %s_row) : (view<[%t_span]xf32>, index, index, index, i32, vector<16xf32>, f32, f32) -> (f32)
+      scf.yield %cm : f32
+    } else {
+      %ct = func.call @ggml_hrx_fat_table(%t_view, %t_span, %bins_top, %tb, %bins_top_i32, %zero_f32, %s_row) : (view<[%t_span]xf32>, index, index, index, i32, f32, f32) -> (f32)
+      scf.yield %ct : f32
+    }
+    scf.yield %cb : f32
+  } else {
+    scf.yield %zero_f32 : f32
+  }
+  %crow8 = vector.splat %crow : vector<8xf32>
+  // Toeplitz tiles: 48 x 18 halves of LDS for each wave, e of the wave's block row at 4 R + 32 (row n_words) + kt.
+  %toep_cfg = config.get @ggml.flash_attn.toep : index
+  %toep_on = index.cmp ne, %toep_cfg, %c0 : index
+  %c1728x = index.constant 1728 : index
+  %c4l = index.constant 4 : index
+  %one_bx = index.constant 1 : offset
+  %x_size0 = index.mul %waves, %c1728x : index
+  %x_size = scf.select %toep_on, %x_size0, %c16 : index
+  %x_bytes = index.scale %x_size, %one_bx : index, offset -> offset
+  %x_lds = buffer.alloca<workgroup> align(16) %x_bytes : buffer
+  %x_off0 = index.mul %wave, %c1728x : index
+  %x_off1 = scf.select %toep_on, %x_off0, %c0 : index
+  %x_off = index.scale %x_off1, %one_bx : index, offset -> offset
+  %x_view = buffer.view %x_lds[%x_off] : buffer -> view<48x18xf16>
+  %e_r0 = index.mul %own_row, %c32 : index
+  %e_r1 = index.mul %mix_base, %c4l : index
+  %e_rbase = index.add %e_r0, %e_r1 : index
+  %r_top = index.sub %r_span, %c1 : index
+
+  %k_o2 = index.mul %ik2, %k_s2 : index
+  %k_o3 = index.mul %ik3, %k_s3 : index
+  %k_head = index.add %k_o2, %k_o3 : index
+  %v_o2 = index.mul %ik2, %v_s2 : index
+  %v_o3 = index.mul %ik3, %v_s3 : index
+  %v_head = index.add %v_o2, %v_o3 : index
+  %k_layout = encoding.layout.strided [%k_s1, 1] : encoding<layout>
+  %v_layout = encoding.layout.strided [%v_s1, 1] : encoding<layout>
+  %kv_last = index.sub %n_kv, %c1 : index
+
+  // Loaders of the prefetch: waves 0-7 take key 4 w + lane % 4, channels 8 (lane / 4) and 64 more; waves 8-15 take keys 2 p and
+  // 2 p + 1 with p = lane % 16, channels 8 (2 (w - 8) + lane / 16).
+  %pf_cfg = config.get @ggml.flash_attn.prefetch : index
+  %pf_on = index.cmp ne, %pf_cfg, %c0 : index
+  %c7l = index.constant 7 : index
+  %c8l = index.constant 8 : index
+  %c15l = index.constant 15 : index
+  %c16l = index.constant 16 : index
+  %c64l = index.constant 64 : index
+  %is_kl = index.cmp ult, %wave, %c8l : index
+  %ge8 = index.cmp uge, %wave, %c8l : index
+  %lt16 = index.cmp ult, %wave, %c16l : index
+  %is_vl0 = scalar.andi %ge8, %lt16 : i1
+  %is_vl = scalar.andi %is_vl0, %pf_on : i1
+  %wk = index.min %wave, %c7l : index
+  %lm4 = index.rem %lane, %c4l : index
+  %ld4 = index.div %lane, %c4l : index
+  %kl_key0 = index.mul %wk, %c4l : index
+  %kl_key1 = index.add %kl_key0, %lm4 : index
+  %kl_key = index.assume %kl_key1 [range(%kl_key1, 0, 31)] : index
+  %kl_d0a = index.mul %ld4, %c8l : index
+  %kl_d0 = index.assume %kl_d0a [range(%kl_d0a, 0, 56), multiple_of(%kl_d0a, 8)] : index
+  %kl_d1a = index.add %kl_d0, %c64l : index
+  %kl_d1 = index.assume %kl_d1a [range(%kl_d1a, 64, 120), multiple_of(%kl_d1a, 8)] : index
+  // w - 8 for the V loaders.
+  %wv = index.rem %wave, %c8l : index
+  %vl_kp = index.assume %lane_col [range(%lane_col, 0, 15)] : index
+  %vl_ch0 = index.mul %wv, %c2 : index
+  %vl_ch1 = index.add %vl_ch0, %lane_half : index
+  %vl_d0a = index.mul %vl_ch1, %c8l : index
+  %vl_d0 = index.assume %vl_d0a [range(%vl_d0a, 0, 120), multiple_of(%vl_d0a, 8)] : index
+  %vl_key0 = index.mul %vl_kp, %c2 : index
+  %zero8h = vector.splatf 0.0 : vector<8xf16>
+  %kt0 = func.call @ggml_hrx_fat_next(%cls_on, %l_view, %c0, %n_kt) : (i1, view<2112xi32>, index, index) -> (index)
+  %pro_kt_c0 = index.sub %n_kt, %c1 : index
+  %pro_kt_c = index.min %kt0, %pro_kt_c0 : index
+  %pro_kbase = index.mul %pro_kt_c, %c32 : index
+  %pro_r0, %pro_r1 = scf.if %pf_on -> (vector<8xf16>, vector<8xf16>) {
+    %pro_rr0, %pro_rr1 = scf.if %is_kl -> (vector<8xf16>, vector<8xf16>) {
+      %pro_kk = index.add %pro_kbase, %kl_key : index
+      %pro_kin = index.cmp ult, %pro_kk, %n_kv : index
+      %pro_kc = index.min %pro_kk, %kv_last : index
+      %pro_ka = func.call @ggml_hrx_fat_row8(%k_aligned, %k_head, %k_s1, %pro_kc, %kl_d0, %pro_kin) : (buffer, index, index, index, index, i1) -> (vector<8xf16>)
+      %pro_kb2 = func.call @ggml_hrx_fat_row8(%k_aligned, %k_head, %k_s1, %pro_kc, %kl_d1, %pro_kin) : (buffer, index, index, index, index, i1) -> (vector<8xf16>)
+      scf.yield %pro_ka, %pro_kb2 : vector<8xf16>, vector<8xf16>
+    } else {
+      %pro_vr0, %pro_vr1 = scf.if %is_vl -> (vector<8xf16>, vector<8xf16>) {
+        %pro_va_k = index.add %pro_kbase, %vl_key0 : index
+        %pro_vb_k = index.add %pro_va_k, %c1 : index
+        %pro_va_in = index.cmp ult, %pro_va_k, %n_kv : index
+        %pro_vb_in = index.cmp ult, %pro_vb_k, %n_kv : index
+        %pro_va_c = index.min %pro_va_k, %kv_last : index
+        %pro_vb_c = index.min %pro_vb_k, %kv_last : index
+        %pro_va = func.call @ggml_hrx_fat_row8(%v_aligned, %v_head, %v_s1, %pro_va_c, %vl_d0, %pro_va_in) : (buffer, index, index, index, index, i1) -> (vector<8xf16>)
+        %pro_vb = func.call @ggml_hrx_fat_row8(%v_aligned, %v_head, %v_s1, %pro_vb_c, %vl_d0, %pro_vb_in) : (buffer, index, index, index, index, i1) -> (vector<8xf16>)
+        scf.yield %pro_va, %pro_vb : vector<8xf16>, vector<8xf16>
+      } else {
+        scf.yield %zero8h, %zero8h : vector<8xf16>, vector<8xf16>
+      }
+      scf.yield %pro_vr0, %pro_vr1 : vector<8xf16>, vector<8xf16>
+    }
+    scf.yield %pro_rr0, %pro_rr1 : vector<8xf16>, vector<8xf16>
+  } else {
+    scf.yield %zero8h, %zero8h : vector<8xf16>, vector<8xf16>
+  }
+  %ko0_0_c = index.constant 0 : index
+  %ko0_0 = index.add %ko0_0_c, %lane_half : index
+  %ko0_1_c = index.constant 2 : index
+  %ko0_1 = index.add %ko0_1_c, %lane_half : index
+  %ko0_2_c = index.constant 4 : index
+  %ko0_2 = index.add %ko0_2_c, %lane_half : index
+  %ko0_3_c = index.constant 6 : index
+  %ko0_3 = index.add %ko0_3_c, %lane_half : index
+  %ko0_4_c = index.constant 8 : index
+  %ko0_4 = index.add %ko0_4_c, %lane_half : index
+  %ko0_5_c = index.constant 10 : index
+  %ko0_5 = index.add %ko0_5_c, %lane_half : index
+  %ko0_6_c = index.constant 12 : index
+  %ko0_6 = index.add %ko0_6_c, %lane_half : index
+  %ko0_7_c = index.constant 14 : index
+  %ko0_7 = index.add %ko0_7_c, %lane_half : index
+  %ko1_0_c = index.constant 16 : index
+  %ko1_0 = index.add %ko1_0_c, %lane_half : index
+  %ko1_1_c = index.constant 18 : index
+  %ko1_1 = index.add %ko1_1_c, %lane_half : index
+  %ko1_2_c = index.constant 20 : index
+  %ko1_2 = index.add %ko1_2_c, %lane_half : index
+  %ko1_3_c = index.constant 22 : index
+  %ko1_3 = index.add %ko1_3_c, %lane_half : index
+  %ko1_4_c = index.constant 24 : index
+  %ko1_4 = index.add %ko1_4_c, %lane_half : index
+  %ko1_5_c = index.constant 26 : index
+  %ko1_5 = index.add %ko1_5_c, %lane_half : index
+  %ko1_6_c = index.constant 28 : index
+  %ko1_6 = index.add %ko1_6_c, %lane_half : index
+  %ko1_7_c = index.constant 30 : index
+  %ko1_7 = index.add %ko1_7_c, %lane_half : index
+  %krow0_c = index.constant 0 : index
+  %krow0_0 = index.add %krow0_c, %lane_col : index
+  %krow0 = index.assume %krow0_0 [range(%krow0_0, 0, 31)] : index
+  %krow1_c = index.constant 16 : index
+  %krow1_0 = index.add %krow1_c, %lane_col : index
+  %krow1 = index.assume %krow1_0 [range(%krow1_0, 0, 31)] : index
+  %vrow0_c = index.constant 0 : index
+  %vrow0_0 = index.add %vrow0_c, %lane_col : index
+  %vrow0 = index.assume %vrow0_0 [range(%vrow0_0, 0, 127)] : index
+  %vrow1_c = index.constant 16 : index
+  %vrow1_0 = index.add %vrow1_c, %lane_col : index
+  %vrow1 = index.assume %vrow1_0 [range(%vrow1_0, 0, 127)] : index
+  %vrow2_c = index.constant 32 : index
+  %vrow2_0 = index.add %vrow2_c, %lane_col : index
+  %vrow2 = index.assume %vrow2_0 [range(%vrow2_0, 0, 127)] : index
+  %vrow3_c = index.constant 48 : index
+  %vrow3_0 = index.add %vrow3_c, %lane_col : index
+  %vrow3 = index.assume %vrow3_0 [range(%vrow3_0, 0, 127)] : index
+  %vrow4_c = index.constant 64 : index
+  %vrow4_0 = index.add %vrow4_c, %lane_col : index
+  %vrow4 = index.assume %vrow4_0 [range(%vrow4_0, 0, 127)] : index
+  %vrow5_c = index.constant 80 : index
+  %vrow5_0 = index.add %vrow5_c, %lane_col : index
+  %vrow5 = index.assume %vrow5_0 [range(%vrow5_0, 0, 127)] : index
+  %vrow6_c = index.constant 96 : index
+  %vrow6_0 = index.add %vrow6_c, %lane_col : index
+  %vrow6 = index.assume %vrow6_0 [range(%vrow6_0, 0, 127)] : index
+  %vrow7_c = index.constant 112 : index
+  %vrow7_0 = index.add %vrow7_c, %lane_col : index
+  %vrow7 = index.assume %vrow7_0 [range(%vrow7_0, 0, 127)] : index
+
+  %kt_fin, %m_fin, %l_fin, %of0, %of1, %of2, %of3, %of4, %of5, %of6, %of7, %rf0, %rf1 = scf.while(%ktw = %kt0 : index, %mw = %neg_large : f32, %lw = %zero_f32 : f32, %aw0 = %init : vector<8xf32>, %aw1 = %init : vector<8xf32>, %aw2 = %init : vector<8xf32>, %aw3 = %init : vector<8xf32>, %aw4 = %init : vector<8xf32>, %aw5 = %init : vector<8xf32>, %aw6 = %init : vector<8xf32>, %aw7 = %init : vector<8xf32>, %rw0 = %pro_r0 : vector<8xf16>, %rw1 = %pro_r1 : vector<8xf16>) -> (index, f32, f32, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf16>, vector<8xf16>) {
+    %wmore = index.cmp ult, %ktw, %n_kt : index
+    scf.condition %wmore, %ktw, %mw, %lw, %aw0, %aw1, %aw2, %aw3, %aw4, %aw5, %aw6, %aw7, %rw0, %rw1 : i1, index, f32, f32, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf16>, vector<8xf16>
+  } do(%kt: index, %m_run: f32, %l_run: f32, %a0: vector<8xf32>, %a1: vector<8xf32>, %a2: vector<8xf32>, %a3: vector<8xf32>, %a4: vector<8xf32>, %a5: vector<8xf32>, %a6: vector<8xf32>, %a7: vector<8xf32>, %r0: vector<8xf16>, %r1: vector<8xf16>) {
+    %kb = index.mul %kt, %c32 : index
+    %e_t = scf.if %toep_on -> (i32) {
+      %e_i0 = index.add %e_rbase, %kt : index
+      %e_i1 = index.assume %e_i0 [range(%e_i0, 0, 2147483646)] : index
+      %e_i2 = index.min %e_i1, %r_top : index
+      %e_i = index.assume %e_i2 [lt(%e_i2, %r_span)] : index
+      %e_l = view.load %cls_view[%e_i] : view<[%r_span]xi32> -> i32
+      scf.yield %e_l : i32
+    } else {
+      %e_z = scalar.constant 0 : i32
+      scf.yield %e_z : i32
+    }
+    // Stage K and V^T: the prefetched registers, else a slot of 16 channels of one key for each lane. Keys past n_kv are 0.
+    scf.if %pf_on {
+      scf.if %is_kl {
+        vector.store %r0, %k_view[%kl_key, %kl_d0] : vector<8xf16>, view<32x136xf16>
+        vector.store %r1, %k_view[%kl_key, %kl_d1] : vector<8xf16>, view<32x136xf16>
+      }
+      scf.if %is_vl {
+        %vab = vector.interleave<0> %r0, %r1 : vector<8xf16>, vector<8xf16> -> vector<16xf16>
+        %vwd = vector.bitcast %vab : vector<16xf16> to vector<8xi32>
+        %vw0 = vector.extract %vwd[0] : vector<8xi32> -> i32
+        %vrow0_0 = index.add %vl_d0, %c0_vr : index
+        %vrow0_1 = index.assume %vrow0_0 [range(%vrow0_0, 0, 127)] : index
+        view.store %vw0, %vtw_view[%vrow0_1, %vl_kp] : i32, view<128x20xi32>
+        %vw1 = vector.extract %vwd[1] : vector<8xi32> -> i32
+        %vrow1_0 = index.add %vl_d0, %c1_vr : index
+        %vrow1_1 = index.assume %vrow1_0 [range(%vrow1_0, 0, 127)] : index
+        view.store %vw1, %vtw_view[%vrow1_1, %vl_kp] : i32, view<128x20xi32>
+        %vw2 = vector.extract %vwd[2] : vector<8xi32> -> i32
+        %vrow2_0 = index.add %vl_d0, %c2_vr : index
+        %vrow2_1 = index.assume %vrow2_0 [range(%vrow2_0, 0, 127)] : index
+        view.store %vw2, %vtw_view[%vrow2_1, %vl_kp] : i32, view<128x20xi32>
+        %vw3 = vector.extract %vwd[3] : vector<8xi32> -> i32
+        %vrow3_0 = index.add %vl_d0, %c3_vr : index
+        %vrow3_1 = index.assume %vrow3_0 [range(%vrow3_0, 0, 127)] : index
+        view.store %vw3, %vtw_view[%vrow3_1, %vl_kp] : i32, view<128x20xi32>
+        %vw4 = vector.extract %vwd[4] : vector<8xi32> -> i32
+        %vrow4_0 = index.add %vl_d0, %c4_vr : index
+        %vrow4_1 = index.assume %vrow4_0 [range(%vrow4_0, 0, 127)] : index
+        view.store %vw4, %vtw_view[%vrow4_1, %vl_kp] : i32, view<128x20xi32>
+        %vw5 = vector.extract %vwd[5] : vector<8xi32> -> i32
+        %vrow5_0 = index.add %vl_d0, %c5_vr : index
+        %vrow5_1 = index.assume %vrow5_0 [range(%vrow5_0, 0, 127)] : index
+        view.store %vw5, %vtw_view[%vrow5_1, %vl_kp] : i32, view<128x20xi32>
+        %vw6 = vector.extract %vwd[6] : vector<8xi32> -> i32
+        %vrow6_0 = index.add %vl_d0, %c6_vr : index
+        %vrow6_1 = index.assume %vrow6_0 [range(%vrow6_0, 0, 127)] : index
+        view.store %vw6, %vtw_view[%vrow6_1, %vl_kp] : i32, view<128x20xi32>
+        %vw7 = vector.extract %vwd[7] : vector<8xi32> -> i32
+        %vrow7_0 = index.add %vl_d0, %c7_vr : index
+        %vrow7_1 = index.assume %vrow7_0 [range(%vrow7_0, 0, 127)] : index
+        view.store %vw7, %vtw_view[%vrow7_1, %vl_kp] : i32, view<128x20xi32>
+      }
+    } else {
+      // Stage K and V^T. A slot is 16 channels of one key. Keys past n_kv are 0.
+      scf.for %slot = [%t to %c256 step %wg_size] {
+        %sl = index.assume %slot [range(%slot, 0, 255)] : index
+        %key_l = index.div %sl, %c8 : index
+        %seg = index.rem %sl, %c8 : index
+        %d0 = index.mul %seg, %c16 : index
+        %key = index.add %kb, %key_l : index
+        %key_in = index.cmp ult, %key, %n_kv : index
+        %key_c = index.min %key, %kv_last : index
+        %k1 = index.mul %key_c, %k_s1 : index
+        %k2 = index.add %k_head, %k1 : index
+        %k_off = index.scale %k2, %f16_bytes : index, offset -> offset
+        %k_row = buffer.view %k_aligned[%k_off] : buffer -> view<128xf16>
+        %kx = vector.load %k_row[%d0] : view<128xf16> -> vector<16xf16>
+        %vv1 = index.mul %key_c, %v_s1 : index
+        %vv2 = index.add %v_head, %vv1 : index
+        %v_off = index.scale %vv2, %f16_bytes : index, offset -> offset
+        %v_row = buffer.view %v_aligned[%v_off] : buffer -> view<128xf16>
+        %vx = vector.load %v_row[%d0] : view<128xf16> -> vector<16xf16>
+        %ks = scf.select %key_in, %kx, %zero16h : vector<16xf16>
+        %vs = scf.select %key_in, %vx, %zero16h : vector<16xf16>
+        vector.store %ks, %k_view[%key_l, %d0] : vector<16xf16>, view<32x136xf16>
+        scf.for %j = [%c0 to %c16 step %c1] unroll {
+          %vj = vector.extract %vs[%j] : vector<16xf16> -> f16
+          %vt_row0 = index.add %d0, %j : index
+          %vt_row = index.assume %vt_row0 [range(%vt_row0, 0, 127)] : index
+          view.store %vj, %vt_view[%vt_row, %key_l] : f16, view<128x40xf16>
+        }
+      }
+    }
+    // The class bits of the wave's own rows for this tile.
+    %kt_r = index.assume %kt [range(%kt, 0, 1073741824)] : index
+    %own_w = index.div %kt_r, %c32 : index
+    %own_b = index.rem %kt_r, %c32 : index
+    %own_b_i32 = index.cast %own_b : index to i32
+    %one_i32w = scalar.constant 1 : i32
+    %zero_i32w = scalar.constant 0 : i32
+    %own_act, %own_mix, %own_toe, %own_full = scf.if %cls_on -> (i1, i1, i1, i1) {
+      %ow1 = index.min %own_w, %c63_ow : index
+      %oo0 = index.mul %sub, %c64_ow : index
+      %oo1 = index.add %oo0, %ow1 : index
+      %oo = index.min %oo1, %c511_ow : index
+      %om = index.add %oo, %c512_ow : index
+      %ot = index.add %oo, %c1088_ow : index
+      %of = index.add %oo, %c1600_ow : index
+      %aw_ = view.load %l_view[%oo] : view<2112xi32> -> i32
+      %mw_ = view.load %l_view[%om] : view<2112xi32> -> i32
+      %tw_ = view.load %l_view[%ot] : view<2112xi32> -> i32
+      %fw_ = view.load %l_view[%of] : view<2112xi32> -> i32
+      %as_ = scalar.shrui %aw_, %own_b_i32 : i32
+      %ms_ = scalar.shrui %mw_, %own_b_i32 : i32
+      %ts_ = scalar.shrui %tw_, %own_b_i32 : i32
+      %fs_ = scalar.shrui %fw_, %own_b_i32 : i32
+      %ab_ = scalar.andi %as_, %one_i32w : i32
+      %mb_ = scalar.andi %ms_, %one_i32w : i32
+      %tb_ = scalar.andi %ts_, %one_i32w : i32
+      %fb_ = scalar.andi %fs_, %one_i32w : i32
+      %ai_ = scalar.cmpi ne, %ab_, %zero_i32w : i32
+      %mi_ = scalar.cmpi ne, %mb_, %zero_i32w : i32
+      %ti_ = scalar.cmpi ne, %tb_, %zero_i32w : i32
+      %fi_ = scalar.cmpi ne, %fb_, %zero_i32w : i32
+      scf.yield %ai_, %mi_, %ti_, %fi_ : i1, i1, i1, i1
+    } else {
+      %t_ = scalar.constant true : i1
+      %f_ = scalar.constant false : i1
+      scf.yield %t_, %t_, %f_, %f_ : i1, i1, i1, i1
+    }
+    %use_toe0 = scalar.andi %own_act, %own_toe : i1
+    %use_toe = scalar.andi %use_toe0, %toep_on : i1
+    %true_t = scalar.constant true : i1
+    %no_toe = scalar.xori %use_toe, %true_t : i1
+    %use_mask0 = scalar.andi %own_act, %own_mix : i1
+    %use_mask = scalar.andi %use_mask0, %no_toe : i1
+    %mvc0, %mvc1 = scf.if %use_toe -> (vector<8xf32>, vector<8xf32>) {
+      // Rows e - 31 + 16 m + lane_col of w times r: row 16 m + 2 i + half of product m is in element i.
+      %c31_t = scalar.constant 31 : i32
+      %c16_t = scalar.constant 16 : i32
+      %lc_t = index.cast %lane_col : index to i32
+      %e_lo = scalar.subi %e_t, %c31_t : i32
+      %wr0 = scalar.addi %e_lo, %lc_t : i32
+      %wr1 = scalar.addi %wr0, %c16_t : i32
+      %wr2 = scalar.addi %wr1, %c16_t : i32
+      // r of the row again: it does not stay in registers across the tiles.
+      %rqx = func.call @ggml_hrx_fat_load16(%rr_view, %rr_span, %rr_top, %rr_b, %rv, %one_f32) : (view<[%rr_span]xf32>, index, index, index, i1, f32) -> (vector<16xf32>)
+      %rqh = vector.fptrunc %rqx : vector<16xf32> to vector<16xf16>
+      %rf = vector.fragment<rhs> %rqh shape [%c16, %c16] : vector<16xf16>
+      %c3_t = index.constant 3 : index
+      scf.for %tm = [%c0 to %c3_t step %c1] {
+        %tm16 = index.mul %tm, %c16 : index
+        %tm16_i32 = index.cast %tm16 : index to i32
+        %wrm = scalar.addi %wr0, %tm16_i32 : i32
+        %wfm = func.call @ggml_hrx_fat_wfrag32(%t_view, %t_span, %bins_top, %w_s1, %wrm) : (view<[%t_span]xf32>, index, index, index, i32) -> (vector<16xf16>)
+        %btm = vector.mma %wfm, %rf, %init : vector<16xf16>, vector<16xf16>, vector<8xf32>
+        // The values are f16(b - s): the sum with mask 0, rounded as in the other tiles.
+        %xrb = index.add %tm16, %lane_half : index
+        %xe0 = vector.extract %btm[0] : vector<8xf32> -> f32
+        %xs0 = scalar.subf %xe0, %s_row : f32
+        %xh0 = scalar.fptrunc %xs0 : f32 to f16
+        %xrc0 = index.constant 0 : index
+        %xr0 = index.add %xrb, %xrc0 : index
+        view.store %xh0, %x_view[%xr0, %lane_col] : f16, view<48x18xf16>
+        %xe1 = vector.extract %btm[1] : vector<8xf32> -> f32
+        %xs1 = scalar.subf %xe1, %s_row : f32
+        %xh1 = scalar.fptrunc %xs1 : f32 to f16
+        %xrc1 = index.constant 2 : index
+        %xr1 = index.add %xrb, %xrc1 : index
+        view.store %xh1, %x_view[%xr1, %lane_col] : f16, view<48x18xf16>
+        %xe2 = vector.extract %btm[2] : vector<8xf32> -> f32
+        %xs2 = scalar.subf %xe2, %s_row : f32
+        %xh2 = scalar.fptrunc %xs2 : f32 to f16
+        %xrc2 = index.constant 4 : index
+        %xr2 = index.add %xrb, %xrc2 : index
+        view.store %xh2, %x_view[%xr2, %lane_col] : f16, view<48x18xf16>
+        %xe3 = vector.extract %btm[3] : vector<8xf32> -> f32
+        %xs3 = scalar.subf %xe3, %s_row : f32
+        %xh3 = scalar.fptrunc %xs3 : f32 to f16
+        %xrc3 = index.constant 6 : index
+        %xr3 = index.add %xrb, %xrc3 : index
+        view.store %xh3, %x_view[%xr3, %lane_col] : f16, view<48x18xf16>
+        %xe4 = vector.extract %btm[4] : vector<8xf32> -> f32
+        %xs4 = scalar.subf %xe4, %s_row : f32
+        %xh4 = scalar.fptrunc %xs4 : f32 to f16
+        %xrc4 = index.constant 8 : index
+        %xr4 = index.add %xrb, %xrc4 : index
+        view.store %xh4, %x_view[%xr4, %lane_col] : f16, view<48x18xf16>
+        %xe5 = vector.extract %btm[5] : vector<8xf32> -> f32
+        %xs5 = scalar.subf %xe5, %s_row : f32
+        %xh5 = scalar.fptrunc %xs5 : f32 to f16
+        %xrc5 = index.constant 10 : index
+        %xr5 = index.add %xrb, %xrc5 : index
+        view.store %xh5, %x_view[%xr5, %lane_col] : f16, view<48x18xf16>
+        %xe6 = vector.extract %btm[6] : vector<8xf32> -> f32
+        %xs6 = scalar.subf %xe6, %s_row : f32
+        %xh6 = scalar.fptrunc %xs6 : f32 to f16
+        %xrc6 = index.constant 12 : index
+        %xr6 = index.add %xrb, %xrc6 : index
+        view.store %xh6, %x_view[%xr6, %lane_col] : f16, view<48x18xf16>
+        %xe7 = vector.extract %btm[7] : vector<8xf32> -> f32
+        %xs7 = scalar.subf %xe7, %s_row : f32
+        %xh7 = scalar.fptrunc %xs7 : f32 to f16
+        %xrc7 = index.constant 14 : index
+        %xr7 = index.add %xrb, %xrc7 : index
+        view.store %xh7, %x_view[%xr7, %lane_col] : f16, view<48x18xf16>
+      }
+      kernel.barrier<workgroup> scope(subgroup) ordering(acq_rel)
+      // Key 16 kh + 2 i + half of the lane's query takes row 31 + lane_col - 16 kh - 2 i - half.
+      %yrc0_0 = index.constant 31 : index
+      %yr00_0 = index.add %yrc0_0, %lane_col : index
+      %yr0_0 = index.sub %yr00_0, %lane_half : index
+      %yh0_0 = view.load %x_view[%yr0_0, %lane_col] : view<48x18xf16> -> f16
+      %yf0_0 = scalar.extf %yh0_0 : f16 to f32
+      %yrc0_1 = index.constant 29 : index
+      %yr00_1 = index.add %yrc0_1, %lane_col : index
+      %yr0_1 = index.sub %yr00_1, %lane_half : index
+      %yh0_1 = view.load %x_view[%yr0_1, %lane_col] : view<48x18xf16> -> f16
+      %yf0_1 = scalar.extf %yh0_1 : f16 to f32
+      %yrc0_2 = index.constant 27 : index
+      %yr00_2 = index.add %yrc0_2, %lane_col : index
+      %yr0_2 = index.sub %yr00_2, %lane_half : index
+      %yh0_2 = view.load %x_view[%yr0_2, %lane_col] : view<48x18xf16> -> f16
+      %yf0_2 = scalar.extf %yh0_2 : f16 to f32
+      %yrc0_3 = index.constant 25 : index
+      %yr00_3 = index.add %yrc0_3, %lane_col : index
+      %yr0_3 = index.sub %yr00_3, %lane_half : index
+      %yh0_3 = view.load %x_view[%yr0_3, %lane_col] : view<48x18xf16> -> f16
+      %yf0_3 = scalar.extf %yh0_3 : f16 to f32
+      %yrc0_4 = index.constant 23 : index
+      %yr00_4 = index.add %yrc0_4, %lane_col : index
+      %yr0_4 = index.sub %yr00_4, %lane_half : index
+      %yh0_4 = view.load %x_view[%yr0_4, %lane_col] : view<48x18xf16> -> f16
+      %yf0_4 = scalar.extf %yh0_4 : f16 to f32
+      %yrc0_5 = index.constant 21 : index
+      %yr00_5 = index.add %yrc0_5, %lane_col : index
+      %yr0_5 = index.sub %yr00_5, %lane_half : index
+      %yh0_5 = view.load %x_view[%yr0_5, %lane_col] : view<48x18xf16> -> f16
+      %yf0_5 = scalar.extf %yh0_5 : f16 to f32
+      %yrc0_6 = index.constant 19 : index
+      %yr00_6 = index.add %yrc0_6, %lane_col : index
+      %yr0_6 = index.sub %yr00_6, %lane_half : index
+      %yh0_6 = view.load %x_view[%yr0_6, %lane_col] : view<48x18xf16> -> f16
+      %yf0_6 = scalar.extf %yh0_6 : f16 to f32
+      %yrc0_7 = index.constant 17 : index
+      %yr00_7 = index.add %yrc0_7, %lane_col : index
+      %yr0_7 = index.sub %yr00_7, %lane_half : index
+      %yh0_7 = view.load %x_view[%yr0_7, %lane_col] : view<48x18xf16> -> f16
+      %yf0_7 = scalar.extf %yh0_7 : f16 to f32
+      %bx0 = vector.from_elements %yf0_0, %yf0_1, %yf0_2, %yf0_3, %yf0_4, %yf0_5, %yf0_6, %yf0_7 : vector<8xf32>
+      %yrc1_0 = index.constant 15 : index
+      %yr01_0 = index.add %yrc1_0, %lane_col : index
+      %yr1_0 = index.sub %yr01_0, %lane_half : index
+      %yh1_0 = view.load %x_view[%yr1_0, %lane_col] : view<48x18xf16> -> f16
+      %yf1_0 = scalar.extf %yh1_0 : f16 to f32
+      %yrc1_1 = index.constant 13 : index
+      %yr01_1 = index.add %yrc1_1, %lane_col : index
+      %yr1_1 = index.sub %yr01_1, %lane_half : index
+      %yh1_1 = view.load %x_view[%yr1_1, %lane_col] : view<48x18xf16> -> f16
+      %yf1_1 = scalar.extf %yh1_1 : f16 to f32
+      %yrc1_2 = index.constant 11 : index
+      %yr01_2 = index.add %yrc1_2, %lane_col : index
+      %yr1_2 = index.sub %yr01_2, %lane_half : index
+      %yh1_2 = view.load %x_view[%yr1_2, %lane_col] : view<48x18xf16> -> f16
+      %yf1_2 = scalar.extf %yh1_2 : f16 to f32
+      %yrc1_3 = index.constant 9 : index
+      %yr01_3 = index.add %yrc1_3, %lane_col : index
+      %yr1_3 = index.sub %yr01_3, %lane_half : index
+      %yh1_3 = view.load %x_view[%yr1_3, %lane_col] : view<48x18xf16> -> f16
+      %yf1_3 = scalar.extf %yh1_3 : f16 to f32
+      %yrc1_4 = index.constant 7 : index
+      %yr01_4 = index.add %yrc1_4, %lane_col : index
+      %yr1_4 = index.sub %yr01_4, %lane_half : index
+      %yh1_4 = view.load %x_view[%yr1_4, %lane_col] : view<48x18xf16> -> f16
+      %yf1_4 = scalar.extf %yh1_4 : f16 to f32
+      %yrc1_5 = index.constant 5 : index
+      %yr01_5 = index.add %yrc1_5, %lane_col : index
+      %yr1_5 = index.sub %yr01_5, %lane_half : index
+      %yh1_5 = view.load %x_view[%yr1_5, %lane_col] : view<48x18xf16> -> f16
+      %yf1_5 = scalar.extf %yh1_5 : f16 to f32
+      %yrc1_6 = index.constant 3 : index
+      %yr01_6 = index.add %yrc1_6, %lane_col : index
+      %yr1_6 = index.sub %yr01_6, %lane_half : index
+      %yh1_6 = view.load %x_view[%yr1_6, %lane_col] : view<48x18xf16> -> f16
+      %yf1_6 = scalar.extf %yh1_6 : f16 to f32
+      %yrc1_7 = index.constant 1 : index
+      %yr01_7 = index.add %yrc1_7, %lane_col : index
+      %yr1_7 = index.sub %yr01_7, %lane_half : index
+      %yh1_7 = view.load %x_view[%yr1_7, %lane_col] : view<48x18xf16> -> f16
+      %yf1_7 = scalar.extf %yh1_7 : f16 to f32
+      %bx1 = vector.from_elements %yf1_0, %yf1_1, %yf1_2, %yf1_3, %yf1_4, %yf1_5, %yf1_6, %yf1_7 : vector<8xf32>
+      // A tile that is not full: the mask (0 or -inf) and the key range decide which keys the row sees.
+      %tv0, %tv1 = scf.if %own_full -> (vector<8xf32>, vector<8xf32>) {
+        scf.yield %bx0, %bx1 : vector<8xf32>, vector<8xf32>
+      } else {
+        %tkf0_c = index.constant 0 : index
+        %tkf0 = index.add %kb, %tkf0_c : index
+        %tmi0_0 = index.add %mb, %tkf0 : index
+        %tmi0 = index.assume %tmi0_0 [range(%tmi0_0, 0, 2147483630), multiple_of(%tmi0_0, 16), le(%tmi0_0, %m_top16)] : index
+        %tmx0 = vector.load %m_view[%tmi0] : view<[%m_span]xf16> -> vector<16xf16>
+        %tme0, %tmo0 = vector.deinterleave<0> %tmx0 : vector<16xf16> -> vector<8xf16>, vector<8xf16>
+        %tms0 = scf.select %hi_half, %tmo0, %tme0 : vector<8xf16>
+        %tmf0 = vector.extf %tms0 : vector<8xf16> to vector<8xf32>
+        %tsum0 = vector.addf %tmf0, %bx0 : vector<8xf32>
+        %tkk0_0 = index.add %kb, %ko0_0 : index
+        %tkin0_0 = index.cmp ult, %tkk0_0, %n_kv : index
+        %tkok0_0 = scalar.andi %rv, %tkin0_0 : i1
+        %tse0_0 = vector.extract %tsum0[0] : vector<8xf32> -> f32
+        %tsv0_0 = scf.select %tkok0_0, %tse0_0, %neg_large : f32
+        %tkk0_1 = index.add %kb, %ko0_1 : index
+        %tkin0_1 = index.cmp ult, %tkk0_1, %n_kv : index
+        %tkok0_1 = scalar.andi %rv, %tkin0_1 : i1
+        %tse0_1 = vector.extract %tsum0[1] : vector<8xf32> -> f32
+        %tsv0_1 = scf.select %tkok0_1, %tse0_1, %neg_large : f32
+        %tkk0_2 = index.add %kb, %ko0_2 : index
+        %tkin0_2 = index.cmp ult, %tkk0_2, %n_kv : index
+        %tkok0_2 = scalar.andi %rv, %tkin0_2 : i1
+        %tse0_2 = vector.extract %tsum0[2] : vector<8xf32> -> f32
+        %tsv0_2 = scf.select %tkok0_2, %tse0_2, %neg_large : f32
+        %tkk0_3 = index.add %kb, %ko0_3 : index
+        %tkin0_3 = index.cmp ult, %tkk0_3, %n_kv : index
+        %tkok0_3 = scalar.andi %rv, %tkin0_3 : i1
+        %tse0_3 = vector.extract %tsum0[3] : vector<8xf32> -> f32
+        %tsv0_3 = scf.select %tkok0_3, %tse0_3, %neg_large : f32
+        %tkk0_4 = index.add %kb, %ko0_4 : index
+        %tkin0_4 = index.cmp ult, %tkk0_4, %n_kv : index
+        %tkok0_4 = scalar.andi %rv, %tkin0_4 : i1
+        %tse0_4 = vector.extract %tsum0[4] : vector<8xf32> -> f32
+        %tsv0_4 = scf.select %tkok0_4, %tse0_4, %neg_large : f32
+        %tkk0_5 = index.add %kb, %ko0_5 : index
+        %tkin0_5 = index.cmp ult, %tkk0_5, %n_kv : index
+        %tkok0_5 = scalar.andi %rv, %tkin0_5 : i1
+        %tse0_5 = vector.extract %tsum0[5] : vector<8xf32> -> f32
+        %tsv0_5 = scf.select %tkok0_5, %tse0_5, %neg_large : f32
+        %tkk0_6 = index.add %kb, %ko0_6 : index
+        %tkin0_6 = index.cmp ult, %tkk0_6, %n_kv : index
+        %tkok0_6 = scalar.andi %rv, %tkin0_6 : i1
+        %tse0_6 = vector.extract %tsum0[6] : vector<8xf32> -> f32
+        %tsv0_6 = scf.select %tkok0_6, %tse0_6, %neg_large : f32
+        %tkk0_7 = index.add %kb, %ko0_7 : index
+        %tkin0_7 = index.cmp ult, %tkk0_7, %n_kv : index
+        %tkok0_7 = scalar.andi %rv, %tkin0_7 : i1
+        %tse0_7 = vector.extract %tsum0[7] : vector<8xf32> -> f32
+        %tsv0_7 = scf.select %tkok0_7, %tse0_7, %neg_large : f32
+        %tm0 = vector.from_elements %tsv0_0, %tsv0_1, %tsv0_2, %tsv0_3, %tsv0_4, %tsv0_5, %tsv0_6, %tsv0_7 : vector<8xf32>
+        %tkf1_c = index.constant 16 : index
+        %tkf1 = index.add %kb, %tkf1_c : index
+        %tmi1_0 = index.add %mb, %tkf1 : index
+        %tmi1 = index.assume %tmi1_0 [range(%tmi1_0, 0, 2147483630), multiple_of(%tmi1_0, 16), le(%tmi1_0, %m_top16)] : index
+        %tmx1 = vector.load %m_view[%tmi1] : view<[%m_span]xf16> -> vector<16xf16>
+        %tme1, %tmo1 = vector.deinterleave<0> %tmx1 : vector<16xf16> -> vector<8xf16>, vector<8xf16>
+        %tms1 = scf.select %hi_half, %tmo1, %tme1 : vector<8xf16>
+        %tmf1 = vector.extf %tms1 : vector<8xf16> to vector<8xf32>
+        %tsum1 = vector.addf %tmf1, %bx1 : vector<8xf32>
+        %tkk1_0 = index.add %kb, %ko1_0 : index
+        %tkin1_0 = index.cmp ult, %tkk1_0, %n_kv : index
+        %tkok1_0 = scalar.andi %rv, %tkin1_0 : i1
+        %tse1_0 = vector.extract %tsum1[0] : vector<8xf32> -> f32
+        %tsv1_0 = scf.select %tkok1_0, %tse1_0, %neg_large : f32
+        %tkk1_1 = index.add %kb, %ko1_1 : index
+        %tkin1_1 = index.cmp ult, %tkk1_1, %n_kv : index
+        %tkok1_1 = scalar.andi %rv, %tkin1_1 : i1
+        %tse1_1 = vector.extract %tsum1[1] : vector<8xf32> -> f32
+        %tsv1_1 = scf.select %tkok1_1, %tse1_1, %neg_large : f32
+        %tkk1_2 = index.add %kb, %ko1_2 : index
+        %tkin1_2 = index.cmp ult, %tkk1_2, %n_kv : index
+        %tkok1_2 = scalar.andi %rv, %tkin1_2 : i1
+        %tse1_2 = vector.extract %tsum1[2] : vector<8xf32> -> f32
+        %tsv1_2 = scf.select %tkok1_2, %tse1_2, %neg_large : f32
+        %tkk1_3 = index.add %kb, %ko1_3 : index
+        %tkin1_3 = index.cmp ult, %tkk1_3, %n_kv : index
+        %tkok1_3 = scalar.andi %rv, %tkin1_3 : i1
+        %tse1_3 = vector.extract %tsum1[3] : vector<8xf32> -> f32
+        %tsv1_3 = scf.select %tkok1_3, %tse1_3, %neg_large : f32
+        %tkk1_4 = index.add %kb, %ko1_4 : index
+        %tkin1_4 = index.cmp ult, %tkk1_4, %n_kv : index
+        %tkok1_4 = scalar.andi %rv, %tkin1_4 : i1
+        %tse1_4 = vector.extract %tsum1[4] : vector<8xf32> -> f32
+        %tsv1_4 = scf.select %tkok1_4, %tse1_4, %neg_large : f32
+        %tkk1_5 = index.add %kb, %ko1_5 : index
+        %tkin1_5 = index.cmp ult, %tkk1_5, %n_kv : index
+        %tkok1_5 = scalar.andi %rv, %tkin1_5 : i1
+        %tse1_5 = vector.extract %tsum1[5] : vector<8xf32> -> f32
+        %tsv1_5 = scf.select %tkok1_5, %tse1_5, %neg_large : f32
+        %tkk1_6 = index.add %kb, %ko1_6 : index
+        %tkin1_6 = index.cmp ult, %tkk1_6, %n_kv : index
+        %tkok1_6 = scalar.andi %rv, %tkin1_6 : i1
+        %tse1_6 = vector.extract %tsum1[6] : vector<8xf32> -> f32
+        %tsv1_6 = scf.select %tkok1_6, %tse1_6, %neg_large : f32
+        %tkk1_7 = index.add %kb, %ko1_7 : index
+        %tkin1_7 = index.cmp ult, %tkk1_7, %n_kv : index
+        %tkok1_7 = scalar.andi %rv, %tkin1_7 : i1
+        %tse1_7 = vector.extract %tsum1[7] : vector<8xf32> -> f32
+        %tsv1_7 = scf.select %tkok1_7, %tse1_7, %neg_large : f32
+        %tm1 = vector.from_elements %tsv1_0, %tsv1_1, %tsv1_2, %tsv1_3, %tsv1_4, %tsv1_5, %tsv1_6, %tsv1_7 : vector<8xf32>
+        scf.yield %tm0, %tm1 : vector<8xf32>, vector<8xf32>
+      }
+      scf.yield %tv0, %tv1 : vector<8xf32>, vector<8xf32>
+    } else {
+      %mvd0, %mvd1 = scf.if %use_mask -> (vector<8xf32>, vector<8xf32>) {
+        %mve0, %mve1 = scf.if %toep_on -> (vector<8xf32>, vector<8xf32>) {
+          %rqm = func.call @ggml_hrx_fat_load16(%rr_view, %rr_span, %rr_top, %rr_b, %rv, %one_f32) : (view<[%rr_span]xf32>, index, index, index, i1, f32) -> (vector<16xf32>)
+          %c8m = index.constant 8 : index
+          scf.for %me = [%c0 to %c16 step %c1] {
+            %mkh = index.div %me, %c8m : index
+            %mi = index.rem %me, %c8m : index
+            %mk0 = index.mul %mkh, %c16 : index
+            %mk1 = index.mul %mi, %c2 : index
+            %mk2 = index.add %mk0, %mk1 : index
+            %mkl = index.add %mk2, %lane_half : index
+            %mkey = index.add %kb, %mkl : index
+            %mkin = index.cmp ult, %mkey, %n_kv : index
+            %mkok = scalar.andi %rv, %mkin : i1
+            %mkc = index.min %mkey, %kv_last : index
+            %mval = scf.if %mkok -> (f32) {
+              %mmi0 = index.add %mb, %mkc : index
+              %mmi = index.assume %mmi0 [range(%mmi0, 0, 2147483646), lt(%mmi0, %m_span)] : index
+              %mmh = view.load %m_view[%mmi] : view<[%m_span]xf16> -> f16
+              %mmf = scalar.extf %mmh : f16 to f32
+              %mii0 = index.add %ib, %mkc : index
+              %mii = index.assume %mii0 [range(%mii0, 0, 2147483646), lt(%mii0, %i_span)] : index
+              %mbin = view.load %i_view[%mii] : view<[%i_span]xi32> -> i32
+              %mbv = func.call @ggml_hrx_fat_mm(%t_view, %t_span, %bins_top, %w_s1, %mbin, %rqm, %mmf, %s_row) : (view<[%t_span]xf32>, index, index, index, i32, vector<16xf32>, f32, f32) -> (f32)
+              scf.yield %mbv : f32
+            } else {
+              scf.yield %neg_large : f32
+            }
+            // f16 holds the value exactly (it is rounded to f16), -1e30 becomes -inf.
+            %mvh = scalar.fptrunc %mval : f32 to f16
+            view.store %mvh, %x_view[%mkl, %lane_col] : f16, view<48x18xf16>
+          }
+          kernel.barrier<workgroup> scope(subgroup) ordering(acq_rel)
+          %mrh0_0 = view.load %x_view[%ko0_0, %lane_col] : view<48x18xf16> -> f16
+          %mrf0_0 = scalar.extf %mrh0_0 : f16 to f32
+          %mrh0_1 = view.load %x_view[%ko0_1, %lane_col] : view<48x18xf16> -> f16
+          %mrf0_1 = scalar.extf %mrh0_1 : f16 to f32
+          %mrh0_2 = view.load %x_view[%ko0_2, %lane_col] : view<48x18xf16> -> f16
+          %mrf0_2 = scalar.extf %mrh0_2 : f16 to f32
+          %mrh0_3 = view.load %x_view[%ko0_3, %lane_col] : view<48x18xf16> -> f16
+          %mrf0_3 = scalar.extf %mrh0_3 : f16 to f32
+          %mrh0_4 = view.load %x_view[%ko0_4, %lane_col] : view<48x18xf16> -> f16
+          %mrf0_4 = scalar.extf %mrh0_4 : f16 to f32
+          %mrh0_5 = view.load %x_view[%ko0_5, %lane_col] : view<48x18xf16> -> f16
+          %mrf0_5 = scalar.extf %mrh0_5 : f16 to f32
+          %mrh0_6 = view.load %x_view[%ko0_6, %lane_col] : view<48x18xf16> -> f16
+          %mrf0_6 = scalar.extf %mrh0_6 : f16 to f32
+          %mrh0_7 = view.load %x_view[%ko0_7, %lane_col] : view<48x18xf16> -> f16
+          %mrf0_7 = scalar.extf %mrh0_7 : f16 to f32
+          %mr0 = vector.from_elements %mrf0_0, %mrf0_1, %mrf0_2, %mrf0_3, %mrf0_4, %mrf0_5, %mrf0_6, %mrf0_7 : vector<8xf32>
+          %mrh1_0 = view.load %x_view[%ko1_0, %lane_col] : view<48x18xf16> -> f16
+          %mrf1_0 = scalar.extf %mrh1_0 : f16 to f32
+          %mrh1_1 = view.load %x_view[%ko1_1, %lane_col] : view<48x18xf16> -> f16
+          %mrf1_1 = scalar.extf %mrh1_1 : f16 to f32
+          %mrh1_2 = view.load %x_view[%ko1_2, %lane_col] : view<48x18xf16> -> f16
+          %mrf1_2 = scalar.extf %mrh1_2 : f16 to f32
+          %mrh1_3 = view.load %x_view[%ko1_3, %lane_col] : view<48x18xf16> -> f16
+          %mrf1_3 = scalar.extf %mrh1_3 : f16 to f32
+          %mrh1_4 = view.load %x_view[%ko1_4, %lane_col] : view<48x18xf16> -> f16
+          %mrf1_4 = scalar.extf %mrh1_4 : f16 to f32
+          %mrh1_5 = view.load %x_view[%ko1_5, %lane_col] : view<48x18xf16> -> f16
+          %mrf1_5 = scalar.extf %mrh1_5 : f16 to f32
+          %mrh1_6 = view.load %x_view[%ko1_6, %lane_col] : view<48x18xf16> -> f16
+          %mrf1_6 = scalar.extf %mrh1_6 : f16 to f32
+          %mrh1_7 = view.load %x_view[%ko1_7, %lane_col] : view<48x18xf16> -> f16
+          %mrf1_7 = scalar.extf %mrh1_7 : f16 to f32
+          %mr1 = vector.from_elements %mrf1_0, %mrf1_1, %mrf1_2, %mrf1_3, %mrf1_4, %mrf1_5, %mrf1_6, %mrf1_7 : vector<8xf32>
+          scf.yield %mr0, %mr1 : vector<8xf32>, vector<8xf32>
+        } else {
+          // r of the row again: it does not stay in registers across the tiles.
+          %rqt = scf.if %bmm_on -> (vector<16xf32>) {
+            %rqt16 = func.call @ggml_hrx_fat_load16(%rr_view, %rr_span, %rr_top, %rr_b, %rv, %one_f32) : (view<[%rr_span]xf32>, index, index, index, i1, f32) -> (vector<16xf32>)
+            scf.yield %rqt16 : vector<16xf32>
+          } else {
+            scf.yield %zero16f : vector<16xf32>
+          }
+          // Mask and bias of the lane's keys.
+          %kk0_0 = index.add %kb, %ko0_0 : index
+          %kin0_0 = index.cmp ult, %kk0_0, %n_kv : index
+          %kok0_0 = scalar.andi %rv, %kin0_0 : i1
+          %kk0_1 = index.add %kb, %ko0_1 : index
+          %kin0_1 = index.cmp ult, %kk0_1, %n_kv : index
+          %kok0_1 = scalar.andi %rv, %kin0_1 : i1
+          %kk0_2 = index.add %kb, %ko0_2 : index
+          %kin0_2 = index.cmp ult, %kk0_2, %n_kv : index
+          %kok0_2 = scalar.andi %rv, %kin0_2 : i1
+          %kk0_3 = index.add %kb, %ko0_3 : index
+          %kin0_3 = index.cmp ult, %kk0_3, %n_kv : index
+          %kok0_3 = scalar.andi %rv, %kin0_3 : i1
+          %kk0_4 = index.add %kb, %ko0_4 : index
+          %kin0_4 = index.cmp ult, %kk0_4, %n_kv : index
+          %kok0_4 = scalar.andi %rv, %kin0_4 : i1
+          %kk0_5 = index.add %kb, %ko0_5 : index
+          %kin0_5 = index.cmp ult, %kk0_5, %n_kv : index
+          %kok0_5 = scalar.andi %rv, %kin0_5 : i1
+          %kk0_6 = index.add %kb, %ko0_6 : index
+          %kin0_6 = index.cmp ult, %kk0_6, %n_kv : index
+          %kok0_6 = scalar.andi %rv, %kin0_6 : i1
+          %kk0_7 = index.add %kb, %ko0_7 : index
+          %kin0_7 = index.cmp ult, %kk0_7, %n_kv : index
+          %kok0_7 = scalar.andi %rv, %kin0_7 : i1
+          %mv0 = scf.if %vec_on -> (vector<8xf32>) {
+            %kf0_c = index.constant 0 : index
+            %kf0 = index.add %kb, %kf0_c : index
+            %mm0 = scf.if %mask_on -> (vector<8xf32>) {
+              %mi0_0 = index.add %mb, %kf0 : index
+              %mi0 = index.assume %mi0_0 [range(%mi0_0, 0, 2147483630), multiple_of(%mi0_0, 16), le(%mi0_0, %m_top16)] : index
+              %mx0 = vector.load %m_view[%mi0] : view<[%m_span]xf16> -> vector<16xf16>
+              %me0, %mo0 = vector.deinterleave<0> %mx0 : vector<16xf16> -> vector<8xf16>, vector<8xf16>
+              %ms0 = scf.select %hi_half, %mo0, %me0 : vector<8xf16>
+              %mf0 = vector.extf %ms0 : vector<8xf16> to vector<8xf32>
+              scf.yield %mf0 : vector<8xf32>
+            } else {
+              scf.yield %zero8 : vector<8xf32>
+            }
+            %mb0 = scf.if %bias_on -> (vector<8xf32>) {
+              %ii0_0 = index.add %ib, %kf0 : index
+              %ii0 = index.assume %ii0_0 [range(%ii0_0, 0, 2147483630), multiple_of(%ii0_0, 16), le(%ii0_0, %i_top16)] : index
+              %ix0 = vector.load %i_view[%ii0] : view<[%i_span]xi32> -> vector<16xi32>
+              %ie0, %io0 = vector.deinterleave<0> %ix0 : vector<16xi32> -> vector<8xi32>, vector<8xi32>
+              %is0 = scf.select %hi_half, %io0, %ie0 : vector<8xi32>
+              %bm0_0 = vector.extract %mm0[0] : vector<8xf32> -> f32
+              %bi0_0 = vector.extract %is0[0] : vector<8xi32> -> i32
+              %bv0_0 = scf.if %bmm_on -> (f32) {
+                %bvm0_0 = func.call @ggml_hrx_fat_mm(%t_view, %t_span, %bins_top, %w_s1, %bi0_0, %rqt, %bm0_0, %s_row) : (view<[%t_span]xf32>, index, index, index, i32, vector<16xf32>, f32, f32) -> (f32)
+                scf.yield %bvm0_0 : f32
+              } else {
+                %bvt0_0 = func.call @ggml_hrx_fat_table(%t_view, %t_span, %bins_top, %tb, %bi0_0, %bm0_0, %s_row) : (view<[%t_span]xf32>, index, index, index, i32, f32, f32) -> (f32)
+                scf.yield %bvt0_0 : f32
+              }
+              %bm0_1 = vector.extract %mm0[1] : vector<8xf32> -> f32
+              %bi0_1 = vector.extract %is0[1] : vector<8xi32> -> i32
+              %bv0_1 = scf.if %bmm_on -> (f32) {
+                %bvm0_1 = func.call @ggml_hrx_fat_mm(%t_view, %t_span, %bins_top, %w_s1, %bi0_1, %rqt, %bm0_1, %s_row) : (view<[%t_span]xf32>, index, index, index, i32, vector<16xf32>, f32, f32) -> (f32)
+                scf.yield %bvm0_1 : f32
+              } else {
+                %bvt0_1 = func.call @ggml_hrx_fat_table(%t_view, %t_span, %bins_top, %tb, %bi0_1, %bm0_1, %s_row) : (view<[%t_span]xf32>, index, index, index, i32, f32, f32) -> (f32)
+                scf.yield %bvt0_1 : f32
+              }
+              %bm0_2 = vector.extract %mm0[2] : vector<8xf32> -> f32
+              %bi0_2 = vector.extract %is0[2] : vector<8xi32> -> i32
+              %bv0_2 = scf.if %bmm_on -> (f32) {
+                %bvm0_2 = func.call @ggml_hrx_fat_mm(%t_view, %t_span, %bins_top, %w_s1, %bi0_2, %rqt, %bm0_2, %s_row) : (view<[%t_span]xf32>, index, index, index, i32, vector<16xf32>, f32, f32) -> (f32)
+                scf.yield %bvm0_2 : f32
+              } else {
+                %bvt0_2 = func.call @ggml_hrx_fat_table(%t_view, %t_span, %bins_top, %tb, %bi0_2, %bm0_2, %s_row) : (view<[%t_span]xf32>, index, index, index, i32, f32, f32) -> (f32)
+                scf.yield %bvt0_2 : f32
+              }
+              %bm0_3 = vector.extract %mm0[3] : vector<8xf32> -> f32
+              %bi0_3 = vector.extract %is0[3] : vector<8xi32> -> i32
+              %bv0_3 = scf.if %bmm_on -> (f32) {
+                %bvm0_3 = func.call @ggml_hrx_fat_mm(%t_view, %t_span, %bins_top, %w_s1, %bi0_3, %rqt, %bm0_3, %s_row) : (view<[%t_span]xf32>, index, index, index, i32, vector<16xf32>, f32, f32) -> (f32)
+                scf.yield %bvm0_3 : f32
+              } else {
+                %bvt0_3 = func.call @ggml_hrx_fat_table(%t_view, %t_span, %bins_top, %tb, %bi0_3, %bm0_3, %s_row) : (view<[%t_span]xf32>, index, index, index, i32, f32, f32) -> (f32)
+                scf.yield %bvt0_3 : f32
+              }
+              %bm0_4 = vector.extract %mm0[4] : vector<8xf32> -> f32
+              %bi0_4 = vector.extract %is0[4] : vector<8xi32> -> i32
+              %bv0_4 = scf.if %bmm_on -> (f32) {
+                %bvm0_4 = func.call @ggml_hrx_fat_mm(%t_view, %t_span, %bins_top, %w_s1, %bi0_4, %rqt, %bm0_4, %s_row) : (view<[%t_span]xf32>, index, index, index, i32, vector<16xf32>, f32, f32) -> (f32)
+                scf.yield %bvm0_4 : f32
+              } else {
+                %bvt0_4 = func.call @ggml_hrx_fat_table(%t_view, %t_span, %bins_top, %tb, %bi0_4, %bm0_4, %s_row) : (view<[%t_span]xf32>, index, index, index, i32, f32, f32) -> (f32)
+                scf.yield %bvt0_4 : f32
+              }
+              %bm0_5 = vector.extract %mm0[5] : vector<8xf32> -> f32
+              %bi0_5 = vector.extract %is0[5] : vector<8xi32> -> i32
+              %bv0_5 = scf.if %bmm_on -> (f32) {
+                %bvm0_5 = func.call @ggml_hrx_fat_mm(%t_view, %t_span, %bins_top, %w_s1, %bi0_5, %rqt, %bm0_5, %s_row) : (view<[%t_span]xf32>, index, index, index, i32, vector<16xf32>, f32, f32) -> (f32)
+                scf.yield %bvm0_5 : f32
+              } else {
+                %bvt0_5 = func.call @ggml_hrx_fat_table(%t_view, %t_span, %bins_top, %tb, %bi0_5, %bm0_5, %s_row) : (view<[%t_span]xf32>, index, index, index, i32, f32, f32) -> (f32)
+                scf.yield %bvt0_5 : f32
+              }
+              %bm0_6 = vector.extract %mm0[6] : vector<8xf32> -> f32
+              %bi0_6 = vector.extract %is0[6] : vector<8xi32> -> i32
+              %bv0_6 = scf.if %bmm_on -> (f32) {
+                %bvm0_6 = func.call @ggml_hrx_fat_mm(%t_view, %t_span, %bins_top, %w_s1, %bi0_6, %rqt, %bm0_6, %s_row) : (view<[%t_span]xf32>, index, index, index, i32, vector<16xf32>, f32, f32) -> (f32)
+                scf.yield %bvm0_6 : f32
+              } else {
+                %bvt0_6 = func.call @ggml_hrx_fat_table(%t_view, %t_span, %bins_top, %tb, %bi0_6, %bm0_6, %s_row) : (view<[%t_span]xf32>, index, index, index, i32, f32, f32) -> (f32)
+                scf.yield %bvt0_6 : f32
+              }
+              %bm0_7 = vector.extract %mm0[7] : vector<8xf32> -> f32
+              %bi0_7 = vector.extract %is0[7] : vector<8xi32> -> i32
+              %bv0_7 = scf.if %bmm_on -> (f32) {
+                %bvm0_7 = func.call @ggml_hrx_fat_mm(%t_view, %t_span, %bins_top, %w_s1, %bi0_7, %rqt, %bm0_7, %s_row) : (view<[%t_span]xf32>, index, index, index, i32, vector<16xf32>, f32, f32) -> (f32)
+                scf.yield %bvm0_7 : f32
+              } else {
+                %bvt0_7 = func.call @ggml_hrx_fat_table(%t_view, %t_span, %bins_top, %tb, %bi0_7, %bm0_7, %s_row) : (view<[%t_span]xf32>, index, index, index, i32, f32, f32) -> (f32)
+                scf.yield %bvt0_7 : f32
+              }
+              %bvv0 = vector.from_elements %bv0_0, %bv0_1, %bv0_2, %bv0_3, %bv0_4, %bv0_5, %bv0_6, %bv0_7 : vector<8xf32>
+              scf.yield %bvv0 : vector<8xf32>
+            } else {
+              scf.yield %mm0 : vector<8xf32>
+            }
+            %vb0_0 = vector.extract %mb0[0] : vector<8xf32> -> f32
+            %vr0_0 = scf.select %kok0_0, %vb0_0, %neg_large : f32
+            %vb0_1 = vector.extract %mb0[1] : vector<8xf32> -> f32
+            %vr0_1 = scf.select %kok0_1, %vb0_1, %neg_large : f32
+            %vb0_2 = vector.extract %mb0[2] : vector<8xf32> -> f32
+            %vr0_2 = scf.select %kok0_2, %vb0_2, %neg_large : f32
+            %vb0_3 = vector.extract %mb0[3] : vector<8xf32> -> f32
+            %vr0_3 = scf.select %kok0_3, %vb0_3, %neg_large : f32
+            %vb0_4 = vector.extract %mb0[4] : vector<8xf32> -> f32
+            %vr0_4 = scf.select %kok0_4, %vb0_4, %neg_large : f32
+            %vb0_5 = vector.extract %mb0[5] : vector<8xf32> -> f32
+            %vr0_5 = scf.select %kok0_5, %vb0_5, %neg_large : f32
+            %vb0_6 = vector.extract %mb0[6] : vector<8xf32> -> f32
+            %vr0_6 = scf.select %kok0_6, %vb0_6, %neg_large : f32
+            %vb0_7 = vector.extract %mb0[7] : vector<8xf32> -> f32
+            %vr0_7 = scf.select %kok0_7, %vb0_7, %neg_large : f32
+            %vrv0 = vector.from_elements %vr0_0, %vr0_1, %vr0_2, %vr0_3, %vr0_4, %vr0_5, %vr0_6, %vr0_7 : vector<8xf32>
+            scf.yield %vrv0 : vector<8xf32>
+          } else {
+            %kc0_0 = index.min %kk0_0, %kv_last : index
+            %mk0_0 = func.call @ggml_hrx_fat_key(%m_view, %m_span, %i_view, %i_span, %t_view, %t_span, %mask_on, %bias_on, %bins_top, %mb, %ib, %tb, %kc0_0, %kok0_0, %s_row) : (view<[%m_span]xf16>, index, view<[%i_span]xi32>, index, view<[%t_span]xf32>, index, i1, i1, index, index, index, index, index, i1, f32) -> (f32)
+            %kc0_1 = index.min %kk0_1, %kv_last : index
+            %mk0_1 = func.call @ggml_hrx_fat_key(%m_view, %m_span, %i_view, %i_span, %t_view, %t_span, %mask_on, %bias_on, %bins_top, %mb, %ib, %tb, %kc0_1, %kok0_1, %s_row) : (view<[%m_span]xf16>, index, view<[%i_span]xi32>, index, view<[%t_span]xf32>, index, i1, i1, index, index, index, index, index, i1, f32) -> (f32)
+            %kc0_2 = index.min %kk0_2, %kv_last : index
+            %mk0_2 = func.call @ggml_hrx_fat_key(%m_view, %m_span, %i_view, %i_span, %t_view, %t_span, %mask_on, %bias_on, %bins_top, %mb, %ib, %tb, %kc0_2, %kok0_2, %s_row) : (view<[%m_span]xf16>, index, view<[%i_span]xi32>, index, view<[%t_span]xf32>, index, i1, i1, index, index, index, index, index, i1, f32) -> (f32)
+            %kc0_3 = index.min %kk0_3, %kv_last : index
+            %mk0_3 = func.call @ggml_hrx_fat_key(%m_view, %m_span, %i_view, %i_span, %t_view, %t_span, %mask_on, %bias_on, %bins_top, %mb, %ib, %tb, %kc0_3, %kok0_3, %s_row) : (view<[%m_span]xf16>, index, view<[%i_span]xi32>, index, view<[%t_span]xf32>, index, i1, i1, index, index, index, index, index, i1, f32) -> (f32)
+            %kc0_4 = index.min %kk0_4, %kv_last : index
+            %mk0_4 = func.call @ggml_hrx_fat_key(%m_view, %m_span, %i_view, %i_span, %t_view, %t_span, %mask_on, %bias_on, %bins_top, %mb, %ib, %tb, %kc0_4, %kok0_4, %s_row) : (view<[%m_span]xf16>, index, view<[%i_span]xi32>, index, view<[%t_span]xf32>, index, i1, i1, index, index, index, index, index, i1, f32) -> (f32)
+            %kc0_5 = index.min %kk0_5, %kv_last : index
+            %mk0_5 = func.call @ggml_hrx_fat_key(%m_view, %m_span, %i_view, %i_span, %t_view, %t_span, %mask_on, %bias_on, %bins_top, %mb, %ib, %tb, %kc0_5, %kok0_5, %s_row) : (view<[%m_span]xf16>, index, view<[%i_span]xi32>, index, view<[%t_span]xf32>, index, i1, i1, index, index, index, index, index, i1, f32) -> (f32)
+            %kc0_6 = index.min %kk0_6, %kv_last : index
+            %mk0_6 = func.call @ggml_hrx_fat_key(%m_view, %m_span, %i_view, %i_span, %t_view, %t_span, %mask_on, %bias_on, %bins_top, %mb, %ib, %tb, %kc0_6, %kok0_6, %s_row) : (view<[%m_span]xf16>, index, view<[%i_span]xi32>, index, view<[%t_span]xf32>, index, i1, i1, index, index, index, index, index, i1, f32) -> (f32)
+            %kc0_7 = index.min %kk0_7, %kv_last : index
+            %mk0_7 = func.call @ggml_hrx_fat_key(%m_view, %m_span, %i_view, %i_span, %t_view, %t_span, %mask_on, %bias_on, %bins_top, %mb, %ib, %tb, %kc0_7, %kok0_7, %s_row) : (view<[%m_span]xf16>, index, view<[%i_span]xi32>, index, view<[%t_span]xf32>, index, i1, i1, index, index, index, index, index, i1, f32) -> (f32)
+            %mks0 = vector.from_elements %mk0_0, %mk0_1, %mk0_2, %mk0_3, %mk0_4, %mk0_5, %mk0_6, %mk0_7 : vector<8xf32>
+            scf.yield %mks0 : vector<8xf32>
+          }
+          %kk1_0 = index.add %kb, %ko1_0 : index
+          %kin1_0 = index.cmp ult, %kk1_0, %n_kv : index
+          %kok1_0 = scalar.andi %rv, %kin1_0 : i1
+          %kk1_1 = index.add %kb, %ko1_1 : index
+          %kin1_1 = index.cmp ult, %kk1_1, %n_kv : index
+          %kok1_1 = scalar.andi %rv, %kin1_1 : i1
+          %kk1_2 = index.add %kb, %ko1_2 : index
+          %kin1_2 = index.cmp ult, %kk1_2, %n_kv : index
+          %kok1_2 = scalar.andi %rv, %kin1_2 : i1
+          %kk1_3 = index.add %kb, %ko1_3 : index
+          %kin1_3 = index.cmp ult, %kk1_3, %n_kv : index
+          %kok1_3 = scalar.andi %rv, %kin1_3 : i1
+          %kk1_4 = index.add %kb, %ko1_4 : index
+          %kin1_4 = index.cmp ult, %kk1_4, %n_kv : index
+          %kok1_4 = scalar.andi %rv, %kin1_4 : i1
+          %kk1_5 = index.add %kb, %ko1_5 : index
+          %kin1_5 = index.cmp ult, %kk1_5, %n_kv : index
+          %kok1_5 = scalar.andi %rv, %kin1_5 : i1
+          %kk1_6 = index.add %kb, %ko1_6 : index
+          %kin1_6 = index.cmp ult, %kk1_6, %n_kv : index
+          %kok1_6 = scalar.andi %rv, %kin1_6 : i1
+          %kk1_7 = index.add %kb, %ko1_7 : index
+          %kin1_7 = index.cmp ult, %kk1_7, %n_kv : index
+          %kok1_7 = scalar.andi %rv, %kin1_7 : i1
+          %mv1 = scf.if %vec_on -> (vector<8xf32>) {
+            %kf1_c = index.constant 16 : index
+            %kf1 = index.add %kb, %kf1_c : index
+            %mm1 = scf.if %mask_on -> (vector<8xf32>) {
+              %mi1_0 = index.add %mb, %kf1 : index
+              %mi1 = index.assume %mi1_0 [range(%mi1_0, 0, 2147483630), multiple_of(%mi1_0, 16), le(%mi1_0, %m_top16)] : index
+              %mx1 = vector.load %m_view[%mi1] : view<[%m_span]xf16> -> vector<16xf16>
+              %me1, %mo1 = vector.deinterleave<0> %mx1 : vector<16xf16> -> vector<8xf16>, vector<8xf16>
+              %ms1 = scf.select %hi_half, %mo1, %me1 : vector<8xf16>
+              %mf1 = vector.extf %ms1 : vector<8xf16> to vector<8xf32>
+              scf.yield %mf1 : vector<8xf32>
+            } else {
+              scf.yield %zero8 : vector<8xf32>
+            }
+            %mb1 = scf.if %bias_on -> (vector<8xf32>) {
+              %ii1_0 = index.add %ib, %kf1 : index
+              %ii1 = index.assume %ii1_0 [range(%ii1_0, 0, 2147483630), multiple_of(%ii1_0, 16), le(%ii1_0, %i_top16)] : index
+              %ix1 = vector.load %i_view[%ii1] : view<[%i_span]xi32> -> vector<16xi32>
+              %ie1, %io1 = vector.deinterleave<0> %ix1 : vector<16xi32> -> vector<8xi32>, vector<8xi32>
+              %is1 = scf.select %hi_half, %io1, %ie1 : vector<8xi32>
+              %bm1_0 = vector.extract %mm1[0] : vector<8xf32> -> f32
+              %bi1_0 = vector.extract %is1[0] : vector<8xi32> -> i32
+              %bv1_0 = scf.if %bmm_on -> (f32) {
+                %bvm1_0 = func.call @ggml_hrx_fat_mm(%t_view, %t_span, %bins_top, %w_s1, %bi1_0, %rqt, %bm1_0, %s_row) : (view<[%t_span]xf32>, index, index, index, i32, vector<16xf32>, f32, f32) -> (f32)
+                scf.yield %bvm1_0 : f32
+              } else {
+                %bvt1_0 = func.call @ggml_hrx_fat_table(%t_view, %t_span, %bins_top, %tb, %bi1_0, %bm1_0, %s_row) : (view<[%t_span]xf32>, index, index, index, i32, f32, f32) -> (f32)
+                scf.yield %bvt1_0 : f32
+              }
+              %bm1_1 = vector.extract %mm1[1] : vector<8xf32> -> f32
+              %bi1_1 = vector.extract %is1[1] : vector<8xi32> -> i32
+              %bv1_1 = scf.if %bmm_on -> (f32) {
+                %bvm1_1 = func.call @ggml_hrx_fat_mm(%t_view, %t_span, %bins_top, %w_s1, %bi1_1, %rqt, %bm1_1, %s_row) : (view<[%t_span]xf32>, index, index, index, i32, vector<16xf32>, f32, f32) -> (f32)
+                scf.yield %bvm1_1 : f32
+              } else {
+                %bvt1_1 = func.call @ggml_hrx_fat_table(%t_view, %t_span, %bins_top, %tb, %bi1_1, %bm1_1, %s_row) : (view<[%t_span]xf32>, index, index, index, i32, f32, f32) -> (f32)
+                scf.yield %bvt1_1 : f32
+              }
+              %bm1_2 = vector.extract %mm1[2] : vector<8xf32> -> f32
+              %bi1_2 = vector.extract %is1[2] : vector<8xi32> -> i32
+              %bv1_2 = scf.if %bmm_on -> (f32) {
+                %bvm1_2 = func.call @ggml_hrx_fat_mm(%t_view, %t_span, %bins_top, %w_s1, %bi1_2, %rqt, %bm1_2, %s_row) : (view<[%t_span]xf32>, index, index, index, i32, vector<16xf32>, f32, f32) -> (f32)
+                scf.yield %bvm1_2 : f32
+              } else {
+                %bvt1_2 = func.call @ggml_hrx_fat_table(%t_view, %t_span, %bins_top, %tb, %bi1_2, %bm1_2, %s_row) : (view<[%t_span]xf32>, index, index, index, i32, f32, f32) -> (f32)
+                scf.yield %bvt1_2 : f32
+              }
+              %bm1_3 = vector.extract %mm1[3] : vector<8xf32> -> f32
+              %bi1_3 = vector.extract %is1[3] : vector<8xi32> -> i32
+              %bv1_3 = scf.if %bmm_on -> (f32) {
+                %bvm1_3 = func.call @ggml_hrx_fat_mm(%t_view, %t_span, %bins_top, %w_s1, %bi1_3, %rqt, %bm1_3, %s_row) : (view<[%t_span]xf32>, index, index, index, i32, vector<16xf32>, f32, f32) -> (f32)
+                scf.yield %bvm1_3 : f32
+              } else {
+                %bvt1_3 = func.call @ggml_hrx_fat_table(%t_view, %t_span, %bins_top, %tb, %bi1_3, %bm1_3, %s_row) : (view<[%t_span]xf32>, index, index, index, i32, f32, f32) -> (f32)
+                scf.yield %bvt1_3 : f32
+              }
+              %bm1_4 = vector.extract %mm1[4] : vector<8xf32> -> f32
+              %bi1_4 = vector.extract %is1[4] : vector<8xi32> -> i32
+              %bv1_4 = scf.if %bmm_on -> (f32) {
+                %bvm1_4 = func.call @ggml_hrx_fat_mm(%t_view, %t_span, %bins_top, %w_s1, %bi1_4, %rqt, %bm1_4, %s_row) : (view<[%t_span]xf32>, index, index, index, i32, vector<16xf32>, f32, f32) -> (f32)
+                scf.yield %bvm1_4 : f32
+              } else {
+                %bvt1_4 = func.call @ggml_hrx_fat_table(%t_view, %t_span, %bins_top, %tb, %bi1_4, %bm1_4, %s_row) : (view<[%t_span]xf32>, index, index, index, i32, f32, f32) -> (f32)
+                scf.yield %bvt1_4 : f32
+              }
+              %bm1_5 = vector.extract %mm1[5] : vector<8xf32> -> f32
+              %bi1_5 = vector.extract %is1[5] : vector<8xi32> -> i32
+              %bv1_5 = scf.if %bmm_on -> (f32) {
+                %bvm1_5 = func.call @ggml_hrx_fat_mm(%t_view, %t_span, %bins_top, %w_s1, %bi1_5, %rqt, %bm1_5, %s_row) : (view<[%t_span]xf32>, index, index, index, i32, vector<16xf32>, f32, f32) -> (f32)
+                scf.yield %bvm1_5 : f32
+              } else {
+                %bvt1_5 = func.call @ggml_hrx_fat_table(%t_view, %t_span, %bins_top, %tb, %bi1_5, %bm1_5, %s_row) : (view<[%t_span]xf32>, index, index, index, i32, f32, f32) -> (f32)
+                scf.yield %bvt1_5 : f32
+              }
+              %bm1_6 = vector.extract %mm1[6] : vector<8xf32> -> f32
+              %bi1_6 = vector.extract %is1[6] : vector<8xi32> -> i32
+              %bv1_6 = scf.if %bmm_on -> (f32) {
+                %bvm1_6 = func.call @ggml_hrx_fat_mm(%t_view, %t_span, %bins_top, %w_s1, %bi1_6, %rqt, %bm1_6, %s_row) : (view<[%t_span]xf32>, index, index, index, i32, vector<16xf32>, f32, f32) -> (f32)
+                scf.yield %bvm1_6 : f32
+              } else {
+                %bvt1_6 = func.call @ggml_hrx_fat_table(%t_view, %t_span, %bins_top, %tb, %bi1_6, %bm1_6, %s_row) : (view<[%t_span]xf32>, index, index, index, i32, f32, f32) -> (f32)
+                scf.yield %bvt1_6 : f32
+              }
+              %bm1_7 = vector.extract %mm1[7] : vector<8xf32> -> f32
+              %bi1_7 = vector.extract %is1[7] : vector<8xi32> -> i32
+              %bv1_7 = scf.if %bmm_on -> (f32) {
+                %bvm1_7 = func.call @ggml_hrx_fat_mm(%t_view, %t_span, %bins_top, %w_s1, %bi1_7, %rqt, %bm1_7, %s_row) : (view<[%t_span]xf32>, index, index, index, i32, vector<16xf32>, f32, f32) -> (f32)
+                scf.yield %bvm1_7 : f32
+              } else {
+                %bvt1_7 = func.call @ggml_hrx_fat_table(%t_view, %t_span, %bins_top, %tb, %bi1_7, %bm1_7, %s_row) : (view<[%t_span]xf32>, index, index, index, i32, f32, f32) -> (f32)
+                scf.yield %bvt1_7 : f32
+              }
+              %bvv1 = vector.from_elements %bv1_0, %bv1_1, %bv1_2, %bv1_3, %bv1_4, %bv1_5, %bv1_6, %bv1_7 : vector<8xf32>
+              scf.yield %bvv1 : vector<8xf32>
+            } else {
+              scf.yield %mm1 : vector<8xf32>
+            }
+            %vb1_0 = vector.extract %mb1[0] : vector<8xf32> -> f32
+            %vr1_0 = scf.select %kok1_0, %vb1_0, %neg_large : f32
+            %vb1_1 = vector.extract %mb1[1] : vector<8xf32> -> f32
+            %vr1_1 = scf.select %kok1_1, %vb1_1, %neg_large : f32
+            %vb1_2 = vector.extract %mb1[2] : vector<8xf32> -> f32
+            %vr1_2 = scf.select %kok1_2, %vb1_2, %neg_large : f32
+            %vb1_3 = vector.extract %mb1[3] : vector<8xf32> -> f32
+            %vr1_3 = scf.select %kok1_3, %vb1_3, %neg_large : f32
+            %vb1_4 = vector.extract %mb1[4] : vector<8xf32> -> f32
+            %vr1_4 = scf.select %kok1_4, %vb1_4, %neg_large : f32
+            %vb1_5 = vector.extract %mb1[5] : vector<8xf32> -> f32
+            %vr1_5 = scf.select %kok1_5, %vb1_5, %neg_large : f32
+            %vb1_6 = vector.extract %mb1[6] : vector<8xf32> -> f32
+            %vr1_6 = scf.select %kok1_6, %vb1_6, %neg_large : f32
+            %vb1_7 = vector.extract %mb1[7] : vector<8xf32> -> f32
+            %vr1_7 = scf.select %kok1_7, %vb1_7, %neg_large : f32
+            %vrv1 = vector.from_elements %vr1_0, %vr1_1, %vr1_2, %vr1_3, %vr1_4, %vr1_5, %vr1_6, %vr1_7 : vector<8xf32>
+            scf.yield %vrv1 : vector<8xf32>
+          } else {
+            %kc1_0 = index.min %kk1_0, %kv_last : index
+            %mk1_0 = func.call @ggml_hrx_fat_key(%m_view, %m_span, %i_view, %i_span, %t_view, %t_span, %mask_on, %bias_on, %bins_top, %mb, %ib, %tb, %kc1_0, %kok1_0, %s_row) : (view<[%m_span]xf16>, index, view<[%i_span]xi32>, index, view<[%t_span]xf32>, index, i1, i1, index, index, index, index, index, i1, f32) -> (f32)
+            %kc1_1 = index.min %kk1_1, %kv_last : index
+            %mk1_1 = func.call @ggml_hrx_fat_key(%m_view, %m_span, %i_view, %i_span, %t_view, %t_span, %mask_on, %bias_on, %bins_top, %mb, %ib, %tb, %kc1_1, %kok1_1, %s_row) : (view<[%m_span]xf16>, index, view<[%i_span]xi32>, index, view<[%t_span]xf32>, index, i1, i1, index, index, index, index, index, i1, f32) -> (f32)
+            %kc1_2 = index.min %kk1_2, %kv_last : index
+            %mk1_2 = func.call @ggml_hrx_fat_key(%m_view, %m_span, %i_view, %i_span, %t_view, %t_span, %mask_on, %bias_on, %bins_top, %mb, %ib, %tb, %kc1_2, %kok1_2, %s_row) : (view<[%m_span]xf16>, index, view<[%i_span]xi32>, index, view<[%t_span]xf32>, index, i1, i1, index, index, index, index, index, i1, f32) -> (f32)
+            %kc1_3 = index.min %kk1_3, %kv_last : index
+            %mk1_3 = func.call @ggml_hrx_fat_key(%m_view, %m_span, %i_view, %i_span, %t_view, %t_span, %mask_on, %bias_on, %bins_top, %mb, %ib, %tb, %kc1_3, %kok1_3, %s_row) : (view<[%m_span]xf16>, index, view<[%i_span]xi32>, index, view<[%t_span]xf32>, index, i1, i1, index, index, index, index, index, i1, f32) -> (f32)
+            %kc1_4 = index.min %kk1_4, %kv_last : index
+            %mk1_4 = func.call @ggml_hrx_fat_key(%m_view, %m_span, %i_view, %i_span, %t_view, %t_span, %mask_on, %bias_on, %bins_top, %mb, %ib, %tb, %kc1_4, %kok1_4, %s_row) : (view<[%m_span]xf16>, index, view<[%i_span]xi32>, index, view<[%t_span]xf32>, index, i1, i1, index, index, index, index, index, i1, f32) -> (f32)
+            %kc1_5 = index.min %kk1_5, %kv_last : index
+            %mk1_5 = func.call @ggml_hrx_fat_key(%m_view, %m_span, %i_view, %i_span, %t_view, %t_span, %mask_on, %bias_on, %bins_top, %mb, %ib, %tb, %kc1_5, %kok1_5, %s_row) : (view<[%m_span]xf16>, index, view<[%i_span]xi32>, index, view<[%t_span]xf32>, index, i1, i1, index, index, index, index, index, i1, f32) -> (f32)
+            %kc1_6 = index.min %kk1_6, %kv_last : index
+            %mk1_6 = func.call @ggml_hrx_fat_key(%m_view, %m_span, %i_view, %i_span, %t_view, %t_span, %mask_on, %bias_on, %bins_top, %mb, %ib, %tb, %kc1_6, %kok1_6, %s_row) : (view<[%m_span]xf16>, index, view<[%i_span]xi32>, index, view<[%t_span]xf32>, index, i1, i1, index, index, index, index, index, i1, f32) -> (f32)
+            %kc1_7 = index.min %kk1_7, %kv_last : index
+            %mk1_7 = func.call @ggml_hrx_fat_key(%m_view, %m_span, %i_view, %i_span, %t_view, %t_span, %mask_on, %bias_on, %bins_top, %mb, %ib, %tb, %kc1_7, %kok1_7, %s_row) : (view<[%m_span]xf16>, index, view<[%i_span]xi32>, index, view<[%t_span]xf32>, index, i1, i1, index, index, index, index, index, i1, f32) -> (f32)
+            %mks1 = vector.from_elements %mk1_0, %mk1_1, %mk1_2, %mk1_3, %mk1_4, %mk1_5, %mk1_6, %mk1_7 : vector<8xf32>
+            scf.yield %mks1 : vector<8xf32>
+          }
+          scf.yield %mv0, %mv1 : vector<8xf32>, vector<8xf32>
+        }
+        scf.yield %mve0, %mve1 : vector<8xf32>, vector<8xf32>
+      } else {
+        %crow_a = scf.select %own_act, %crow, %neg_large : f32
+        %crow8p = vector.splat %crow_a : vector<8xf32>
+        scf.yield %crow8p, %crow8p : vector<8xf32>, vector<8xf32>
+      }
+      scf.yield %mvd0, %mvd1 : vector<8xf32>, vector<8xf32>
+    }
+    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+    %kt_p1 = index.add %kt, %c1 : index
+    %kt_n = func.call @ggml_hrx_fat_next(%cls_on, %l_view, %kt_p1, %n_kt) : (i1, view<2112xi32>, index, index) -> (index)
+    %nx_kt_c0 = index.sub %n_kt, %c1 : index
+    %nx_kt_c = index.min %kt_n, %nx_kt_c0 : index
+    %nx_kbase = index.mul %nx_kt_c, %c32 : index
+    %nx_r0, %nx_r1 = scf.if %pf_on -> (vector<8xf16>, vector<8xf16>) {
+      %nx_rr0, %nx_rr1 = scf.if %is_kl -> (vector<8xf16>, vector<8xf16>) {
+        %nx_kk = index.add %nx_kbase, %kl_key : index
+        %nx_kin = index.cmp ult, %nx_kk, %n_kv : index
+        %nx_kc = index.min %nx_kk, %kv_last : index
+        %nx_ka = func.call @ggml_hrx_fat_row8(%k_aligned, %k_head, %k_s1, %nx_kc, %kl_d0, %nx_kin) : (buffer, index, index, index, index, i1) -> (vector<8xf16>)
+        %nx_kb2 = func.call @ggml_hrx_fat_row8(%k_aligned, %k_head, %k_s1, %nx_kc, %kl_d1, %nx_kin) : (buffer, index, index, index, index, i1) -> (vector<8xf16>)
+        scf.yield %nx_ka, %nx_kb2 : vector<8xf16>, vector<8xf16>
+      } else {
+        %nx_vr0, %nx_vr1 = scf.if %is_vl -> (vector<8xf16>, vector<8xf16>) {
+          %nx_va_k = index.add %nx_kbase, %vl_key0 : index
+          %nx_vb_k = index.add %nx_va_k, %c1 : index
+          %nx_va_in = index.cmp ult, %nx_va_k, %n_kv : index
+          %nx_vb_in = index.cmp ult, %nx_vb_k, %n_kv : index
+          %nx_va_c = index.min %nx_va_k, %kv_last : index
+          %nx_vb_c = index.min %nx_vb_k, %kv_last : index
+          %nx_va = func.call @ggml_hrx_fat_row8(%v_aligned, %v_head, %v_s1, %nx_va_c, %vl_d0, %nx_va_in) : (buffer, index, index, index, index, i1) -> (vector<8xf16>)
+          %nx_vb = func.call @ggml_hrx_fat_row8(%v_aligned, %v_head, %v_s1, %nx_vb_c, %vl_d0, %nx_vb_in) : (buffer, index, index, index, index, i1) -> (vector<8xf16>)
+          scf.yield %nx_va, %nx_vb : vector<8xf16>, vector<8xf16>
+        } else {
+          scf.yield %zero8h, %zero8h : vector<8xf16>, vector<8xf16>
+        }
+        scf.yield %nx_vr0, %nx_vr1 : vector<8xf16>, vector<8xf16>
+      }
+      scf.yield %nx_rr0, %nx_rr1 : vector<8xf16>, vector<8xf16>
+    } else {
+      scf.yield %zero8h, %zero8h : vector<8xf16>, vector<8xf16>
+    }
+    %comp_all = scalar.constant true : i1
+    %cm_new, %cl_new, %con0, %con1, %con2, %con3, %con4, %con5, %con6, %con7 = scf.if %comp_all -> (f32, f32, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>) {
+      %kv0_0 = vector.load %k_view[%krow0, %c0_d] : view<32x136xf16> -> vector<16xf16>
+      %kl0_0 = vector.fragment<lhs> %kv0_0 shape [%c16, %c16] : vector<16xf16>
+      %s0_0 = vector.mma %kl0_0, %qf0, %init : vector<16xf16>, vector<16xf16>, vector<8xf32>
+      %kv0_1 = vector.load %k_view[%krow0, %c16_d] : view<32x136xf16> -> vector<16xf16>
+      %kl0_1 = vector.fragment<lhs> %kv0_1 shape [%c16, %c16] : vector<16xf16>
+      %s0_1 = vector.mma %kl0_1, %qf1, %s0_0 : vector<16xf16>, vector<16xf16>, vector<8xf32>
+      %kv0_2 = vector.load %k_view[%krow0, %c32_d] : view<32x136xf16> -> vector<16xf16>
+      %kl0_2 = vector.fragment<lhs> %kv0_2 shape [%c16, %c16] : vector<16xf16>
+      %s0_2 = vector.mma %kl0_2, %qf2, %s0_1 : vector<16xf16>, vector<16xf16>, vector<8xf32>
+      %kv0_3 = vector.load %k_view[%krow0, %c48_d] : view<32x136xf16> -> vector<16xf16>
+      %kl0_3 = vector.fragment<lhs> %kv0_3 shape [%c16, %c16] : vector<16xf16>
+      %s0_3 = vector.mma %kl0_3, %qf3, %s0_2 : vector<16xf16>, vector<16xf16>, vector<8xf32>
+      %kv0_4 = vector.load %k_view[%krow0, %c64_d] : view<32x136xf16> -> vector<16xf16>
+      %kl0_4 = vector.fragment<lhs> %kv0_4 shape [%c16, %c16] : vector<16xf16>
+      %s0_4 = vector.mma %kl0_4, %qf4, %s0_3 : vector<16xf16>, vector<16xf16>, vector<8xf32>
+      %kv0_5 = vector.load %k_view[%krow0, %c80_d] : view<32x136xf16> -> vector<16xf16>
+      %kl0_5 = vector.fragment<lhs> %kv0_5 shape [%c16, %c16] : vector<16xf16>
+      %s0_5 = vector.mma %kl0_5, %qf5, %s0_4 : vector<16xf16>, vector<16xf16>, vector<8xf32>
+      %kv0_6 = vector.load %k_view[%krow0, %c96_d] : view<32x136xf16> -> vector<16xf16>
+      %kl0_6 = vector.fragment<lhs> %kv0_6 shape [%c16, %c16] : vector<16xf16>
+      %s0_6 = vector.mma %kl0_6, %qf6, %s0_5 : vector<16xf16>, vector<16xf16>, vector<8xf32>
+      %kv0_7 = vector.load %k_view[%krow0, %c112_d] : view<32x136xf16> -> vector<16xf16>
+      %kl0_7 = vector.fragment<lhs> %kv0_7 shape [%c16, %c16] : vector<16xf16>
+      %s0_7 = vector.mma %kl0_7, %qf7, %s0_6 : vector<16xf16>, vector<16xf16>, vector<8xf32>
+      %sm00 = vector.addf %s0_7, %mvc0 : vector<8xf32>
+      %valid0 = vector.cmpf ogt, %mvc0, %neg8 : vector<8xf32> -> vector<8xi1>
+      %sm0 = vector.select %valid0, %sm00, %neg8 : vector<8xf32>
+      %lmax0 = vector.reduce<maxnumf> %sm0, %neg_large : vector<8xf32>, f32
+      %kv1_0 = vector.load %k_view[%krow1, %c0_d] : view<32x136xf16> -> vector<16xf16>
+      %kl1_0 = vector.fragment<lhs> %kv1_0 shape [%c16, %c16] : vector<16xf16>
+      %s1_0 = vector.mma %kl1_0, %qf0, %init : vector<16xf16>, vector<16xf16>, vector<8xf32>
+      %kv1_1 = vector.load %k_view[%krow1, %c16_d] : view<32x136xf16> -> vector<16xf16>
+      %kl1_1 = vector.fragment<lhs> %kv1_1 shape [%c16, %c16] : vector<16xf16>
+      %s1_1 = vector.mma %kl1_1, %qf1, %s1_0 : vector<16xf16>, vector<16xf16>, vector<8xf32>
+      %kv1_2 = vector.load %k_view[%krow1, %c32_d] : view<32x136xf16> -> vector<16xf16>
+      %kl1_2 = vector.fragment<lhs> %kv1_2 shape [%c16, %c16] : vector<16xf16>
+      %s1_2 = vector.mma %kl1_2, %qf2, %s1_1 : vector<16xf16>, vector<16xf16>, vector<8xf32>
+      %kv1_3 = vector.load %k_view[%krow1, %c48_d] : view<32x136xf16> -> vector<16xf16>
+      %kl1_3 = vector.fragment<lhs> %kv1_3 shape [%c16, %c16] : vector<16xf16>
+      %s1_3 = vector.mma %kl1_3, %qf3, %s1_2 : vector<16xf16>, vector<16xf16>, vector<8xf32>
+      %kv1_4 = vector.load %k_view[%krow1, %c64_d] : view<32x136xf16> -> vector<16xf16>
+      %kl1_4 = vector.fragment<lhs> %kv1_4 shape [%c16, %c16] : vector<16xf16>
+      %s1_4 = vector.mma %kl1_4, %qf4, %s1_3 : vector<16xf16>, vector<16xf16>, vector<8xf32>
+      %kv1_5 = vector.load %k_view[%krow1, %c80_d] : view<32x136xf16> -> vector<16xf16>
+      %kl1_5 = vector.fragment<lhs> %kv1_5 shape [%c16, %c16] : vector<16xf16>
+      %s1_5 = vector.mma %kl1_5, %qf5, %s1_4 : vector<16xf16>, vector<16xf16>, vector<8xf32>
+      %kv1_6 = vector.load %k_view[%krow1, %c96_d] : view<32x136xf16> -> vector<16xf16>
+      %kl1_6 = vector.fragment<lhs> %kv1_6 shape [%c16, %c16] : vector<16xf16>
+      %s1_6 = vector.mma %kl1_6, %qf6, %s1_5 : vector<16xf16>, vector<16xf16>, vector<8xf32>
+      %kv1_7 = vector.load %k_view[%krow1, %c112_d] : view<32x136xf16> -> vector<16xf16>
+      %kl1_7 = vector.fragment<lhs> %kv1_7 shape [%c16, %c16] : vector<16xf16>
+      %s1_7 = vector.mma %kl1_7, %qf7, %s1_6 : vector<16xf16>, vector<16xf16>, vector<8xf32>
+      %sm10 = vector.addf %s1_7, %mvc1 : vector<8xf32>
+      %valid1 = vector.cmpf ogt, %mvc1, %neg8 : vector<8xf32> -> vector<8xi1>
+      %sm1 = vector.select %valid1, %sm10, %neg8 : vector<8xf32>
+      %lmax1 = vector.reduce<maxnumf> %sm1, %neg_large : vector<8xf32>, f32
+      %lmax = scalar.maxnumf %lmax0, %lmax1 : f32
+      %omax = func.call @ggml_hrx_fat_partner1(%lmax) : (f32) -> (f32)
+      %tmax = scalar.maxnumf %lmax, %omax : f32
+      %m_new = scalar.maxnumf %m_run, %tmax : f32
+      %m_shift = scalar.subf %m_run, %m_new : f32
+      %alpha = scalar.expf<afn> %m_shift : f32
+      %m_new8 = vector.splat %m_new : vector<8xf32>
+      %sd0 = vector.subf %sm0, %m_new8 : vector<8xf32>
+      %pe0 = vector.expf<afn> %sd0 : vector<8xf32>
+      %p0 = vector.select %valid0, %pe0, %zero8 : vector<8xf32>
+      %ls0 = vector.reduce<addf> %p0, %zero_f32 : vector<8xf32>, f32
+      %pt0 = func.call @ggml_hrx_fat_pt(%p0, %hi_half) : (vector<8xf32>, i1) -> (vector<16xf16>)
+      %sd1 = vector.subf %sm1, %m_new8 : vector<8xf32>
+      %pe1 = vector.expf<afn> %sd1 : vector<8xf32>
+      %p1 = vector.select %valid1, %pe1, %zero8 : vector<8xf32>
+      %ls1 = vector.reduce<addf> %p1, %zero_f32 : vector<8xf32>, f32
+      %pt1 = func.call @ggml_hrx_fat_pt(%p1, %hi_half) : (vector<8xf32>, i1) -> (vector<16xf16>)
+      %lsum = scalar.addf %ls0, %ls1 : f32
+      %osum = func.call @ggml_hrx_fat_partner1(%lsum) : (f32) -> (f32)
+      %tsum = scalar.addf %lsum, %osum : f32
+      %l_new = scalar.fmaf %l_run, %alpha, %tsum : f32
+      %alpha8 = vector.splat %alpha : vector<8xf32>
+      %os0 = vector.mulf %a0, %alpha8 : vector<8xf32>
+      %os1 = vector.mulf %a1, %alpha8 : vector<8xf32>
+      %os2 = vector.mulf %a2, %alpha8 : vector<8xf32>
+      %os3 = vector.mulf %a3, %alpha8 : vector<8xf32>
+      %os4 = vector.mulf %a4, %alpha8 : vector<8xf32>
+      %os5 = vector.mulf %a5, %alpha8 : vector<8xf32>
+      %os6 = vector.mulf %a6, %alpha8 : vector<8xf32>
+      %os7 = vector.mulf %a7, %alpha8 : vector<8xf32>
+      %vv0_0 = vector.load %vt_view[%vrow0, %c0_r] : view<128x40xf16> -> vector<16xf16>
+      %vl0_0 = vector.fragment<lhs> %vv0_0 shape [%c16, %c16] : vector<16xf16>
+      %on0_0 = vector.mma %vl0_0, %pt0, %os0 : vector<16xf16>, vector<16xf16>, vector<8xf32>
+      %vv0_1 = vector.load %vt_view[%vrow0, %c16_r] : view<128x40xf16> -> vector<16xf16>
+      %vl0_1 = vector.fragment<lhs> %vv0_1 shape [%c16, %c16] : vector<16xf16>
+      %on0_1 = vector.mma %vl0_1, %pt1, %on0_0 : vector<16xf16>, vector<16xf16>, vector<8xf32>
+      %vv1_0 = vector.load %vt_view[%vrow1, %c0_r] : view<128x40xf16> -> vector<16xf16>
+      %vl1_0 = vector.fragment<lhs> %vv1_0 shape [%c16, %c16] : vector<16xf16>
+      %on1_0 = vector.mma %vl1_0, %pt0, %os1 : vector<16xf16>, vector<16xf16>, vector<8xf32>
+      %vv1_1 = vector.load %vt_view[%vrow1, %c16_r] : view<128x40xf16> -> vector<16xf16>
+      %vl1_1 = vector.fragment<lhs> %vv1_1 shape [%c16, %c16] : vector<16xf16>
+      %on1_1 = vector.mma %vl1_1, %pt1, %on1_0 : vector<16xf16>, vector<16xf16>, vector<8xf32>
+      %vv2_0 = vector.load %vt_view[%vrow2, %c0_r] : view<128x40xf16> -> vector<16xf16>
+      %vl2_0 = vector.fragment<lhs> %vv2_0 shape [%c16, %c16] : vector<16xf16>
+      %on2_0 = vector.mma %vl2_0, %pt0, %os2 : vector<16xf16>, vector<16xf16>, vector<8xf32>
+      %vv2_1 = vector.load %vt_view[%vrow2, %c16_r] : view<128x40xf16> -> vector<16xf16>
+      %vl2_1 = vector.fragment<lhs> %vv2_1 shape [%c16, %c16] : vector<16xf16>
+      %on2_1 = vector.mma %vl2_1, %pt1, %on2_0 : vector<16xf16>, vector<16xf16>, vector<8xf32>
+      %vv3_0 = vector.load %vt_view[%vrow3, %c0_r] : view<128x40xf16> -> vector<16xf16>
+      %vl3_0 = vector.fragment<lhs> %vv3_0 shape [%c16, %c16] : vector<16xf16>
+      %on3_0 = vector.mma %vl3_0, %pt0, %os3 : vector<16xf16>, vector<16xf16>, vector<8xf32>
+      %vv3_1 = vector.load %vt_view[%vrow3, %c16_r] : view<128x40xf16> -> vector<16xf16>
+      %vl3_1 = vector.fragment<lhs> %vv3_1 shape [%c16, %c16] : vector<16xf16>
+      %on3_1 = vector.mma %vl3_1, %pt1, %on3_0 : vector<16xf16>, vector<16xf16>, vector<8xf32>
+      %vv4_0 = vector.load %vt_view[%vrow4, %c0_r] : view<128x40xf16> -> vector<16xf16>
+      %vl4_0 = vector.fragment<lhs> %vv4_0 shape [%c16, %c16] : vector<16xf16>
+      %on4_0 = vector.mma %vl4_0, %pt0, %os4 : vector<16xf16>, vector<16xf16>, vector<8xf32>
+      %vv4_1 = vector.load %vt_view[%vrow4, %c16_r] : view<128x40xf16> -> vector<16xf16>
+      %vl4_1 = vector.fragment<lhs> %vv4_1 shape [%c16, %c16] : vector<16xf16>
+      %on4_1 = vector.mma %vl4_1, %pt1, %on4_0 : vector<16xf16>, vector<16xf16>, vector<8xf32>
+      %vv5_0 = vector.load %vt_view[%vrow5, %c0_r] : view<128x40xf16> -> vector<16xf16>
+      %vl5_0 = vector.fragment<lhs> %vv5_0 shape [%c16, %c16] : vector<16xf16>
+      %on5_0 = vector.mma %vl5_0, %pt0, %os5 : vector<16xf16>, vector<16xf16>, vector<8xf32>
+      %vv5_1 = vector.load %vt_view[%vrow5, %c16_r] : view<128x40xf16> -> vector<16xf16>
+      %vl5_1 = vector.fragment<lhs> %vv5_1 shape [%c16, %c16] : vector<16xf16>
+      %on5_1 = vector.mma %vl5_1, %pt1, %on5_0 : vector<16xf16>, vector<16xf16>, vector<8xf32>
+      %vv6_0 = vector.load %vt_view[%vrow6, %c0_r] : view<128x40xf16> -> vector<16xf16>
+      %vl6_0 = vector.fragment<lhs> %vv6_0 shape [%c16, %c16] : vector<16xf16>
+      %on6_0 = vector.mma %vl6_0, %pt0, %os6 : vector<16xf16>, vector<16xf16>, vector<8xf32>
+      %vv6_1 = vector.load %vt_view[%vrow6, %c16_r] : view<128x40xf16> -> vector<16xf16>
+      %vl6_1 = vector.fragment<lhs> %vv6_1 shape [%c16, %c16] : vector<16xf16>
+      %on6_1 = vector.mma %vl6_1, %pt1, %on6_0 : vector<16xf16>, vector<16xf16>, vector<8xf32>
+      %vv7_0 = vector.load %vt_view[%vrow7, %c0_r] : view<128x40xf16> -> vector<16xf16>
+      %vl7_0 = vector.fragment<lhs> %vv7_0 shape [%c16, %c16] : vector<16xf16>
+      %on7_0 = vector.mma %vl7_0, %pt0, %os7 : vector<16xf16>, vector<16xf16>, vector<8xf32>
+      %vv7_1 = vector.load %vt_view[%vrow7, %c16_r] : view<128x40xf16> -> vector<16xf16>
+      %vl7_1 = vector.fragment<lhs> %vv7_1 shape [%c16, %c16] : vector<16xf16>
+      %on7_1 = vector.mma %vl7_1, %pt1, %on7_0 : vector<16xf16>, vector<16xf16>, vector<8xf32>
+      scf.yield %m_new, %l_new, %on0_1, %on1_1, %on2_1, %on3_1, %on4_1, %on5_1, %on6_1, %on7_1 : f32, f32, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>
+    } else {
+      scf.yield %m_run, %l_run, %a0, %a1, %a2, %a3, %a4, %a5, %a6, %a7 : f32, f32, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>
+    }
+    // The next tile writes the LDS again.
+    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+    scf.yield %kt_n, %cm_new, %cl_new, %con0, %con1, %con2, %con3, %con4, %con5, %con6, %con7, %nx_r0, %nx_r1 : index, f32, f32, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf16>, vector<8xf16>
+  }
+
+  // The sink of the head is one more logit in the softmax. It has no V row. A row with no unmasked key gets 0, as on the CPU.
+  %sinks_on = index.cmp ne, %has_sinks, %c0 : index
+  %sink_row = scalar.andi %sinks_on, %rv : i1
+  %sink = scf.if %sink_row -> (f32) {
+    %sink_ok = index.cmp ult, %head, %s_span : index
+    %sink_x = scf.if %sink_ok -> (f32) {
+      %sink_l = view.load %sink_view[%head] : view<[%s_span]xf32> -> f32
+      scf.yield %sink_l : f32
+    } else {
+      scf.yield %neg_large : f32
+    }
+    scf.yield %sink_x : f32
+  } else {
+    scf.yield %neg_large : f32
+  }
+  %m_all = scalar.maxnumf %m_fin, %sink : f32
+  %dm = scalar.subf %m_fin, %m_all : f32
+  %em = scalar.expf<afn> %dm : f32
+  %sink_d = scalar.subf %sink, %m_all : f32
+  %sink_e = scalar.expf<afn> %sink_d : f32
+  %sink_p = scf.select %sink_row, %sink_e, %zero_f32 : f32
+  %l_all = scalar.fmaf %l_fin, %em, %sink_p : f32
+  %l_pos = scalar.cmpf ogt, %l_all, %zero_f32 : f32
+  %l_safe = scf.select %l_pos, %l_all, %one_f32 : f32
+  %g0 = scalar.divf %em, %l_safe : f32
+  %g = scf.select %l_pos, %g0, %zero_f32 : f32
+  %g8 = vector.splat %g : vector<8xf32>
+
+  // O^T: the lane holds channels 16 c + 2 i + half of its query. dst holds all rows of the valid queries.
+  scf.if %rv {
+    %o_tok = index.add %qf_s, %tok : index
+    %o_th = index.mul %o_tok, %n_head : index
+    %o_row = index.add %o_th, %head : index
+    %o_base0 = index.mul %o_row, %c128 : index
+    %o_base = index.add %o_base0, %lane_half : index
+    %y0 = vector.mulf %of0, %g8 : vector<8xf32>
+    %ye0_0 = vector.extract %y0[0] : vector<8xf32> -> f32
+    %yo0_0_c = index.constant 0 : index
+    %yo0_0_0 = index.add %o_base, %yo0_0_c : index
+    %yo0_0 = index.assume %yo0_0_0 [range(%yo0_0_0, 0, 2147483646), lt(%yo0_0_0, %dst_span)] : index
+    view.store %ye0_0, %dst_view[%yo0_0] : f32, view<[%dst_span]xf32>
+    %ye0_1 = vector.extract %y0[1] : vector<8xf32> -> f32
+    %yo0_1_c = index.constant 2 : index
+    %yo0_1_0 = index.add %o_base, %yo0_1_c : index
+    %yo0_1 = index.assume %yo0_1_0 [range(%yo0_1_0, 0, 2147483646), lt(%yo0_1_0, %dst_span)] : index
+    view.store %ye0_1, %dst_view[%yo0_1] : f32, view<[%dst_span]xf32>
+    %ye0_2 = vector.extract %y0[2] : vector<8xf32> -> f32
+    %yo0_2_c = index.constant 4 : index
+    %yo0_2_0 = index.add %o_base, %yo0_2_c : index
+    %yo0_2 = index.assume %yo0_2_0 [range(%yo0_2_0, 0, 2147483646), lt(%yo0_2_0, %dst_span)] : index
+    view.store %ye0_2, %dst_view[%yo0_2] : f32, view<[%dst_span]xf32>
+    %ye0_3 = vector.extract %y0[3] : vector<8xf32> -> f32
+    %yo0_3_c = index.constant 6 : index
+    %yo0_3_0 = index.add %o_base, %yo0_3_c : index
+    %yo0_3 = index.assume %yo0_3_0 [range(%yo0_3_0, 0, 2147483646), lt(%yo0_3_0, %dst_span)] : index
+    view.store %ye0_3, %dst_view[%yo0_3] : f32, view<[%dst_span]xf32>
+    %ye0_4 = vector.extract %y0[4] : vector<8xf32> -> f32
+    %yo0_4_c = index.constant 8 : index
+    %yo0_4_0 = index.add %o_base, %yo0_4_c : index
+    %yo0_4 = index.assume %yo0_4_0 [range(%yo0_4_0, 0, 2147483646), lt(%yo0_4_0, %dst_span)] : index
+    view.store %ye0_4, %dst_view[%yo0_4] : f32, view<[%dst_span]xf32>
+    %ye0_5 = vector.extract %y0[5] : vector<8xf32> -> f32
+    %yo0_5_c = index.constant 10 : index
+    %yo0_5_0 = index.add %o_base, %yo0_5_c : index
+    %yo0_5 = index.assume %yo0_5_0 [range(%yo0_5_0, 0, 2147483646), lt(%yo0_5_0, %dst_span)] : index
+    view.store %ye0_5, %dst_view[%yo0_5] : f32, view<[%dst_span]xf32>
+    %ye0_6 = vector.extract %y0[6] : vector<8xf32> -> f32
+    %yo0_6_c = index.constant 12 : index
+    %yo0_6_0 = index.add %o_base, %yo0_6_c : index
+    %yo0_6 = index.assume %yo0_6_0 [range(%yo0_6_0, 0, 2147483646), lt(%yo0_6_0, %dst_span)] : index
+    view.store %ye0_6, %dst_view[%yo0_6] : f32, view<[%dst_span]xf32>
+    %ye0_7 = vector.extract %y0[7] : vector<8xf32> -> f32
+    %yo0_7_c = index.constant 14 : index
+    %yo0_7_0 = index.add %o_base, %yo0_7_c : index
+    %yo0_7 = index.assume %yo0_7_0 [range(%yo0_7_0, 0, 2147483646), lt(%yo0_7_0, %dst_span)] : index
+    view.store %ye0_7, %dst_view[%yo0_7] : f32, view<[%dst_span]xf32>
+    %y1 = vector.mulf %of1, %g8 : vector<8xf32>
+    %ye1_0 = vector.extract %y1[0] : vector<8xf32> -> f32
+    %yo1_0_c = index.constant 16 : index
+    %yo1_0_0 = index.add %o_base, %yo1_0_c : index
+    %yo1_0 = index.assume %yo1_0_0 [range(%yo1_0_0, 0, 2147483646), lt(%yo1_0_0, %dst_span)] : index
+    view.store %ye1_0, %dst_view[%yo1_0] : f32, view<[%dst_span]xf32>
+    %ye1_1 = vector.extract %y1[1] : vector<8xf32> -> f32
+    %yo1_1_c = index.constant 18 : index
+    %yo1_1_0 = index.add %o_base, %yo1_1_c : index
+    %yo1_1 = index.assume %yo1_1_0 [range(%yo1_1_0, 0, 2147483646), lt(%yo1_1_0, %dst_span)] : index
+    view.store %ye1_1, %dst_view[%yo1_1] : f32, view<[%dst_span]xf32>
+    %ye1_2 = vector.extract %y1[2] : vector<8xf32> -> f32
+    %yo1_2_c = index.constant 20 : index
+    %yo1_2_0 = index.add %o_base, %yo1_2_c : index
+    %yo1_2 = index.assume %yo1_2_0 [range(%yo1_2_0, 0, 2147483646), lt(%yo1_2_0, %dst_span)] : index
+    view.store %ye1_2, %dst_view[%yo1_2] : f32, view<[%dst_span]xf32>
+    %ye1_3 = vector.extract %y1[3] : vector<8xf32> -> f32
+    %yo1_3_c = index.constant 22 : index
+    %yo1_3_0 = index.add %o_base, %yo1_3_c : index
+    %yo1_3 = index.assume %yo1_3_0 [range(%yo1_3_0, 0, 2147483646), lt(%yo1_3_0, %dst_span)] : index
+    view.store %ye1_3, %dst_view[%yo1_3] : f32, view<[%dst_span]xf32>
+    %ye1_4 = vector.extract %y1[4] : vector<8xf32> -> f32
+    %yo1_4_c = index.constant 24 : index
+    %yo1_4_0 = index.add %o_base, %yo1_4_c : index
+    %yo1_4 = index.assume %yo1_4_0 [range(%yo1_4_0, 0, 2147483646), lt(%yo1_4_0, %dst_span)] : index
+    view.store %ye1_4, %dst_view[%yo1_4] : f32, view<[%dst_span]xf32>
+    %ye1_5 = vector.extract %y1[5] : vector<8xf32> -> f32
+    %yo1_5_c = index.constant 26 : index
+    %yo1_5_0 = index.add %o_base, %yo1_5_c : index
+    %yo1_5 = index.assume %yo1_5_0 [range(%yo1_5_0, 0, 2147483646), lt(%yo1_5_0, %dst_span)] : index
+    view.store %ye1_5, %dst_view[%yo1_5] : f32, view<[%dst_span]xf32>
+    %ye1_6 = vector.extract %y1[6] : vector<8xf32> -> f32
+    %yo1_6_c = index.constant 28 : index
+    %yo1_6_0 = index.add %o_base, %yo1_6_c : index
+    %yo1_6 = index.assume %yo1_6_0 [range(%yo1_6_0, 0, 2147483646), lt(%yo1_6_0, %dst_span)] : index
+    view.store %ye1_6, %dst_view[%yo1_6] : f32, view<[%dst_span]xf32>
+    %ye1_7 = vector.extract %y1[7] : vector<8xf32> -> f32
+    %yo1_7_c = index.constant 30 : index
+    %yo1_7_0 = index.add %o_base, %yo1_7_c : index
+    %yo1_7 = index.assume %yo1_7_0 [range(%yo1_7_0, 0, 2147483646), lt(%yo1_7_0, %dst_span)] : index
+    view.store %ye1_7, %dst_view[%yo1_7] : f32, view<[%dst_span]xf32>
+    %y2 = vector.mulf %of2, %g8 : vector<8xf32>
+    %ye2_0 = vector.extract %y2[0] : vector<8xf32> -> f32
+    %yo2_0_c = index.constant 32 : index
+    %yo2_0_0 = index.add %o_base, %yo2_0_c : index
+    %yo2_0 = index.assume %yo2_0_0 [range(%yo2_0_0, 0, 2147483646), lt(%yo2_0_0, %dst_span)] : index
+    view.store %ye2_0, %dst_view[%yo2_0] : f32, view<[%dst_span]xf32>
+    %ye2_1 = vector.extract %y2[1] : vector<8xf32> -> f32
+    %yo2_1_c = index.constant 34 : index
+    %yo2_1_0 = index.add %o_base, %yo2_1_c : index
+    %yo2_1 = index.assume %yo2_1_0 [range(%yo2_1_0, 0, 2147483646), lt(%yo2_1_0, %dst_span)] : index
+    view.store %ye2_1, %dst_view[%yo2_1] : f32, view<[%dst_span]xf32>
+    %ye2_2 = vector.extract %y2[2] : vector<8xf32> -> f32
+    %yo2_2_c = index.constant 36 : index
+    %yo2_2_0 = index.add %o_base, %yo2_2_c : index
+    %yo2_2 = index.assume %yo2_2_0 [range(%yo2_2_0, 0, 2147483646), lt(%yo2_2_0, %dst_span)] : index
+    view.store %ye2_2, %dst_view[%yo2_2] : f32, view<[%dst_span]xf32>
+    %ye2_3 = vector.extract %y2[3] : vector<8xf32> -> f32
+    %yo2_3_c = index.constant 38 : index
+    %yo2_3_0 = index.add %o_base, %yo2_3_c : index
+    %yo2_3 = index.assume %yo2_3_0 [range(%yo2_3_0, 0, 2147483646), lt(%yo2_3_0, %dst_span)] : index
+    view.store %ye2_3, %dst_view[%yo2_3] : f32, view<[%dst_span]xf32>
+    %ye2_4 = vector.extract %y2[4] : vector<8xf32> -> f32
+    %yo2_4_c = index.constant 40 : index
+    %yo2_4_0 = index.add %o_base, %yo2_4_c : index
+    %yo2_4 = index.assume %yo2_4_0 [range(%yo2_4_0, 0, 2147483646), lt(%yo2_4_0, %dst_span)] : index
+    view.store %ye2_4, %dst_view[%yo2_4] : f32, view<[%dst_span]xf32>
+    %ye2_5 = vector.extract %y2[5] : vector<8xf32> -> f32
+    %yo2_5_c = index.constant 42 : index
+    %yo2_5_0 = index.add %o_base, %yo2_5_c : index
+    %yo2_5 = index.assume %yo2_5_0 [range(%yo2_5_0, 0, 2147483646), lt(%yo2_5_0, %dst_span)] : index
+    view.store %ye2_5, %dst_view[%yo2_5] : f32, view<[%dst_span]xf32>
+    %ye2_6 = vector.extract %y2[6] : vector<8xf32> -> f32
+    %yo2_6_c = index.constant 44 : index
+    %yo2_6_0 = index.add %o_base, %yo2_6_c : index
+    %yo2_6 = index.assume %yo2_6_0 [range(%yo2_6_0, 0, 2147483646), lt(%yo2_6_0, %dst_span)] : index
+    view.store %ye2_6, %dst_view[%yo2_6] : f32, view<[%dst_span]xf32>
+    %ye2_7 = vector.extract %y2[7] : vector<8xf32> -> f32
+    %yo2_7_c = index.constant 46 : index
+    %yo2_7_0 = index.add %o_base, %yo2_7_c : index
+    %yo2_7 = index.assume %yo2_7_0 [range(%yo2_7_0, 0, 2147483646), lt(%yo2_7_0, %dst_span)] : index
+    view.store %ye2_7, %dst_view[%yo2_7] : f32, view<[%dst_span]xf32>
+    %y3 = vector.mulf %of3, %g8 : vector<8xf32>
+    %ye3_0 = vector.extract %y3[0] : vector<8xf32> -> f32
+    %yo3_0_c = index.constant 48 : index
+    %yo3_0_0 = index.add %o_base, %yo3_0_c : index
+    %yo3_0 = index.assume %yo3_0_0 [range(%yo3_0_0, 0, 2147483646), lt(%yo3_0_0, %dst_span)] : index
+    view.store %ye3_0, %dst_view[%yo3_0] : f32, view<[%dst_span]xf32>
+    %ye3_1 = vector.extract %y3[1] : vector<8xf32> -> f32
+    %yo3_1_c = index.constant 50 : index
+    %yo3_1_0 = index.add %o_base, %yo3_1_c : index
+    %yo3_1 = index.assume %yo3_1_0 [range(%yo3_1_0, 0, 2147483646), lt(%yo3_1_0, %dst_span)] : index
+    view.store %ye3_1, %dst_view[%yo3_1] : f32, view<[%dst_span]xf32>
+    %ye3_2 = vector.extract %y3[2] : vector<8xf32> -> f32
+    %yo3_2_c = index.constant 52 : index
+    %yo3_2_0 = index.add %o_base, %yo3_2_c : index
+    %yo3_2 = index.assume %yo3_2_0 [range(%yo3_2_0, 0, 2147483646), lt(%yo3_2_0, %dst_span)] : index
+    view.store %ye3_2, %dst_view[%yo3_2] : f32, view<[%dst_span]xf32>
+    %ye3_3 = vector.extract %y3[3] : vector<8xf32> -> f32
+    %yo3_3_c = index.constant 54 : index
+    %yo3_3_0 = index.add %o_base, %yo3_3_c : index
+    %yo3_3 = index.assume %yo3_3_0 [range(%yo3_3_0, 0, 2147483646), lt(%yo3_3_0, %dst_span)] : index
+    view.store %ye3_3, %dst_view[%yo3_3] : f32, view<[%dst_span]xf32>
+    %ye3_4 = vector.extract %y3[4] : vector<8xf32> -> f32
+    %yo3_4_c = index.constant 56 : index
+    %yo3_4_0 = index.add %o_base, %yo3_4_c : index
+    %yo3_4 = index.assume %yo3_4_0 [range(%yo3_4_0, 0, 2147483646), lt(%yo3_4_0, %dst_span)] : index
+    view.store %ye3_4, %dst_view[%yo3_4] : f32, view<[%dst_span]xf32>
+    %ye3_5 = vector.extract %y3[5] : vector<8xf32> -> f32
+    %yo3_5_c = index.constant 58 : index
+    %yo3_5_0 = index.add %o_base, %yo3_5_c : index
+    %yo3_5 = index.assume %yo3_5_0 [range(%yo3_5_0, 0, 2147483646), lt(%yo3_5_0, %dst_span)] : index
+    view.store %ye3_5, %dst_view[%yo3_5] : f32, view<[%dst_span]xf32>
+    %ye3_6 = vector.extract %y3[6] : vector<8xf32> -> f32
+    %yo3_6_c = index.constant 60 : index
+    %yo3_6_0 = index.add %o_base, %yo3_6_c : index
+    %yo3_6 = index.assume %yo3_6_0 [range(%yo3_6_0, 0, 2147483646), lt(%yo3_6_0, %dst_span)] : index
+    view.store %ye3_6, %dst_view[%yo3_6] : f32, view<[%dst_span]xf32>
+    %ye3_7 = vector.extract %y3[7] : vector<8xf32> -> f32
+    %yo3_7_c = index.constant 62 : index
+    %yo3_7_0 = index.add %o_base, %yo3_7_c : index
+    %yo3_7 = index.assume %yo3_7_0 [range(%yo3_7_0, 0, 2147483646), lt(%yo3_7_0, %dst_span)] : index
+    view.store %ye3_7, %dst_view[%yo3_7] : f32, view<[%dst_span]xf32>
+    %y4 = vector.mulf %of4, %g8 : vector<8xf32>
+    %ye4_0 = vector.extract %y4[0] : vector<8xf32> -> f32
+    %yo4_0_c = index.constant 64 : index
+    %yo4_0_0 = index.add %o_base, %yo4_0_c : index
+    %yo4_0 = index.assume %yo4_0_0 [range(%yo4_0_0, 0, 2147483646), lt(%yo4_0_0, %dst_span)] : index
+    view.store %ye4_0, %dst_view[%yo4_0] : f32, view<[%dst_span]xf32>
+    %ye4_1 = vector.extract %y4[1] : vector<8xf32> -> f32
+    %yo4_1_c = index.constant 66 : index
+    %yo4_1_0 = index.add %o_base, %yo4_1_c : index
+    %yo4_1 = index.assume %yo4_1_0 [range(%yo4_1_0, 0, 2147483646), lt(%yo4_1_0, %dst_span)] : index
+    view.store %ye4_1, %dst_view[%yo4_1] : f32, view<[%dst_span]xf32>
+    %ye4_2 = vector.extract %y4[2] : vector<8xf32> -> f32
+    %yo4_2_c = index.constant 68 : index
+    %yo4_2_0 = index.add %o_base, %yo4_2_c : index
+    %yo4_2 = index.assume %yo4_2_0 [range(%yo4_2_0, 0, 2147483646), lt(%yo4_2_0, %dst_span)] : index
+    view.store %ye4_2, %dst_view[%yo4_2] : f32, view<[%dst_span]xf32>
+    %ye4_3 = vector.extract %y4[3] : vector<8xf32> -> f32
+    %yo4_3_c = index.constant 70 : index
+    %yo4_3_0 = index.add %o_base, %yo4_3_c : index
+    %yo4_3 = index.assume %yo4_3_0 [range(%yo4_3_0, 0, 2147483646), lt(%yo4_3_0, %dst_span)] : index
+    view.store %ye4_3, %dst_view[%yo4_3] : f32, view<[%dst_span]xf32>
+    %ye4_4 = vector.extract %y4[4] : vector<8xf32> -> f32
+    %yo4_4_c = index.constant 72 : index
+    %yo4_4_0 = index.add %o_base, %yo4_4_c : index
+    %yo4_4 = index.assume %yo4_4_0 [range(%yo4_4_0, 0, 2147483646), lt(%yo4_4_0, %dst_span)] : index
+    view.store %ye4_4, %dst_view[%yo4_4] : f32, view<[%dst_span]xf32>
+    %ye4_5 = vector.extract %y4[5] : vector<8xf32> -> f32
+    %yo4_5_c = index.constant 74 : index
+    %yo4_5_0 = index.add %o_base, %yo4_5_c : index
+    %yo4_5 = index.assume %yo4_5_0 [range(%yo4_5_0, 0, 2147483646), lt(%yo4_5_0, %dst_span)] : index
+    view.store %ye4_5, %dst_view[%yo4_5] : f32, view<[%dst_span]xf32>
+    %ye4_6 = vector.extract %y4[6] : vector<8xf32> -> f32
+    %yo4_6_c = index.constant 76 : index
+    %yo4_6_0 = index.add %o_base, %yo4_6_c : index
+    %yo4_6 = index.assume %yo4_6_0 [range(%yo4_6_0, 0, 2147483646), lt(%yo4_6_0, %dst_span)] : index
+    view.store %ye4_6, %dst_view[%yo4_6] : f32, view<[%dst_span]xf32>
+    %ye4_7 = vector.extract %y4[7] : vector<8xf32> -> f32
+    %yo4_7_c = index.constant 78 : index
+    %yo4_7_0 = index.add %o_base, %yo4_7_c : index
+    %yo4_7 = index.assume %yo4_7_0 [range(%yo4_7_0, 0, 2147483646), lt(%yo4_7_0, %dst_span)] : index
+    view.store %ye4_7, %dst_view[%yo4_7] : f32, view<[%dst_span]xf32>
+    %y5 = vector.mulf %of5, %g8 : vector<8xf32>
+    %ye5_0 = vector.extract %y5[0] : vector<8xf32> -> f32
+    %yo5_0_c = index.constant 80 : index
+    %yo5_0_0 = index.add %o_base, %yo5_0_c : index
+    %yo5_0 = index.assume %yo5_0_0 [range(%yo5_0_0, 0, 2147483646), lt(%yo5_0_0, %dst_span)] : index
+    view.store %ye5_0, %dst_view[%yo5_0] : f32, view<[%dst_span]xf32>
+    %ye5_1 = vector.extract %y5[1] : vector<8xf32> -> f32
+    %yo5_1_c = index.constant 82 : index
+    %yo5_1_0 = index.add %o_base, %yo5_1_c : index
+    %yo5_1 = index.assume %yo5_1_0 [range(%yo5_1_0, 0, 2147483646), lt(%yo5_1_0, %dst_span)] : index
+    view.store %ye5_1, %dst_view[%yo5_1] : f32, view<[%dst_span]xf32>
+    %ye5_2 = vector.extract %y5[2] : vector<8xf32> -> f32
+    %yo5_2_c = index.constant 84 : index
+    %yo5_2_0 = index.add %o_base, %yo5_2_c : index
+    %yo5_2 = index.assume %yo5_2_0 [range(%yo5_2_0, 0, 2147483646), lt(%yo5_2_0, %dst_span)] : index
+    view.store %ye5_2, %dst_view[%yo5_2] : f32, view<[%dst_span]xf32>
+    %ye5_3 = vector.extract %y5[3] : vector<8xf32> -> f32
+    %yo5_3_c = index.constant 86 : index
+    %yo5_3_0 = index.add %o_base, %yo5_3_c : index
+    %yo5_3 = index.assume %yo5_3_0 [range(%yo5_3_0, 0, 2147483646), lt(%yo5_3_0, %dst_span)] : index
+    view.store %ye5_3, %dst_view[%yo5_3] : f32, view<[%dst_span]xf32>
+    %ye5_4 = vector.extract %y5[4] : vector<8xf32> -> f32
+    %yo5_4_c = index.constant 88 : index
+    %yo5_4_0 = index.add %o_base, %yo5_4_c : index
+    %yo5_4 = index.assume %yo5_4_0 [range(%yo5_4_0, 0, 2147483646), lt(%yo5_4_0, %dst_span)] : index
+    view.store %ye5_4, %dst_view[%yo5_4] : f32, view<[%dst_span]xf32>
+    %ye5_5 = vector.extract %y5[5] : vector<8xf32> -> f32
+    %yo5_5_c = index.constant 90 : index
+    %yo5_5_0 = index.add %o_base, %yo5_5_c : index
+    %yo5_5 = index.assume %yo5_5_0 [range(%yo5_5_0, 0, 2147483646), lt(%yo5_5_0, %dst_span)] : index
+    view.store %ye5_5, %dst_view[%yo5_5] : f32, view<[%dst_span]xf32>
+    %ye5_6 = vector.extract %y5[6] : vector<8xf32> -> f32
+    %yo5_6_c = index.constant 92 : index
+    %yo5_6_0 = index.add %o_base, %yo5_6_c : index
+    %yo5_6 = index.assume %yo5_6_0 [range(%yo5_6_0, 0, 2147483646), lt(%yo5_6_0, %dst_span)] : index
+    view.store %ye5_6, %dst_view[%yo5_6] : f32, view<[%dst_span]xf32>
+    %ye5_7 = vector.extract %y5[7] : vector<8xf32> -> f32
+    %yo5_7_c = index.constant 94 : index
+    %yo5_7_0 = index.add %o_base, %yo5_7_c : index
+    %yo5_7 = index.assume %yo5_7_0 [range(%yo5_7_0, 0, 2147483646), lt(%yo5_7_0, %dst_span)] : index
+    view.store %ye5_7, %dst_view[%yo5_7] : f32, view<[%dst_span]xf32>
+    %y6 = vector.mulf %of6, %g8 : vector<8xf32>
+    %ye6_0 = vector.extract %y6[0] : vector<8xf32> -> f32
+    %yo6_0_c = index.constant 96 : index
+    %yo6_0_0 = index.add %o_base, %yo6_0_c : index
+    %yo6_0 = index.assume %yo6_0_0 [range(%yo6_0_0, 0, 2147483646), lt(%yo6_0_0, %dst_span)] : index
+    view.store %ye6_0, %dst_view[%yo6_0] : f32, view<[%dst_span]xf32>
+    %ye6_1 = vector.extract %y6[1] : vector<8xf32> -> f32
+    %yo6_1_c = index.constant 98 : index
+    %yo6_1_0 = index.add %o_base, %yo6_1_c : index
+    %yo6_1 = index.assume %yo6_1_0 [range(%yo6_1_0, 0, 2147483646), lt(%yo6_1_0, %dst_span)] : index
+    view.store %ye6_1, %dst_view[%yo6_1] : f32, view<[%dst_span]xf32>
+    %ye6_2 = vector.extract %y6[2] : vector<8xf32> -> f32
+    %yo6_2_c = index.constant 100 : index
+    %yo6_2_0 = index.add %o_base, %yo6_2_c : index
+    %yo6_2 = index.assume %yo6_2_0 [range(%yo6_2_0, 0, 2147483646), lt(%yo6_2_0, %dst_span)] : index
+    view.store %ye6_2, %dst_view[%yo6_2] : f32, view<[%dst_span]xf32>
+    %ye6_3 = vector.extract %y6[3] : vector<8xf32> -> f32
+    %yo6_3_c = index.constant 102 : index
+    %yo6_3_0 = index.add %o_base, %yo6_3_c : index
+    %yo6_3 = index.assume %yo6_3_0 [range(%yo6_3_0, 0, 2147483646), lt(%yo6_3_0, %dst_span)] : index
+    view.store %ye6_3, %dst_view[%yo6_3] : f32, view<[%dst_span]xf32>
+    %ye6_4 = vector.extract %y6[4] : vector<8xf32> -> f32
+    %yo6_4_c = index.constant 104 : index
+    %yo6_4_0 = index.add %o_base, %yo6_4_c : index
+    %yo6_4 = index.assume %yo6_4_0 [range(%yo6_4_0, 0, 2147483646), lt(%yo6_4_0, %dst_span)] : index
+    view.store %ye6_4, %dst_view[%yo6_4] : f32, view<[%dst_span]xf32>
+    %ye6_5 = vector.extract %y6[5] : vector<8xf32> -> f32
+    %yo6_5_c = index.constant 106 : index
+    %yo6_5_0 = index.add %o_base, %yo6_5_c : index
+    %yo6_5 = index.assume %yo6_5_0 [range(%yo6_5_0, 0, 2147483646), lt(%yo6_5_0, %dst_span)] : index
+    view.store %ye6_5, %dst_view[%yo6_5] : f32, view<[%dst_span]xf32>
+    %ye6_6 = vector.extract %y6[6] : vector<8xf32> -> f32
+    %yo6_6_c = index.constant 108 : index
+    %yo6_6_0 = index.add %o_base, %yo6_6_c : index
+    %yo6_6 = index.assume %yo6_6_0 [range(%yo6_6_0, 0, 2147483646), lt(%yo6_6_0, %dst_span)] : index
+    view.store %ye6_6, %dst_view[%yo6_6] : f32, view<[%dst_span]xf32>
+    %ye6_7 = vector.extract %y6[7] : vector<8xf32> -> f32
+    %yo6_7_c = index.constant 110 : index
+    %yo6_7_0 = index.add %o_base, %yo6_7_c : index
+    %yo6_7 = index.assume %yo6_7_0 [range(%yo6_7_0, 0, 2147483646), lt(%yo6_7_0, %dst_span)] : index
+    view.store %ye6_7, %dst_view[%yo6_7] : f32, view<[%dst_span]xf32>
+    %y7 = vector.mulf %of7, %g8 : vector<8xf32>
+    %ye7_0 = vector.extract %y7[0] : vector<8xf32> -> f32
+    %yo7_0_c = index.constant 112 : index
+    %yo7_0_0 = index.add %o_base, %yo7_0_c : index
+    %yo7_0 = index.assume %yo7_0_0 [range(%yo7_0_0, 0, 2147483646), lt(%yo7_0_0, %dst_span)] : index
+    view.store %ye7_0, %dst_view[%yo7_0] : f32, view<[%dst_span]xf32>
+    %ye7_1 = vector.extract %y7[1] : vector<8xf32> -> f32
+    %yo7_1_c = index.constant 114 : index
+    %yo7_1_0 = index.add %o_base, %yo7_1_c : index
+    %yo7_1 = index.assume %yo7_1_0 [range(%yo7_1_0, 0, 2147483646), lt(%yo7_1_0, %dst_span)] : index
+    view.store %ye7_1, %dst_view[%yo7_1] : f32, view<[%dst_span]xf32>
+    %ye7_2 = vector.extract %y7[2] : vector<8xf32> -> f32
+    %yo7_2_c = index.constant 116 : index
+    %yo7_2_0 = index.add %o_base, %yo7_2_c : index
+    %yo7_2 = index.assume %yo7_2_0 [range(%yo7_2_0, 0, 2147483646), lt(%yo7_2_0, %dst_span)] : index
+    view.store %ye7_2, %dst_view[%yo7_2] : f32, view<[%dst_span]xf32>
+    %ye7_3 = vector.extract %y7[3] : vector<8xf32> -> f32
+    %yo7_3_c = index.constant 118 : index
+    %yo7_3_0 = index.add %o_base, %yo7_3_c : index
+    %yo7_3 = index.assume %yo7_3_0 [range(%yo7_3_0, 0, 2147483646), lt(%yo7_3_0, %dst_span)] : index
+    view.store %ye7_3, %dst_view[%yo7_3] : f32, view<[%dst_span]xf32>
+    %ye7_4 = vector.extract %y7[4] : vector<8xf32> -> f32
+    %yo7_4_c = index.constant 120 : index
+    %yo7_4_0 = index.add %o_base, %yo7_4_c : index
+    %yo7_4 = index.assume %yo7_4_0 [range(%yo7_4_0, 0, 2147483646), lt(%yo7_4_0, %dst_span)] : index
+    view.store %ye7_4, %dst_view[%yo7_4] : f32, view<[%dst_span]xf32>
+    %ye7_5 = vector.extract %y7[5] : vector<8xf32> -> f32
+    %yo7_5_c = index.constant 122 : index
+    %yo7_5_0 = index.add %o_base, %yo7_5_c : index
+    %yo7_5 = index.assume %yo7_5_0 [range(%yo7_5_0, 0, 2147483646), lt(%yo7_5_0, %dst_span)] : index
+    view.store %ye7_5, %dst_view[%yo7_5] : f32, view<[%dst_span]xf32>
+    %ye7_6 = vector.extract %y7[6] : vector<8xf32> -> f32
+    %yo7_6_c = index.constant 124 : index
+    %yo7_6_0 = index.add %o_base, %yo7_6_c : index
+    %yo7_6 = index.assume %yo7_6_0 [range(%yo7_6_0, 0, 2147483646), lt(%yo7_6_0, %dst_span)] : index
+    view.store %ye7_6, %dst_view[%yo7_6] : f32, view<[%dst_span]xf32>
+    %ye7_7 = vector.extract %y7[7] : vector<8xf32> -> f32
+    %yo7_7_c = index.constant 126 : index
+    %yo7_7_0 = index.add %o_base, %yo7_7_c : index
+    %yo7_7 = index.assume %yo7_7_0 [range(%yo7_7_0, 0, 2147483646), lt(%yo7_7_0, %dst_span)] : index
+    view.store %ye7_7, %dst_view[%yo7_7] : f32, view<[%dst_span]xf32>
+  }
+  kernel.return
+}

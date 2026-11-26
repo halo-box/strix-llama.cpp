@@ -1,0 +1,463 @@
+// Gated update with matrix ops (gfx11 wave32 WMMA layout), as in gated_update_f32.loom:
+//   y = x - tanh(Wf z) * x + tanh(Wg z) * m with z = rx * (Wd_x . x) + rm * (Wd_m . m).
+// x, m, the weights and z are rounded to f16 for the matrix ops. The sums, the norms and the update are in f32.
+// The caller makes sure that E is a multiple of 64. The z kernel of gated_update_f32.loom adds the partial dots of the down kernel.
+
+target.decl @ggml_wave32
+
+func.def inline @ggml_hrx_gmma_store(%buf: buffer, %elem: index, %v: f32) {
+  %four = index.constant 4 : offset
+  %bytes = index.scale %elem, %four : index, offset -> offset
+  %view = buffer.view %buf[%bytes] : buffer -> view<1xf32>
+  view.store %v, %view[0] : f32, view<1xf32>
+  func.return
+}
+
+// Cephes tanhf, as the TANH kernel (elementwise/unary_f32.loom).
+func.def inline @ggml_hrx_gmma_tanh(%x: f32) -> (f32) {
+  %one = scalar.constant 1.0 : f32
+  %two = scalar.constant 2.0 : f32
+  %small_max = scalar.constant 0.625 : f32
+  %k4 = scalar.constant -0.00570498872745 : f32
+  %k3 = scalar.constant 0.0206390887954 : f32
+  %k2 = scalar.constant -0.0537397155531 : f32
+  %k1 = scalar.constant 0.133314422036 : f32
+  %k0 = scalar.constant -0.333332819422 : f32
+  %ax = scalar.absf %x : f32
+  %ax2 = scalar.addf %ax, %ax : f32
+  %e = scalar.expf<afn> %ax2 : f32
+  %e1 = scalar.addf %e, %one : f32
+  %q = scalar.divf %two, %e1 : f32
+  %big_abs = scalar.subf %one, %q : f32
+  %big = scalar.copysignf %big_abs, %x : f32
+  %s = scalar.mulf %x, %x : f32
+  %p3 = scalar.fmaf %k4, %s, %k3 : f32
+  %p2 = scalar.fmaf %p3, %s, %k2 : f32
+  %p1 = scalar.fmaf %p2, %s, %k1 : f32
+  %p0 = scalar.fmaf %p1, %s, %k0 : f32
+  %ps = scalar.mulf %p0, %s : f32
+  %small = scalar.fmaf %ps, %x, %x : f32
+  %is_small = scalar.cmpf olt, %ax, %small_max : f32
+  %r = scf.select %is_small, %small, %big : f32
+  func.return %r : f32
+}
+
+// 4 values at elements b_j + k of rows j < 8.
+func.def inline @ggml_hrx_gmma_load8x4(%buf: buffer, %b0: index, %b1: index, %b2: index, %b3: index, %b4: index, %b5: index, %b6: index, %b7: index, %k: index) -> (vector<8x4xf32>) {
+  %c0 = index.constant 0 : index
+  %four = index.constant 4 : offset
+  %zero = vector.splatf 0.0 : vector<8x4xf32>
+  %bases = vector.from_elements %b0, %b1, %b2, %b3, %b4, %b5, %b6, %b7 : vector<8xindex>
+  %c1 = index.constant 1 : index
+  %c8 = index.constant 8 : index
+  %r = scf.for %j = [%c0 to %c8 step %c1](%acc = %zero : vector<8x4xf32>) -> (vector<8x4xf32>) unroll {
+    %b = vector.extract %bases[%j] : vector<8xindex> -> index
+    %i = index.add %b, %k : index
+    %o = index.scale %i, %four : index, offset -> offset
+    %v = buffer.view %buf[%o] : buffer -> view<4xf32>
+    %l = vector.load %v[%c0] : view<4xf32> -> vector<4xf32>
+    %n = vector.insert %l into %acc[%j] : vector<4xf32>, vector<8x4xf32>
+    scf.yield %n : vector<8x4xf32>
+  }
+  func.return %r : vector<8x4xf32>
+}
+
+// Rows 8 j + r0 (j < 8) of a stage get the f16 values of v at column col.
+func.def inline @ggml_hrx_gmma_stage8x4(%stage: view<64x72xf16>, %r0: index, %col: index, %v: vector<8x4xf32>) {
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c8 = index.constant 8 : index
+  scf.for %j = [%c0 to %c8 step %c1] unroll {
+    %v4 = vector.extract %v[%j] : vector<8x4xf32> -> vector<4xf32>
+    %h4 = vector.fptrunc %v4 : vector<4xf32> to vector<4xf16>
+    %row = index.madd %j, %c8, %r0 : index
+    vector.store %h4, %stage[%row, %col] : vector<4xf16>, view<64x72xf16>
+  }
+  func.return
+}
+
+// The sums of squares of the 8 rows of v: each row adds the squares of its 4 values in order.
+func.def inline @ggml_hrx_gmma_sq8x4(%v: vector<8x4xf32>, %sq: vector<8xf32>) -> (vector<8xf32>) {
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c8 = index.constant 8 : index
+  %f0 = scalar.constant 0.0 : f32
+  %out = scf.for %j = [%c0 to %c8 step %c1](%q = %sq : vector<8xf32>) -> (vector<8xf32>) unroll {
+    %v4 = vector.extract %v[%j] : vector<8x4xf32> -> vector<4xf32>
+    %v2 = vector.mulf %v4, %v4 : vector<4xf32>
+    %s = vector.reduce<addf> %v2, %f0 : vector<4xf32>, f32
+    %old = vector.extract %q[%j] : vector<8xf32> -> f32
+    %new = scalar.addf %old, %s : f32
+    %qn = vector.insert %new into %q[%j] : f32, vector<8xf32>
+    scf.yield %qn : vector<8xf32>
+  }
+  func.return %out : vector<8xf32>
+}
+
+// Partial dots of chunk p of kc input values (of [x; m], the x chunks first) for 64 tokens (y) for each workgroup of 4 waves.
+// Wave s takes tokens 16 s and the 64 rows of Wd. part has the layout of gated_update_f32.loom with P = 2 E / kc chunks:
+// The 64 dots of token t start at (t P + p) 64 and the sum of squares is at sq_off + t P + p.
+// Each lane loads four input values for eight tokens and 32 weights from one Wd row per K step.
+kernel.def target(@ggml_wave32) export("ggml_gated_update_down_mma") @ggml_gated_update_down_mma(%n_chunks: index, %n_t: index) {
+  %one = index.constant 1 : index
+  %wg_size = index.constant 128 : index
+  %c63 = index.constant 63 : index
+  %c64 = index.constant 64 : index
+  %n_round = index.add %n_t, %c63 : index
+  %tiles = index.div %n_round, %c64 : index
+  kernel.launch.config workgroups(%n_chunks, %tiles, %one) workgroup_size(%wg_size, %one, %one) : index
+} launch(%e_in: index, %n_t_in: index, %x_s1_in: index, %m_s1_in: index, %kc_in: index, %sq_off_in: index, %x: buffer, %m: buffer, %w: buffer, %part: buffer) {
+  // The caller checks these ranges.
+  %e = index.assume %e_in [range(%e_in, 64, 16777216), multiple_of(%e_in, 64)] : index
+  %n_t = index.assume %n_t_in [range(%n_t_in, 1, 2147483647)] : index
+  %x_s1 = index.assume %x_s1_in [range(%x_s1_in, 0, 2147483647), multiple_of(%x_s1_in, 4)] : index
+  %m_s1 = index.assume %m_s1_in [range(%m_s1_in, 0, 2147483647), multiple_of(%m_s1_in, 4)] : index
+  %kc = index.assume %kc_in [range(%kc_in, 64, 16777216), multiple_of(%kc_in, 64)] : index
+  %sq_off = index.assume %sq_off_in [range(%sq_off_in, 0, 2147483647)] : index
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c4 = index.constant 4 : index
+  %c8 = index.constant 8 : index
+  %c16 = index.constant 16 : index
+  %c24 = index.constant 24 : index
+  %c32 = index.constant 32 : index
+  %c40 = index.constant 40 : index
+  %c48 = index.constant 48 : index
+  %c56 = index.constant 56 : index
+  %c64 = index.constant 64 : index
+  %c0_offset = index.constant 0 : offset
+  %four = index.constant 4 : offset
+  %p = kernel.workgroup.id<x> : index
+  %tile = kernel.workgroup.id<y> : index
+  %tid_raw = kernel.workitem.id<x> : index
+  %t = index.assume %tid_raw [range(%tid_raw, 0, 127)] : index
+  %s_raw = kernel.subgroup.id : index
+  %s = index.assume %s_raw [range(%s_raw, 0, 3)] : index
+  %lane_raw = kernel.subgroup.lane.id : index
+  %lane = index.assume %lane_raw [range(%lane_raw, 0, 31)] : index
+  %x_noalias, %m_noalias, %w_noalias = buffer.assume.noalias %x, %m, %w : buffer, buffer, buffer
+
+  // Stages of one K step: the input and Wd as [64][72] f16.
+  %stage_bytes = index.constant 18432 : offset
+  %lds = buffer.alloca<workgroup> align(16) %stage_bytes : buffer
+  %stage_size = index.constant 9216 : offset
+  %as = buffer.view %lds[%c0_offset] : buffer -> view<64x72xf16>
+  %bs = buffer.view %lds[%stage_size] : buffer -> view<64x72xf16>
+
+  %two_e = index.add %e, %e : index
+  %n_chunks = index.div %two_e, %kc : index
+  %half_chunks = index.div %e, %kc : index
+  %in_x = index.cmp ult, %p, %half_chunks : index
+  %p_base = scf.select %in_x, %c0, %half_chunks : index
+  %p_local = index.sub %p, %p_base : index
+  %k0 = index.mul %p_local, %kc : index
+  %src = scf.select %in_x, %x_noalias, %m_noalias : buffer
+  %s1 = scf.select %in_x, %x_s1, %m_s1 : index
+  %w_k0 = index.mul %p, %kc : index
+
+  %ld_r = index.div %t, %c16 : index
+  %ld_c = index.rem %t, %c16 : index
+  %ld_k = index.mul %ld_c, %c4 : index
+  %tok0 = index.mul %tile, %c64 : index
+  %last_tok = index.sub %n_t, %c1 : index
+  %a_k = index.add %k0, %ld_k : index
+  %r1 = index.add %ld_r, %c8 : index
+  %r2 = index.add %ld_r, %c16 : index
+  %r3 = index.add %ld_r, %c24 : index
+  %r4 = index.add %ld_r, %c32 : index
+  %r5 = index.add %ld_r, %c40 : index
+  %r6 = index.add %ld_r, %c48 : index
+  %r7 = index.add %ld_r, %c56 : index
+  %t0r = index.add %tok0, %ld_r : index
+  %t1r = index.add %tok0, %r1 : index
+  %t2r = index.add %tok0, %r2 : index
+  %t3r = index.add %tok0, %r3 : index
+  %t4r = index.add %tok0, %r4 : index
+  %t5r = index.add %tok0, %r5 : index
+  %t6r = index.add %tok0, %r6 : index
+  %t7r = index.add %tok0, %r7 : index
+  %t0c = index.min %t0r, %last_tok : index
+  %t1c = index.min %t1r, %last_tok : index
+  %t2c = index.min %t2r, %last_tok : index
+  %t3c = index.min %t3r, %last_tok : index
+  %t4c = index.min %t4r, %last_tok : index
+  %t5c = index.min %t5r, %last_tok : index
+  %t6c = index.min %t6r, %last_tok : index
+  %t7c = index.min %t7r, %last_tok : index
+  %ab0 = index.madd %t0c, %s1, %a_k : index
+  %ab1 = index.madd %t1c, %s1, %a_k : index
+  %ab2 = index.madd %t2c, %s1, %a_k : index
+  %ab3 = index.madd %t3c, %s1, %a_k : index
+  %ab4 = index.madd %t4c, %s1, %a_k : index
+  %ab5 = index.madd %t5c, %s1, %a_k : index
+  %ab6 = index.madd %t6c, %s1, %a_k : index
+  %ab7 = index.madd %t7c, %s1, %a_k : index
+  %half_row = index.rem %t, %c2 : index
+  %w_col = index.mul %half_row, %c32 : index
+  %w_row = index.div %t, %c2 : index
+  %w_col0 = index.add %w_k0, %w_col : index
+  %w_base = index.madd %w_row, %two_e, %w_col0 : index
+
+  // The rhs fragment of a lane: 16 K values of Wd row 16 n + lane % 16.
+  %a_row = index.mul %s, %c16 : index
+  %lane_n = index.rem %lane, %c16 : index
+  %n1 = index.add %lane_n, %c16 : index
+  %n2 = index.add %lane_n, %c32 : index
+  %n3 = index.add %lane_n, %c48 : index
+  %zero8 = vector.splatf 0.0 : vector<8xf32>
+  %init = vector.fragment<init> %zero8 shape [%c16, %c16] : vector<8xf32>
+  %acc0, %acc1, %acc2, %acc3, %sq = scf.for %k = [%c0 to %kc step %c64](%a0 = %init : vector<8xf32>, %a1 = %init : vector<8xf32>, %a2 = %init : vector<8xf32>, %a3 = %init : vector<8xf32>, %q = %zero8 : vector<8xf32>) -> (vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>) {
+    %a = func.call @ggml_hrx_gmma_load8x4(%src, %ab0, %ab1, %ab2, %ab3, %ab4, %ab5, %ab6, %ab7, %k) : (buffer, index, index, index, index, index, index, index, index, index) -> (vector<8x4xf32>)
+    func.call @ggml_hrx_gmma_stage8x4(%as, %ld_r, %ld_k, %a) : (view<64x72xf16>, index, index, vector<8x4xf32>)
+    %qn = func.call @ggml_hrx_gmma_sq8x4(%a, %q) : (vector<8x4xf32>, vector<8xf32>) -> (vector<8xf32>)
+    %wi = index.add %w_base, %k : index
+    %wo = index.scale %wi, %four : index, offset -> offset
+    %wv = buffer.view %w_noalias[%wo] : buffer -> view<32xf32>
+    %w32 = vector.load %wv[%c0] : view<32xf32> -> vector<32xf32>
+    %wh = vector.fptrunc %w32 : vector<32xf32> to vector<32xf16>
+    vector.store %wh, %bs[%w_row, %w_col] : vector<32xf16>, view<64x72xf16>
+    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+    %r0a, %r1a, %r2a, %r3a = scf.for %kh = [%c0 to %c64 step %c16](%b0 = %a0 : vector<8xf32>, %b1 = %a1 : vector<8xf32>, %b2 = %a2 : vector<8xf32>, %b3 = %a3 : vector<8xf32>) -> (vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>) unroll {
+      %lhs = vector.fragment.load<lhs> %as[%a_row, %kh] shape [%c16, %c16] : view<64x72xf16> -> vector<16xf16>
+      %v0 = vector.load %bs[%lane_n, %kh] : view<64x72xf16> -> vector<16xf16>
+      %v1 = vector.load %bs[%n1, %kh] : view<64x72xf16> -> vector<16xf16>
+      %v2 = vector.load %bs[%n2, %kh] : view<64x72xf16> -> vector<16xf16>
+      %v3 = vector.load %bs[%n3, %kh] : view<64x72xf16> -> vector<16xf16>
+      %f0r = vector.fragment<rhs> %v0 shape [%c16, %c16] : vector<16xf16>
+      %f1r = vector.fragment<rhs> %v1 shape [%c16, %c16] : vector<16xf16>
+      %f2r = vector.fragment<rhs> %v2 shape [%c16, %c16] : vector<16xf16>
+      %f3r = vector.fragment<rhs> %v3 shape [%c16, %c16] : vector<16xf16>
+      %d0 = vector.mma %lhs, %f0r, %b0 : vector<16xf16>, vector<16xf16>, vector<8xf32>
+      %d1 = vector.mma %lhs, %f1r, %b1 : vector<16xf16>, vector<16xf16>, vector<8xf32>
+      %d2 = vector.mma %lhs, %f2r, %b2 : vector<16xf16>, vector<16xf16>, vector<8xf32>
+      %d3 = vector.mma %lhs, %f3r, %b3 : vector<16xf16>, vector<16xf16>, vector<8xf32>
+      scf.yield %d0, %d1, %d2, %d3 : vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>
+    }
+    // The next K step overwrites the stages.
+    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+    scf.yield %r0a, %r1a, %r2a, %r3a, %qn : vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>
+  }
+
+  // The 16 lanes of a row add their squares.
+  %sq_writer = index.cmp eq, %ld_c, %c0 : index
+  scf.for %j = [%c0 to %c8 step %c1] unroll {
+    %row = index.madd %j, %c8, %ld_r : index
+    %tok = index.add %tok0, %row : index
+    %pq = vector.extract %sq[%j] : vector<8xf32> -> f32
+    %tq = kernel.subgroup.reduce<addf> %pq {cluster_size = 16} : f32
+    %valid = index.cmp ult, %tok, %n_t : index
+    %store = scalar.andi %sq_writer, %valid : i1
+    scf.if %store {
+      %si0 = index.madd %tok, %n_chunks, %p : index
+      %si = index.add %sq_off, %si0 : index
+      func.call @ggml_hrx_gmma_store(%part, %si, %tq) : (buffer, index, f32)
+    }
+  }
+  // Element i of lane l of a dot fragment: token a_row + l / 16 + 2 i and row 16 n + l % 16.
+  %lane_m = index.div %lane, %c16 : index
+  scf.for %i = [%c0 to %c8 step %c1] unroll {
+    %i2 = index.mul %i, %c2 : index
+    %tr0 = index.add %a_row, %lane_m : index
+    %tr = index.add %tr0, %i2 : index
+    %tok = index.add %tok0, %tr : index
+    %valid = index.cmp ult, %tok, %n_t : index
+    scf.if %valid {
+      %pc = index.madd %tok, %n_chunks, %p : index
+      %base = index.mul %pc, %c64 : index
+      %i0 = index.add %base, %lane_n : index
+      %i1 = index.add %base, %n1 : index
+      %i2b = index.add %base, %n2 : index
+      %i3 = index.add %base, %n3 : index
+      %e0 = vector.extract %acc0[%i] : vector<8xf32> -> f32
+      %e1 = vector.extract %acc1[%i] : vector<8xf32> -> f32
+      %e2 = vector.extract %acc2[%i] : vector<8xf32> -> f32
+      %e3 = vector.extract %acc3[%i] : vector<8xf32> -> f32
+      func.call @ggml_hrx_gmma_store(%part, %i0, %e0) : (buffer, index, f32)
+      func.call @ggml_hrx_gmma_store(%part, %i1, %e1) : (buffer, index, f32)
+      func.call @ggml_hrx_gmma_store(%part, %i2b, %e2) : (buffer, index, f32)
+      func.call @ggml_hrx_gmma_store(%part, %i3, %e3) : (buffer, index, f32)
+    }
+  }
+  kernel.return
+}
+
+// y = x - tanh(f) x + tanh(g) m at token tok and row ch, with the ops of the unfused graph: MUL, SUB, MUL, ADD.
+func.def inline @ggml_hrx_gmma_update(%x: buffer, %m: buffer, %y: buffer, %x_s1: index, %m_s1: index, %y_s1: index, %tok: index, %ch: index, %fs: f32, %gs: f32) {
+  %four = index.constant 4 : offset
+  %ft = func.call @ggml_hrx_gmma_tanh(%fs) : (f32) -> (f32)
+  %gt = func.call @ggml_hrx_gmma_tanh(%gs) : (f32) -> (f32)
+  %xi = index.madd %tok, %x_s1, %ch : index
+  %mi = index.madd %tok, %m_s1, %ch : index
+  %yi = index.madd %tok, %y_s1, %ch : index
+  %xo = index.scale %xi, %four : index, offset -> offset
+  %mo = index.scale %mi, %four : index, offset -> offset
+  %yo = index.scale %yi, %four : index, offset -> offset
+  %xv = buffer.view %x[%xo] : buffer -> view<1xf32>
+  %mv = buffer.view %m[%mo] : buffer -> view<1xf32>
+  %yv = buffer.view %y[%yo] : buffer -> view<1xf32>
+  %xe = view.load %xv[0] : view<1xf32> -> f32
+  %me = view.load %mv[0] : view<1xf32> -> f32
+  %fx = scalar.mulf %ft, %xe : f32
+  %d = scalar.subf %xe, %fx : f32
+  %gm = scalar.mulf %gt, %me : f32
+  %yn = scalar.addf %d, %gm : f32
+  view.store %yn, %yv[0] : f32, view<1xf32>
+  func.return
+}
+
+// Rows r0 + 8 j (j < 8) of a stage get the f16 values of the 64-value rows at b + 512 j: 4 values at column col.
+func.def inline @ggml_hrx_gmma_stage8(%stage: view<64x72xf16>, %src: buffer, %b: index, %r0: index, %col: index) {
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c8 = index.constant 8 : index
+  %c512 = index.constant 512 : index
+  %four = index.constant 4 : offset
+  scf.for %j = [%c0 to %c8 step %c1] unroll {
+    %row = index.madd %j, %c8, %r0 : index
+    %ri = index.mul %j, %c512 : index
+    %i0 = index.add %b, %ri : index
+    %i = index.add %i0, %col : index
+    %o = index.scale %i, %four : index, offset -> offset
+    %v = buffer.view %src[%o] : buffer -> view<4xf32>
+    %l = vector.load %v[%c0] : view<4xf32> -> vector<4xf32>
+    %h = vector.fptrunc %l : vector<4xf32> to vector<4xf16>
+    vector.store %h, %stage[%row, %col] : vector<4xf16>, view<64x72xf16>
+  }
+  func.return
+}
+
+// Gates and update of 64 tokens (y) and 64 rows (x) for each workgroup of 4 waves. Wave s: tokens 32 (s / 2), rows 32 (s % 2).
+// z, Wf and Wg are staged as f16. Element i of lane l of a result is token l / 16 + 2 i and row l % 16 of its 16x16 tile.
+kernel.def target(@ggml_wave32) export("ggml_gated_update_apply_mma") @ggml_gated_update_apply_mma(%e: index, %n_t: index) {
+  %one = index.constant 1 : index
+  %c63 = index.constant 63 : index
+  %c64 = index.constant 64 : index
+  %wg_size = index.constant 128 : index
+  %groups = index.div %e, %c64 : index
+  %n_round = index.add %n_t, %c63 : index
+  %tiles = index.div %n_round, %c64 : index
+  kernel.launch.config workgroups(%groups, %tiles, %one) workgroup_size(%wg_size, %one, %one) : index
+} launch(%e_in: index, %n_t_in: index, %x_s1_in: index, %m_s1_in: index, %y_s1_in: index, %z_off_in: index, %x: buffer, %m: buffer, %wf: buffer, %wg: buffer, %part: buffer, %y: buffer) {
+  %e = index.assume %e_in [range(%e_in, 64, 16777216), multiple_of(%e_in, 64)] : index
+  %n_t = index.assume %n_t_in [range(%n_t_in, 1, 2147483647)] : index
+  %x_s1 = index.assume %x_s1_in [range(%x_s1_in, 0, 2147483647), multiple_of(%x_s1_in, 4)] : index
+  %m_s1 = index.assume %m_s1_in [range(%m_s1_in, 0, 2147483647), multiple_of(%m_s1_in, 4)] : index
+  %y_s1 = index.assume %y_s1_in [range(%y_s1_in, 0, 2147483647), multiple_of(%y_s1_in, 4)] : index
+  %z_off = index.assume %z_off_in [range(%z_off_in, 0, 2147483647)] : index
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c4 = index.constant 4 : index
+  %c8 = index.constant 8 : index
+  %c16 = index.constant 16 : index
+  %c32 = index.constant 32 : index
+  %c64 = index.constant 64 : index
+  %c0_offset = index.constant 0 : offset
+  %four = index.constant 4 : offset
+  %group = kernel.workgroup.id<x> : index
+  %tile = kernel.workgroup.id<y> : index
+  %tid_raw = kernel.workitem.id<x> : index
+  %t = index.assume %tid_raw [range(%tid_raw, 0, 127)] : index
+  %s_raw = kernel.subgroup.id : index
+  %s = index.assume %s_raw [range(%s_raw, 0, 3)] : index
+  %lane_raw = kernel.subgroup.lane.id : index
+  %lane = index.assume %lane_raw [range(%lane_raw, 0, 31)] : index
+  %x_noalias, %m_noalias, %y_noalias = buffer.assume.noalias %x, %m, %y : buffer, buffer, buffer
+
+  // The f16 stages of z, Wf and Wg.
+  %lds_bytes = index.constant 27648 : offset
+  %lds = buffer.alloca<workgroup> align(16) %lds_bytes : buffer
+  %o_f = index.constant 9216 : offset
+  %o_g = index.constant 18432 : offset
+  %zs = buffer.view %lds[%c0_offset] : buffer -> view<64x72xf16>
+  %fs = buffer.view %lds[%o_f] : buffer -> view<64x72xf16>
+  %gs = buffer.view %lds[%o_g] : buffer -> view<64x72xf16>
+
+  %ld_r = index.div %t, %c16 : index
+  %ld_c = index.rem %t, %c16 : index
+  %ld_k = index.mul %ld_c, %c4 : index
+  %tok0 = index.mul %tile, %c64 : index
+  %row0 = index.mul %group, %c64 : index
+  // Tokens past the last one read the last one. A part of z has n_t * 64 values: the last 64-token tile is clamped.
+  %last_tok = index.sub %n_t, %c1 : index
+  scf.for %j = [%c0 to %c8 step %c1] unroll {
+    %row = index.madd %j, %c8, %ld_r : index
+    %tk_raw = index.add %tok0, %row : index
+    %tk = index.min %tk_raw, %last_tok : index
+    %zi0 = index.madd %tk, %c64, %ld_k : index
+    %zi = index.add %z_off, %zi0 : index
+    %zo = index.scale %zi, %four : index, offset -> offset
+    %zv = buffer.view %part[%zo] : buffer -> view<4xf32>
+    %z4 = vector.load %zv[%c0] : view<4xf32> -> vector<4xf32>
+    %zh = vector.fptrunc %z4 : vector<4xf32> to vector<4xf16>
+    vector.store %zh, %zs[%row, %ld_k] : vector<4xf16>, view<64x72xf16>
+  }
+  %w_r = index.add %row0, %ld_r : index
+  %w_b1 = index.mul %w_r, %c64 : index
+  func.call @ggml_hrx_gmma_stage8(%fs, %wf, %w_b1, %ld_r, %ld_k) : (view<64x72xf16>, buffer, index, index, index)
+  func.call @ggml_hrx_gmma_stage8(%gs, %wg, %w_b1, %ld_r, %ld_k) : (view<64x72xf16>, buffer, index, index, index)
+  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+
+  %wr = index.div %s, %c2 : index
+  %wc = index.rem %s, %c2 : index
+  %a_row0 = index.mul %wr, %c32 : index
+  %a_row1 = index.add %a_row0, %c16 : index
+  %b_col0 = index.mul %wc, %c32 : index
+  %lane_n = index.rem %lane, %c16 : index
+  %lane_m = index.div %lane, %c16 : index
+  %rc0 = index.add %b_col0, %lane_n : index
+  %rc1 = index.add %rc0, %c16 : index
+  %zero8 = vector.splatf 0.0 : vector<8xf32>
+  %init = vector.fragment<init> %zero8 shape [%c16, %c16] : vector<8xf32>
+  %f00, %f01, %f10, %f11, %g00, %g01, %g10, %g11 = scf.for %kh = [%c0 to %c64 step %c16](%af00 = %init : vector<8xf32>, %af01 = %init : vector<8xf32>, %af10 = %init : vector<8xf32>, %af11 = %init : vector<8xf32>, %ag00 = %init : vector<8xf32>, %ag01 = %init : vector<8xf32>, %ag10 = %init : vector<8xf32>, %ag11 = %init : vector<8xf32>) -> (vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>) unroll {
+    %l0 = vector.fragment.load<lhs> %zs[%a_row0, %kh] shape [%c16, %c16] : view<64x72xf16> -> vector<16xf16>
+    %l1 = vector.fragment.load<lhs> %zs[%a_row1, %kh] shape [%c16, %c16] : view<64x72xf16> -> vector<16xf16>
+    %fv0 = vector.load %fs[%rc0, %kh] : view<64x72xf16> -> vector<16xf16>
+    %fv1 = vector.load %fs[%rc1, %kh] : view<64x72xf16> -> vector<16xf16>
+    %gv0 = vector.load %gs[%rc0, %kh] : view<64x72xf16> -> vector<16xf16>
+    %gv1 = vector.load %gs[%rc1, %kh] : view<64x72xf16> -> vector<16xf16>
+    %fr0 = vector.fragment<rhs> %fv0 shape [%c16, %c16] : vector<16xf16>
+    %fr1 = vector.fragment<rhs> %fv1 shape [%c16, %c16] : vector<16xf16>
+    %gr0 = vector.fragment<rhs> %gv0 shape [%c16, %c16] : vector<16xf16>
+    %gr1 = vector.fragment<rhs> %gv1 shape [%c16, %c16] : vector<16xf16>
+    %nf00 = vector.mma %l0, %fr0, %af00 : vector<16xf16>, vector<16xf16>, vector<8xf32>
+    %nf01 = vector.mma %l0, %fr1, %af01 : vector<16xf16>, vector<16xf16>, vector<8xf32>
+    %nf10 = vector.mma %l1, %fr0, %af10 : vector<16xf16>, vector<16xf16>, vector<8xf32>
+    %nf11 = vector.mma %l1, %fr1, %af11 : vector<16xf16>, vector<16xf16>, vector<8xf32>
+    %ng00 = vector.mma %l0, %gr0, %ag00 : vector<16xf16>, vector<16xf16>, vector<8xf32>
+    %ng01 = vector.mma %l0, %gr1, %ag01 : vector<16xf16>, vector<16xf16>, vector<8xf32>
+    %ng10 = vector.mma %l1, %gr0, %ag10 : vector<16xf16>, vector<16xf16>, vector<8xf32>
+    %ng11 = vector.mma %l1, %gr1, %ag11 : vector<16xf16>, vector<16xf16>, vector<8xf32>
+    scf.yield %nf00, %nf01, %nf10, %nf11, %ng00, %ng01, %ng10, %ng11 : vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>
+  }
+  %ch0 = index.add %row0, %rc0 : index
+  %ch1 = index.add %row0, %rc1 : index
+  %tb0 = index.add %tok0, %a_row0 : index
+  %tb1 = index.add %tok0, %a_row1 : index
+  scf.for %i = [%c0 to %c8 step %c1] unroll {
+    %i2 = index.mul %i, %c2 : index
+    %ti = index.add %lane_m, %i2 : index
+    %tok_a = index.add %tb0, %ti : index
+    %tok_b = index.add %tb1, %ti : index
+    %va = index.cmp ult, %tok_a, %n_t : index
+    %vb = index.cmp ult, %tok_b, %n_t : index
+    %pf00 = vector.extract %f00[%i] : vector<8xf32> -> f32
+    %pf01 = vector.extract %f01[%i] : vector<8xf32> -> f32
+    %pf10 = vector.extract %f10[%i] : vector<8xf32> -> f32
+    %pf11 = vector.extract %f11[%i] : vector<8xf32> -> f32
+    %pg00 = vector.extract %g00[%i] : vector<8xf32> -> f32
+    %pg01 = vector.extract %g01[%i] : vector<8xf32> -> f32
+    %pg10 = vector.extract %g10[%i] : vector<8xf32> -> f32
+    %pg11 = vector.extract %g11[%i] : vector<8xf32> -> f32
+    scf.if %va {
+      func.call @ggml_hrx_gmma_update(%x_noalias, %m_noalias, %y_noalias, %x_s1, %m_s1, %y_s1, %tok_a, %ch0, %pf00, %pg00) : (buffer, buffer, buffer, index, index, index, index, index, f32, f32)
+      func.call @ggml_hrx_gmma_update(%x_noalias, %m_noalias, %y_noalias, %x_s1, %m_s1, %y_s1, %tok_a, %ch1, %pf01, %pg01) : (buffer, buffer, buffer, index, index, index, index, index, f32, f32)
+    }
+    scf.if %vb {
+      func.call @ggml_hrx_gmma_update(%x_noalias, %m_noalias, %y_noalias, %x_s1, %m_s1, %y_s1, %tok_b, %ch0, %pf10, %pg10) : (buffer, buffer, buffer, index, index, index, index, index, f32, f32)
+      func.call @ggml_hrx_gmma_update(%x_noalias, %m_noalias, %y_noalias, %x_s1, %m_s1, %y_s1, %tok_b, %ch1, %pf11, %pg11) : (buffer, buffer, buffer, index, index, index, index, index, f32, f32)
+    }
+  }
+  kernel.return
+}

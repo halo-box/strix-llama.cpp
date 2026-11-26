@@ -89,6 +89,14 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
 //
 std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, bool grammar_first = false);
 
+// largest number of draft candidates that the backend verification takes (see llama_sampler_init_dist_spec)
+#define COMMON_SPEC_VERIFY_N_CAND 64
+
+// sets the draft for the backend verification of the next decode, see llama_sampler_dist_spec_set_draft()
+// after that decode, common_sampler_sample_and_accept_n() gives the result of the rejection sampling
+// returns false if the chain cannot verify on the backend
+bool common_sampler_spec_set_draft(struct common_sampler * gsmpl, const llama_tokens & draft, const std::vector<std::vector<llama_token_data>> & draft_q);
+
 // as above, but verifies by rejection sampling; draft_q holds the draft's candidates per token
 std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, const std::vector<std::vector<llama_token_data>> & draft_q, bool grammar_first = false);
 

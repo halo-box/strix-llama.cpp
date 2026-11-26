@@ -1,0 +1,235 @@
+// Softmax-weighted mix of RMS-normalized rows. For each token t there are R rows x_k of ne0 values, row k in buffer
+// x<k>. n_k = x_k / sqrt(mean(x_k^2) + eps), s_kq = scale * dot(n_k, query_q), p_q = softmax of s_q over k, and
+// dst[t, q] = sum over k of p_kq * n_k. One workgroup for each token. Each lane keeps its vecs vec4 of each row in
+// registers, thus the rows are read only one time. The rows and dst are contiguous.
+
+config.decl @ggml.norm_mix.rows : %value: index where [range(%value, 1, 9)]
+config.decl @ggml.norm_mix.nq : %value: index where [range(%value, 1, 4)]
+config.decl @ggml.norm_mix.lanes : %value: index where [range(%value, 64, 1024), multiple_of(%value, 64)]
+config.decl @ggml.norm_mix.vecs : %value: index where [range(%value, 1, 4)]
+
+target.decl @ggml_wave64
+
+func.def inline @ggml_norm_mix_pick(%k: index, %x0: buffer, %x1: buffer, %x2: buffer, %x3: buffer, %x4: buffer, %x5: buffer, %x6: buffer, %x7: buffer, %x8: buffer) -> (buffer) {
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c3 = index.constant 3 : index
+  %c4 = index.constant 4 : index
+  %c5 = index.constant 5 : index
+  %c6 = index.constant 6 : index
+  %c7 = index.constant 7 : index
+  %c8 = index.constant 8 : index
+  %is1 = index.cmp eq, %k, %c1 : index
+  %is2 = index.cmp eq, %k, %c2 : index
+  %is3 = index.cmp eq, %k, %c3 : index
+  %is4 = index.cmp eq, %k, %c4 : index
+  %is5 = index.cmp eq, %k, %c5 : index
+  %is6 = index.cmp eq, %k, %c6 : index
+  %is7 = index.cmp eq, %k, %c7 : index
+  %is8 = index.cmp eq, %k, %c8 : index
+  %s1 = scf.select %is1, %x1, %x0 : buffer
+  %s2 = scf.select %is2, %x2, %s1 : buffer
+  %s3 = scf.select %is3, %x3, %s2 : buffer
+  %s4 = scf.select %is4, %x4, %s3 : buffer
+  %s5 = scf.select %is5, %x5, %s4 : buffer
+  %s6 = scf.select %is6, %x6, %s5 : buffer
+  %s7 = scf.select %is7, %x7, %s6 : buffer
+  %s8 = scf.select %is8, %x8, %s7 : buffer
+  func.return %s8 : buffer
+}
+
+// 4 values from base + c, zeros past the row end. ne0 is a multiple of 4. The load has no guard: a guard merge waits
+// for the data. The index is clamped and the value selected.
+func.def inline @ggml_norm_mix_load(%src: buffer, %span_in: index, %base: index, %c: index, %ne0: index) -> (vector<4xf32>) {
+  %c3 = index.constant 3 : index
+  %c4 = index.constant 4 : index
+  %zero = index.constant 0 : offset
+  %zero4 = vector.splatf 0.0 : vector<4xf32>
+  %span = index.assume %span_in [range(%span_in, 4, 2147483647)] : index
+  %top = index.sub %span, %c4 : index
+  %limit0 = index.sub %span, %c3 : index
+  %idx = index.add %base, %c : index
+  %off = index.assume %idx [range(%idx, 0, 2147483640)] : index
+  %end = index.add %off, %c3 : index
+  %in_span = index.cmp ult, %end, %span : index
+  %in_row = index.cmp ult, %c, %ne0 : index
+  %ok = scalar.andi %in_row, %in_span : i1
+  %i0 = index.min %off, %top : index
+  %i, %limit = index.assume %i0, %limit0 [lt(%i0, %limit0)] : index, index
+  %extent = index.add %limit, %c3 : index
+  %view = buffer.view %src[%zero] : buffer -> view<[%extent]xf32>
+  %x = vector.load %view[%i] : view<[%extent]xf32> -> vector<4xf32>
+  %v = scf.select %ok, %x, %zero4 : vector<4xf32>
+  func.return %v : vector<4xf32>
+}
+
+func.def inline @ggml_norm_mix_f32_from_bits(%bits: index) -> (f32) {
+  %i = index.cast %bits : index to i32
+  %v = vector.from_elements %i : vector<1xi32>
+  %f = vector.bitcast %v : vector<1xi32> to vector<1xf32>
+  %r = vector.extract %f[0] : vector<1xf32> -> f32
+  func.return %r : f32
+}
+
+kernel.def target(@ggml_wave64) export("ggml_rms_norm_mix_f32") @ggml_rms_norm_mix_f32(%tokens: index) {
+  %one = index.constant 1 : index
+  %lanes = config.get @ggml.norm_mix.lanes : index
+  kernel.launch.config workgroups(%tokens, %one, %one) workgroup_size(%lanes, %one, %one) : index
+} launch(%ne0_in: index, %src_span_in: index, %q_stride_in: index, %q_span_in: index, %dst_span_in: index, %eps_bits: index, %scale_bits: index, %x0: buffer, %x1: buffer, %x2: buffer, %x3: buffer, %x4: buffer, %x5: buffer, %x6: buffer, %x7: buffer, %x8: buffer, %query: buffer, %dst: buffer) {
+  // The caller checks these ranges. ne0 must be a multiple of 4.
+  %ne0 = index.assume %ne0_in [range(%ne0_in, 4, 16384)] : index
+  %src_span = index.assume %src_span_in [range(%src_span_in, 4, 2147483647)] : index
+  %q_stride = index.assume %q_stride_in [range(%q_stride_in, 0, 2147483647)] : index
+  %q_span = index.assume %q_span_in [range(%q_span_in, 4, 2147483647)] : index
+  %dst_span = index.assume %dst_span_in [range(%dst_span_in, 4, 2147483647)] : index
+  %rows = config.get @ggml.norm_mix.rows : index
+  %nq = config.get @ggml.norm_mix.nq : index
+  %lanes = config.get @ggml.norm_mix.lanes : index
+  %vecs = config.get @ggml.norm_mix.vecs : index
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c3 = index.constant 3 : index
+  %c4 = index.constant 4 : index
+  %zero = index.constant 0 : offset
+  %f0 = scalar.constant 0.0 : f32
+  %f1 = scalar.constant 1.0 : f32
+  %lowest = scalar.constant -3.4028234663852886e+38 : f32
+  %zero4 = vector.splatf 0.0 : vector<4xf32>
+  %token = kernel.workgroup.id<x> : index
+  %lane = kernel.workitem.id<x> : index
+  %base_raw = index.mul %token, %ne0 : index
+  %base = index.assume %base_raw [range(%base_raw, 0, 2147483640)] : index
+  %eps = func.call @ggml_norm_mix_f32_from_bits(%eps_bits) : (index) -> (f32)
+  %scale = func.call @ggml_norm_mix_f32_from_bits(%scale_bits) : (index) -> (f32)
+  %ne0_i32 = index.cast %ne0 : index to i32
+  %ne0_f32 = scalar.sitofp %ne0_i32 : i32 to f32
+
+  // The query values of this lane, slot q*4 + j.
+  %qb0 = vector.splatf 0.0 : vector<16x4xf32>
+  %qbank = scf.for %q = [%c0 to %nq step %c1](%qb = %qb0 : vector<16x4xf32>) -> (vector<16x4xf32>) unroll {
+    %q_base_raw = index.mul %q, %q_stride : index
+    %q_base = index.assume %q_base_raw [range(%q_base_raw, 0, 2147483640)] : index
+    %qb_next = scf.for %j = [%c0 to %vecs step %c1](%b = %qb : vector<16x4xf32>) -> (vector<16x4xf32>) unroll {
+      %chunk = index.madd %j, %lanes, %lane : index
+      %c = index.mul %chunk, %c4 : index
+      %v = func.call @ggml_norm_mix_load(%query, %q_span, %q_base, %c, %ne0) : (buffer, index, index, index, index) -> (vector<4xf32>)
+      %slot = index.madd %q, %c4, %j : index
+      %b_next = vector.insert %v into %b[%slot] : vector<4xf32>, vector<16x4xf32>
+      scf.yield %b_next : vector<16x4xf32>
+    }
+    scf.yield %qb_next : vector<16x4xf32>
+  }
+
+  // Pass 1: the rows of this lane (slot k*4 + j), and for each row the partial sum of squares and the partial dot
+  // products with the queries (entry k*(1 + nq) + 0 and k*(1 + nq) + 1 + q).
+  %np1 = index.add %nq, %c1 : index
+  %np = index.mul %rows, %np1 : index
+  %xb0 = vector.splatf 0.0 : vector<36x4xf32>
+  %pt0 = vector.splatf 0.0 : vector<[%np]xf32>
+  %xbank, %part = scf.for %k = [%c0 to %rows step %c1](%xb = %xb0 : vector<36x4xf32>, %pt = %pt0 : vector<[%np]xf32>) -> (vector<36x4xf32>, vector<[%np]xf32>) unroll {
+    %src = func.call @ggml_norm_mix_pick(%k, %x0, %x1, %x2, %x3, %x4, %x5, %x6, %x7, %x8) : (index, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer) -> (buffer)
+    %d0 = vector.splatf 0.0 : vector<4x4xf32>
+    %xb_next, %sq, %dot = scf.for %j = [%c0 to %vecs step %c1](%b = %xb : vector<36x4xf32>, %a = %zero4 : vector<4xf32>, %d = %d0 : vector<4x4xf32>) -> (vector<36x4xf32>, vector<4xf32>, vector<4x4xf32>) unroll {
+      %chunk = index.madd %j, %lanes, %lane : index
+      %c = index.mul %chunk, %c4 : index
+      %x = func.call @ggml_norm_mix_load(%src, %src_span, %base, %c, %ne0) : (buffer, index, index, index, index) -> (vector<4xf32>)
+      %slot = index.madd %k, %c4, %j : index
+      %b_next = vector.insert %x into %b[%slot] : vector<4xf32>, vector<36x4xf32>
+      %a_next = vector.fmaf %x, %x, %a : vector<4xf32>
+      %d_next = scf.for %q = [%c0 to %nq step %c1](%dd = %d : vector<4x4xf32>) -> (vector<4x4xf32>) unroll {
+        %qslot = index.madd %q, %c4, %j : index
+        %qv = vector.extract %qbank[%qslot] : vector<16x4xf32> -> vector<4xf32>
+        %dq = vector.extract %dd[%q] : vector<4x4xf32> -> vector<4xf32>
+        %dq_next = vector.fmaf %x, %qv, %dq : vector<4xf32>
+        %dd_next = vector.insert %dq_next into %dd[%q] : vector<4xf32>, vector<4x4xf32>
+        scf.yield %dd_next : vector<4x4xf32>
+      }
+      scf.yield %b_next, %a_next, %d_next : vector<36x4xf32>, vector<4xf32>, vector<4x4xf32>
+    }
+    %p_base = index.mul %k, %np1 : index
+    %sq_sum = vector.reduce<addf> %sq, %f0 : vector<4xf32>, f32
+    %pt_sq = vector.insert %sq_sum into %pt[%p_base] : f32, vector<[%np]xf32>
+    %pt_next = scf.for %q = [%c0 to %nq step %c1](%p = %pt_sq : vector<[%np]xf32>) -> (vector<[%np]xf32>) unroll {
+      %dq = vector.extract %dot[%q] : vector<4x4xf32> -> vector<4xf32>
+      %dq_sum = vector.reduce<addf> %dq, %f0 : vector<4xf32>, f32
+      %p_idx0 = index.add %p_base, %q : index
+      %p_idx = index.add %p_idx0, %c1 : index
+      %p_next = vector.insert %dq_sum into %p[%p_idx] : f32, vector<[%np]xf32>
+      scf.yield %p_next : vector<[%np]xf32>
+    }
+    scf.yield %xb_next, %pt_next : vector<36x4xf32>, vector<[%np]xf32>
+  }
+  %total = kernel.workgroup.reduce<addf> %part : vector<[%np]xf32>
+
+  // 1 / rms of each row, as in the rms_norm kernels.
+  %rb0 = vector.splatf 0.0 : vector<9xf32>
+  %rinv = scf.for %k = [%c0 to %rows step %c1](%rb = %rb0 : vector<9xf32>) -> (vector<9xf32>) unroll {
+    %p_base = index.mul %k, %np1 : index
+    %sum = vector.extract %total[%p_base] : vector<[%np]xf32> -> f32
+    %mean = scalar.divf %sum, %ne0_f32 : f32
+    %biased = scalar.addf %mean, %eps : f32
+    %root = scalar.sqrtf %biased : f32
+    %r = scalar.divf %f1, %root : f32
+    %rb_next = vector.insert %r into %rb[%k] : f32, vector<9xf32>
+    scf.yield %rb_next : vector<9xf32>
+  }
+
+  %out_base_t = index.mul %token, %nq : index
+  scf.for %q = [%c0 to %nq step %c1] unroll {
+    // Scores and softmax over the rows, as in the soft_max kernels.
+    %sb0 = vector.splatf 0.0 : vector<9xf32>
+    %scores, %max = scf.for %k = [%c0 to %rows step %c1](%sb = %sb0 : vector<9xf32>, %m = %lowest : f32) -> (vector<9xf32>, f32) unroll {
+      %p_base = index.mul %k, %np1 : index
+      %p_idx0 = index.add %p_base, %q : index
+      %p_idx = index.add %p_idx0, %c1 : index
+      %dot = vector.extract %total[%p_idx] : vector<[%np]xf32> -> f32
+      %r = vector.extract %rinv[%k] : vector<9xf32> -> f32
+      %dn = scalar.mulf %dot, %r : f32
+      %s = scalar.mulf %dn, %scale : f32
+      %m_next = scalar.maxnumf %m, %s : f32
+      %sb_next = vector.insert %s into %sb[%k] : f32, vector<9xf32>
+      scf.yield %sb_next, %m_next : vector<9xf32>, f32
+    }
+    %eb, %esum = scf.for %k = [%c0 to %rows step %c1](%e = %sb0 : vector<9xf32>, %acc = %f0 : f32) -> (vector<9xf32>, f32) unroll {
+      %s = vector.extract %scores[%k] : vector<9xf32> -> f32
+      %shifted = scalar.subf %s, %max : f32
+      %ex = scalar.expf<afn> %shifted : f32
+      %e_next = vector.insert %ex into %e[%k] : f32, vector<9xf32>
+      %acc_next = scalar.addf %acc, %ex : f32
+      scf.yield %e_next, %acc_next : vector<9xf32>, f32
+    }
+    %inv_sum = scalar.divf %f1, %esum : f32
+
+    // Pass 2: dst[t, q] = sum over k of p_k * (x_k * rinv_k), with the rows from the registers.
+    %row_raw = index.add %out_base_t, %q : index
+    %out_base_raw = index.mul %row_raw, %ne0 : index
+    %out_base = index.assume %out_base_raw [range(%out_base_raw, 0, 2147483640)] : index
+    %dst_view = buffer.view %dst[%zero] : buffer -> view<[%dst_span]xf32>
+    scf.for %j = [%c0 to %vecs step %c1] unroll {
+      %y = scf.for %k = [%c0 to %rows step %c1](%acc = %zero4 : vector<4xf32>) -> (vector<4xf32>) unroll {
+        %slot = index.madd %k, %c4, %j : index
+        %x = vector.extract %xbank[%slot] : vector<36x4xf32> -> vector<4xf32>
+        %r = vector.extract %rinv[%k] : vector<9xf32> -> f32
+        %ex = vector.extract %eb[%k] : vector<9xf32> -> f32
+        %p = scalar.mulf %ex, %inv_sum : f32
+        %r4 = vector.splat %r : vector<4xf32>
+        %p4 = vector.splat %p : vector<4xf32>
+        %n = vector.mulf %x, %r4 : vector<4xf32>
+        %acc_next = vector.fmaf %p4, %n, %acc : vector<4xf32>
+        scf.yield %acc_next : vector<4xf32>
+      }
+      %chunk = index.madd %j, %lanes, %lane : index
+      %c = index.mul %chunk, %c4 : index
+      %in_row = index.cmp ult, %c, %ne0 : index
+      %idx = index.add %out_base, %c : index
+      %off = index.assume %idx [range(%idx, 0, 2147483640)] : index
+      %last = index.add %off, %c3 : index
+      %in_span = index.cmp ult, %last, %dst_span : index
+      %ok = scalar.andi %in_row, %in_span : i1
+      scf.if %ok {
+        vector.store %y, %dst_view[%off] : vector<4xf32>, view<[%dst_span]xf32>
+      }
+    }
+  }
+  kernel.return
+}

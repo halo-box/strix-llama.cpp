@@ -322,6 +322,10 @@ struct common_params_sampling {
 
     bool backend_sampling = false;
 
+    // with backend sampling, the chain ends with dist_spec: the backend returns only the token and can verify a
+    // probabilistic draft (see common_sampler_spec_set_draft)
+    bool spec_verify = false;
+
     // print the parameters into a string
     std::string print() const;
 };

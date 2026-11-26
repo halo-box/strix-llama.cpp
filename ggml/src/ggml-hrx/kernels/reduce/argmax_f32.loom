@@ -1,0 +1,113 @@
+// argmax of f32 rows to i32 indices. One workgroup for each row. Strides are in elements.
+// Equal maxima give the last index, as in the CPU backend. NaN values are skipped.
+
+// 1: s0 is 1 and the lanes load 4 values at a time.
+config.decl @ggml.argmax.vec4 : %value: index where [range(%value, 0, 1)]
+config.decl @ggml.argmax.wg_size : %value: index where [range(%value, 64, 1024), multiple_of(%value, 64)]
+
+target.decl @ggml_wave64
+
+// Takes x if it is valid and not below the current max. Lanes go up in the index, thus the last equal max stays.
+func.def inline @ggml_hrx_argmax_step(%acc: f32, %acc_idx: i32, %x: f32, %idx: index, %valid: i1) -> (f32, i32) {
+  %ge = scalar.cmpf oge, %x, %acc : f32
+  %take = scalar.andi %ge, %valid : i1
+  %idx_i32 = index.cast %idx : index to i32
+  %m = scf.select %take, %x, %acc : f32
+  %i = scf.select %take, %idx_i32, %acc_idx : i32
+  func.return %m, %i : f32, i32
+}
+
+kernel.def target(@ggml_wave64) export("ggml_argmax_f32") @ggml_argmax_f32(%rows: index) {
+  %one = index.constant 1 : index
+  %wg_size = config.get @ggml.argmax.wg_size : index
+  kernel.launch.config workgroups(%rows, %one, %one) workgroup_size(%wg_size, %one, %one) : index
+} launch(%ne0_in: index, %s0_in: index, %s1_in: index, %src_span_in: index, %d0_in: index, %dst_span_in: index, %src: buffer, %dst: buffer) {
+  // supports_argmax checks these ranges.
+  %ne0 = index.assume %ne0_in [range(%ne0_in, 1, 2147483647)] : index
+  %s0 = index.assume %s0_in [range(%s0_in, 0, 2147483647)] : index
+  %s1 = index.assume %s1_in [range(%s1_in, 0, 2147483647)] : index
+  %src_span = index.assume %src_span_in [range(%src_span_in, 1, 2147483647)] : index
+  %d0 = index.assume %d0_in [range(%d0_in, 0, 2147483647)] : index
+  %dst_span = index.assume %dst_span_in [range(%dst_span_in, 1, 2147483647)] : index
+  %vec4 = config.get @ggml.argmax.vec4 : index
+  %wg_size = config.get @ggml.argmax.wg_size : index
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c3 = index.constant 3 : index
+  %c4 = index.constant 4 : index
+  %zero = index.constant 0 : offset
+  %ninf = scalar.constant -inf : f32
+  %none = scalar.constant -1 : i32
+  %row = kernel.workgroup.id<x> : index
+  %item = kernel.workitem.id<x> : index
+  %base = index.mul %row, %s1 : index
+  %src_view = buffer.view %src[%zero] : buffer -> view<[%src_span]xf32>
+  %is_vec4 = index.cmp eq, %vec4, %c1 : index
+
+  // The vec4 loop covers the first ne0 / 4 * 4 values. The scalar loop does the rest. Each lane goes up in the index.
+  %n4_all = index.div %ne0, %c4 : index
+  %n4_vec = index.mul %n4_all, %c4 : index
+  %n4 = scf.select %is_vec4, %n4_vec, %c0 : index
+  %vec_max, %vec_idx = scf.if %is_vec4 -> (f32, i32) {
+    // supports_argmax checks that the span holds at least 4 values when vec4 is 1.
+    %span4 = index.assume %src_span [range(%src_span, 4, 2147483647)] : index
+    %top = index.sub %span4, %c4 : index
+    %step = index.mul %wg_size, %c4 : index
+    %first = index.mul %item, %c4 : index
+    %m, %mi = scf.for %c = [%first to %n4 step %step](%acc = %ninf : f32, %acc_idx = %none : i32) -> (f32, i32) unroll(%c4) {
+      %idx_raw = index.add %base, %c : index
+      %idx_c = index.min %idx_raw, %top : index
+      %idx = index.assume %idx_c [range(%idx_c, 0, 2147483643), le(%idx_c, %top)] : index
+      %v = vector.load %src_view[%idx] : view<[%src_span]xf32> -> vector<4xf32>
+      %x0 = vector.extract %v[0] : vector<4xf32> -> f32
+      %x1 = vector.extract %v[1] : vector<4xf32> -> f32
+      %x2 = vector.extract %v[2] : vector<4xf32> -> f32
+      %x3 = vector.extract %v[3] : vector<4xf32> -> f32
+      %j1 = index.add %c, %c1 : index
+      %j2 = index.add %c, %c2 : index
+      %j3 = index.add %c, %c3 : index
+      %true = scalar.constant true : i1
+      %a0, %b0 = func.call @ggml_hrx_argmax_step(%acc, %acc_idx, %x0, %c, %true) : (f32, i32, f32, index, i1) -> (f32, i32)
+      %a1, %b1 = func.call @ggml_hrx_argmax_step(%a0, %b0, %x1, %j1, %true) : (f32, i32, f32, index, i1) -> (f32, i32)
+      %a2, %b2 = func.call @ggml_hrx_argmax_step(%a1, %b1, %x2, %j2, %true) : (f32, i32, f32, index, i1) -> (f32, i32)
+      %a3, %b3 = func.call @ggml_hrx_argmax_step(%a2, %b2, %x3, %j3, %true) : (f32, i32, f32, index, i1) -> (f32, i32)
+      scf.yield %a3, %b3 : f32, i32
+    }
+    scf.yield %m, %mi : f32, i32
+  } else {
+    scf.yield %ninf, %none : f32, i32
+  }
+  %top1 = index.sub %src_span, %c1 : index
+  %tail_first = index.add %n4, %item : index
+  %part_max, %part_idx = scf.for %c = [%tail_first to %ne0 step %wg_size](%acc = %vec_max : f32, %acc_idx = %vec_idx : i32) -> (f32, i32) unroll(%c4) {
+    %co = index.mul %c, %s0 : index
+    %idx_raw = index.add %base, %co : index
+    %idx_c = index.min %idx_raw, %top1 : index
+    %idx = index.assume %idx_c [range(%idx_c, 0, 2147483646), le(%idx_c, %top1)] : index
+    %x = view.load %src_view[%idx] : view<[%src_span]xf32> -> f32
+    %ok = index.cmp ule, %idx_raw, %top1 : index
+    %a, %b = func.call @ggml_hrx_argmax_step(%acc, %acc_idx, %x, %c, %ok) : (f32, i32, f32, index, i1) -> (f32, i32)
+    scf.yield %a, %b : f32, i32
+  }
+
+  %row_max = kernel.workgroup.reduce<maxnumf> %part_max : f32
+  %is_max = scalar.cmpf oeq, %part_max, %row_max : f32
+  %cand = scf.select %is_max, %part_idx, %none : i32
+  %best = kernel.workgroup.reduce<maxsi> %cand : i32
+  // A row of NaN values gives index 0.
+  %c0_i32 = scalar.constant 0 : i32
+  %result = scalar.maxsi %best, %c0_i32 : i32
+
+  %is_first = index.cmp eq, %item, %c0 : index
+  scf.if %is_first {
+    %dst_view = buffer.view %dst[%zero] : buffer -> view<[%dst_span]xi32>
+    %dst_idx = index.mul %row, %d0 : index
+    %dst_off = index.assume %dst_idx [range(%dst_idx, 0, 2147483646)] : index
+    %dst_ok = index.cmp ult, %dst_off, %dst_span : index
+    scf.if %dst_ok {
+      view.store %result, %dst_view[%dst_off] : i32, view<[%dst_span]xi32>
+    }
+  }
+  kernel.return
+}

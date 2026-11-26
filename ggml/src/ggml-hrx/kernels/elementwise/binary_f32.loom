@@ -1,0 +1,274 @@
+// Strides are in elements. dst must be contiguous.
+
+config.decl @ggml.binary.op : %value: index where [range(%value, 0, 4)]
+// 1 means that each row of b is one value.
+config.decl @ggml.binary.b_bcast0 : %value: index where [range(%value, 0, 1)]
+// 1 means that b index k is (dst index k) % (b ne k). Else the caller sets the b stride of a broadcast dim to 0.
+config.decl @ggml.binary.b_mod : %value: index where [range(%value, 0, 1)]
+// Number of dims after the caller merges contiguous dims. 4 means 3 or 4.
+config.decl @ggml.binary.dims : %value: index where [range(%value, 1, 4)]
+
+config.decl @ggml.elementwise.wg_size : %value: index where [range(%value, 64, 1024), multiple_of(%value, 64)]
+
+target.decl @ggml_wave64
+
+// op is a config constant. Thus the compiler removes the unused branches.
+func.def inline @ggml_hrx_binary_op4(%op: index, %x: vector<4xf32>, %y: vector<4xf32>) -> (vector<4xf32>) {
+  %op_sub = index.constant 1 : index
+  %op_mul = index.constant 2 : index
+  %op_div = index.constant 3 : index
+  %is_sub = index.cmp eq, %op, %op_sub : index
+  %is_mul = index.cmp eq, %op, %op_mul : index
+  %is_div = index.cmp eq, %op, %op_div : index
+  %r = scf.if %is_div -> (vector<4xf32>) {
+    %quot = vector.divf %x, %y : vector<4xf32>
+    scf.yield %quot : vector<4xf32>
+  } else {
+    %r2 = scf.if %is_mul -> (vector<4xf32>) {
+      %prod = vector.mulf %x, %y : vector<4xf32>
+      scf.yield %prod : vector<4xf32>
+    } else {
+      %r1 = scf.if %is_sub -> (vector<4xf32>) {
+        %diff = vector.subf %x, %y : vector<4xf32>
+        scf.yield %diff : vector<4xf32>
+      } else {
+        %sum = vector.addf %x, %y : vector<4xf32>
+        scf.yield %sum : vector<4xf32>
+      }
+      scf.yield %r1 : vector<4xf32>
+    }
+    scf.yield %r2 : vector<4xf32>
+  }
+  func.return %r : vector<4xf32>
+}
+
+func.def inline @ggml_hrx_binary_op1(%op: index, %x: f32, %y: f32) -> (f32) {
+  %r = scf.switch %op -> (f32) {
+    case 1 {
+      %diff = scalar.subf %x, %y : f32
+      scf.yield %diff : f32
+    }
+    case 2 {
+      %prod = scalar.mulf %x, %y : f32
+      scf.yield %prod : f32
+    }
+    case 3 {
+      %quot = scalar.divf %x, %y : f32
+      scf.yield %quot : f32
+    }
+    default {
+      %sum = scalar.addf %x, %y : f32
+      scf.yield %sum : f32
+    }
+  }
+  func.return %r : f32
+}
+
+// dims 1 and 2 skip the divisions for the higher dims. The caller merges contiguous dims.
+func.def inline @ggml_hrx_binary_idx4(%dims: index, %i: index, %ne0: index, %ne1: index, %ne2: index) -> (index, index, index, index) {
+  %c0 = index.constant 0 : index
+  %i0, %i1, %i2, %i3 = scf.switch %dims -> (index, index, index, index) {
+    case 1 {
+      scf.yield %i, %c0, %c0, %c0 : index, index, index, index
+    }
+    case 2 {
+      %d2_i0 = index.rem %i, %ne0 : index
+      %d2_i1 = index.div %i, %ne0 : index
+      scf.yield %d2_i0, %d2_i1, %c0, %c0 : index, index, index, index
+    }
+    default {
+      %d4_i0 = index.rem %i, %ne0 : index
+      %d4_q0 = index.div %i, %ne0 : index
+      %d4_i1 = index.rem %d4_q0, %ne1 : index
+      %d4_q1 = index.div %d4_q0, %ne1 : index
+      %d4_i2 = index.rem %d4_q1, %ne2 : index
+      %d4_i3 = index.div %d4_q1, %ne2 : index
+      scf.yield %d4_i0, %d4_i1, %d4_i2, %d4_i3 : index, index, index, index
+    }
+  }
+  func.return %i0, %i1, %i2, %i3 : index, index, index, index
+}
+
+kernel.def target(@ggml_wave64) export("ggml_binary_f32_rows") @ggml_binary_f32_rows(%n: index) {
+  %one = index.constant 1 : index
+  %wg_size = config.get @ggml.elementwise.wg_size : index
+  %wg_x2 = index.add %wg_size, %wg_size : index
+  %per_group = index.add %wg_x2, %wg_x2 : index
+  %round = index.sub %per_group, %one : index
+  %n_round = index.add %n, %round : index
+  %groups = index.div %n_round, %per_group : index
+  kernel.launch.config workgroups(%groups, %one, %one) workgroup_size(%wg_size, %one, %one) : index
+} launch(%n_in: index, %d0_in: index, %a_rs_in: index, %a_span_in: index, %b_rows_in: index, %b_rs_in: index, %b_span_in: index, %a: buffer, %b: buffer, %dst: buffer) {
+  // The caller checks these ranges. n and d0 must be multiples of 4.
+  %n = index.assume %n_in [range(%n_in, 4, 2147483644)] : index
+  %d0 = index.assume %d0_in [range(%d0_in, 4, 2147483644)] : index
+  %a_rs = index.assume %a_rs_in [range(%a_rs_in, 0, 2147483647)] : index
+  %a_span = index.assume %a_span_in [range(%a_span_in, 1, 2147483647)] : index
+  %b_rows = index.assume %b_rows_in [range(%b_rows_in, 1, 2147483647)] : index
+  %b_rs = index.assume %b_rs_in [range(%b_rs_in, 0, 2147483647)] : index
+  %b_span = index.assume %b_span_in [range(%b_span_in, 1, 2147483647)] : index
+  %op = config.get @ggml.binary.op : index
+  %b_bcast0 = config.get @ggml.binary.b_bcast0 : index
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c3 = index.constant 3 : index
+  %c4 = index.constant 4 : index
+  %wg_size = config.get @ggml.elementwise.wg_size : index
+  %wg_x2 = index.add %wg_size, %wg_size : index
+  %per_group = index.add %wg_x2, %wg_x2 : index
+  %group = kernel.workgroup.id<x> : index
+  %item = kernel.workitem.id<x> : index
+  %base = index.mul %group, %per_group : index
+  %lane = index.mul %item, %c4 : index
+  %j_raw = index.add %base, %lane : index
+  %j = index.assume %j_raw [range(%j_raw, 0, 2147483644)] : index
+  %j_last = index.add %j, %c3 : index
+  %zero = index.constant 0 : offset
+  %a_view = buffer.view %a[%zero] : buffer -> view<[%a_span]xf32>
+  %b_view = buffer.view %b[%zero] : buffer -> view<[%b_span]xf32>
+  %dst_view = buffer.view %dst[%zero] : buffer -> view<[%n]xf32>
+  %in_bounds = index.cmp ult, %j_last, %n : index
+  scf.if %in_bounds {
+    %r = index.div %j, %d0 : index
+    %r_start = index.mul %r, %d0 : index
+    %c = index.sub %j, %r_start : index
+    %a_row = index.mul %r, %a_rs : index
+    %a_idx = index.add %a_row, %c : index
+    %br = index.rem %r, %b_rows : index
+    %b_row = index.mul %br, %b_rs : index
+    %is_bcast0 = index.cmp eq, %b_bcast0, %c1 : index
+    %b_col = scf.select %is_bcast0, %c0, %c : index
+    %b_idx = index.add %b_row, %b_col : index
+    // The prover reads only branch conditions. Thus cap the offsets and check one bound in each scf.if.
+    %a_off = index.assume %a_idx [range(%a_idx, 0, 2147483640)] : index
+    %b_off = index.assume %b_idx [range(%b_idx, 0, 2147483640)] : index
+    %a_last = index.add %a_off, %c3 : index
+    %b_last = index.add %b_off, %c3 : index
+    %a_ok = index.cmp ult, %a_last, %a_span : index
+    scf.if %a_ok {
+      %x = vector.load %a_view[%a_off] : view<[%a_span]xf32> -> vector<4xf32>
+      scf.if %is_bcast0 {
+        %b_ok = index.cmp ult, %b_off, %b_span : index
+        scf.if %b_ok {
+          %s = view.load %b_view[%b_off] : view<[%b_span]xf32> -> f32
+          %y = vector.splat %s : vector<4xf32>
+          %r4 = func.call @ggml_hrx_binary_op4(%op, %x, %y) : (index, vector<4xf32>, vector<4xf32>) -> (vector<4xf32>)
+          vector.store %r4, %dst_view[%j] : vector<4xf32>, view<[%n]xf32>
+        }
+      } else {
+        %b_ok = index.cmp ult, %b_last, %b_span : index
+        scf.if %b_ok {
+          %y = vector.load %b_view[%b_off] : view<[%b_span]xf32> -> vector<4xf32>
+          %r4 = func.call @ggml_hrx_binary_op4(%op, %x, %y) : (index, vector<4xf32>, vector<4xf32>) -> (vector<4xf32>)
+          vector.store %r4, %dst_view[%j] : vector<4xf32>, view<[%n]xf32>
+        }
+      }
+    }
+  }
+  kernel.return
+}
+
+// Any a, b and dst strides. dst and a have the shape ne. b repeats to ne. Each work item does 1 element.
+kernel.def target(@ggml_wave64) export("ggml_binary_f32_bcast") @ggml_binary_f32_bcast(%n: index) {
+  %one = index.constant 1 : index
+  %wg_size = config.get @ggml.elementwise.wg_size : index
+  %round = index.sub %wg_size, %one : index
+  %n_round = index.add %n, %round : index
+  %groups = index.div %n_round, %wg_size : index
+  kernel.launch.config workgroups(%groups, %one, %one) workgroup_size(%wg_size, %one, %one) : index
+} launch(%n_in: index, %ne0_in: index, %ne1_in: index, %ne2_in: index, %a0_in: index, %a1_in: index, %a2_in: index, %a3_in: index, %a_span_in: index, %bn0_in: index, %bn1_in: index, %bn2_in: index, %bn3_in: index, %b0_in: index, %b1_in: index, %b2_in: index, %b3_in: index, %b_span_in: index, %d0_in: index, %d1_in: index, %d2_in: index, %d3_in: index, %d_span_in: index, %a: buffer, %b: buffer, %dst: buffer) {
+  // The caller checks these ranges.
+  %n = index.assume %n_in [range(%n_in, 1, 2147483647)] : index
+  %ne0 = index.assume %ne0_in [range(%ne0_in, 1, 2147483647)] : index
+  %ne1 = index.assume %ne1_in [range(%ne1_in, 1, 2147483647)] : index
+  %ne2 = index.assume %ne2_in [range(%ne2_in, 1, 2147483647)] : index
+  %a0 = index.assume %a0_in [range(%a0_in, 0, 2147483647)] : index
+  %a1 = index.assume %a1_in [range(%a1_in, 0, 2147483647)] : index
+  %a2 = index.assume %a2_in [range(%a2_in, 0, 2147483647)] : index
+  %a3 = index.assume %a3_in [range(%a3_in, 0, 2147483647)] : index
+  %a_span = index.assume %a_span_in [range(%a_span_in, 1, 2147483647)] : index
+  %bn0 = index.assume %bn0_in [range(%bn0_in, 1, 2147483647)] : index
+  %bn1 = index.assume %bn1_in [range(%bn1_in, 1, 2147483647)] : index
+  %bn2 = index.assume %bn2_in [range(%bn2_in, 1, 2147483647)] : index
+  %bn3 = index.assume %bn3_in [range(%bn3_in, 1, 2147483647)] : index
+  %b0 = index.assume %b0_in [range(%b0_in, 0, 2147483647)] : index
+  %b1 = index.assume %b1_in [range(%b1_in, 0, 2147483647)] : index
+  %b2 = index.assume %b2_in [range(%b2_in, 0, 2147483647)] : index
+  %b3 = index.assume %b3_in [range(%b3_in, 0, 2147483647)] : index
+  %b_span = index.assume %b_span_in [range(%b_span_in, 1, 2147483647)] : index
+  %d0 = index.assume %d0_in [range(%d0_in, 0, 2147483647)] : index
+  %d1 = index.assume %d1_in [range(%d1_in, 0, 2147483647)] : index
+  %d2 = index.assume %d2_in [range(%d2_in, 0, 2147483647)] : index
+  %d3 = index.assume %d3_in [range(%d3_in, 0, 2147483647)] : index
+  %d_span = index.assume %d_span_in [range(%d_span_in, 1, 2147483647)] : index
+  %op = config.get @ggml.binary.op : index
+  %b_mod = config.get @ggml.binary.b_mod : index
+  %dims = config.get @ggml.binary.dims : index
+  %c1 = index.constant 1 : index
+  %wg_size = config.get @ggml.elementwise.wg_size : index
+  %group = kernel.workgroup.id<x> : index
+  %item = kernel.workitem.id<x> : index
+  %base = index.mul %group, %wg_size : index
+  %i = index.add %base, %item : index
+  %in_bounds = index.cmp ult, %i, %n : index
+  %zero = index.constant 0 : offset
+  %a_view = buffer.view %a[%zero] : buffer -> view<[%a_span]xf32>
+  %b_view = buffer.view %b[%zero] : buffer -> view<[%b_span]xf32>
+  %dst_view = buffer.view %dst[%zero] : buffer -> view<[%d_span]xf32>
+  scf.if %in_bounds {
+    %i0, %i1, %i2, %i3 = func.call @ggml_hrx_binary_idx4(%dims, %i, %ne0, %ne1, %ne2) : (index, index, index, index, index) -> (index, index, index, index)
+
+    %ao0 = index.mul %i0, %a0 : index
+    %ao1 = index.mul %i1, %a1 : index
+    %ao2 = index.mul %i2, %a2 : index
+    %ao3 = index.mul %i3, %a3 : index
+    %ao01 = index.add %ao0, %ao1 : index
+    %ao23 = index.add %ao2, %ao3 : index
+    %a_idx = index.add %ao01, %ao23 : index
+
+    %is_mod = index.cmp eq, %b_mod, %c1 : index
+    %j0, %j1, %j2, %j3 = scf.if %is_mod -> (index, index, index, index) {
+      %m0 = index.rem %i0, %bn0 : index
+      %m1 = index.rem %i1, %bn1 : index
+      %m2 = index.rem %i2, %bn2 : index
+      %m3 = index.rem %i3, %bn3 : index
+      scf.yield %m0, %m1, %m2, %m3 : index, index, index, index
+    } else {
+      scf.yield %i0, %i1, %i2, %i3 : index, index, index, index
+    }
+    %bo0 = index.mul %j0, %b0 : index
+    %bo1 = index.mul %j1, %b1 : index
+    %bo2 = index.mul %j2, %b2 : index
+    %bo3 = index.mul %j3, %b3 : index
+    %bo01 = index.add %bo0, %bo1 : index
+    %bo23 = index.add %bo2, %bo3 : index
+    %b_idx = index.add %bo01, %bo23 : index
+
+    %do0 = index.mul %i0, %d0 : index
+    %do1 = index.mul %i1, %d1 : index
+    %do2 = index.mul %i2, %d2 : index
+    %do3 = index.mul %i3, %d3 : index
+    %do01 = index.add %do0, %do1 : index
+    %do23 = index.add %do2, %do3 : index
+    %d_idx = index.add %do01, %do23 : index
+
+    // The prover reads only branch conditions. Thus cap the offsets and check one bound in each scf.if.
+    %a_off = index.assume %a_idx [range(%a_idx, 0, 2147483646)] : index
+    %b_off = index.assume %b_idx [range(%b_idx, 0, 2147483646)] : index
+    %d_off = index.assume %d_idx [range(%d_idx, 0, 2147483646)] : index
+    %a_ok = index.cmp ult, %a_off, %a_span : index
+    scf.if %a_ok {
+      %b_ok = index.cmp ult, %b_off, %b_span : index
+      scf.if %b_ok {
+        %d_ok = index.cmp ult, %d_off, %d_span : index
+        scf.if %d_ok {
+          %x = view.load %a_view[%a_off] : view<[%a_span]xf32> -> f32
+          %y = view.load %b_view[%b_off] : view<[%b_span]xf32> -> f32
+          %r = func.call @ggml_hrx_binary_op1(%op, %x, %y) : (index, f32, f32) -> (f32)
+          view.store %r, %dst_view[%d_off] : f32, view<[%d_span]xf32>
+        }
+      }
+    }
+  }
+  kernel.return
+}

@@ -1,0 +1,218 @@
+// ssm_conv: dst[c, t, s] = sum over k < nc of x[t + k, c, s] * w[k, c], with k in increasing order.
+// x is [nc - 1 + n_t, C, n_s], w is [nc, C], dst is [C, n_t, n_s] and contiguous. Strides are in elements.
+
+target.decl @ggml_wave64
+
+// One workgroup of 256 work items for a tile of 64 channels and 32 tokens. nc is at most 33.
+// The x rows go through workgroup memory. Thus the loads go along x rows and the stores go along dst rows.
+kernel.def target(@ggml_wave64) export("ggml_ssm_conv_f32") @ggml_ssm_conv_f32(%tiles: index) {
+  %one = index.constant 1 : index
+  %wg_size = index.constant 256 : index
+  kernel.launch.config workgroups(%tiles, %one, %one) workgroup_size(%wg_size, %one, %one) : index
+} launch(%channels_in: index, %n_t_in: index, %n_cb_in: index, %n_tb_in: index, %nc_in: index, %ncs_in: index, %x_s0_in: index, %x_s1_in: index, %x_s2_in: index, %x_span_in: index, %w_s0_in: index, %w_s1_in: index, %w_span_in: index, %dst_span_in: index, %x: buffer, %w: buffer, %dst: buffer) {
+  // supports_ssm_conv checks these ranges. n_cb and n_tb are the channel and token tiles. ncs is the x row length.
+  %channels = index.assume %channels_in [range(%channels_in, 1, 2147483647)] : index
+  %n_t = index.assume %n_t_in [range(%n_t_in, 1, 2147483647)] : index
+  %n_cb = index.assume %n_cb_in [range(%n_cb_in, 1, 2147483647)] : index
+  %n_tb = index.assume %n_tb_in [range(%n_tb_in, 1, 2147483647)] : index
+  %nc = index.assume %nc_in [range(%nc_in, 1, 33)] : index
+  %ncs = index.assume %ncs_in [range(%ncs_in, 1, 2147483647)] : index
+  %x_s0 = index.assume %x_s0_in [range(%x_s0_in, 0, 2147483647)] : index
+  %x_s1 = index.assume %x_s1_in [range(%x_s1_in, 0, 2147483647)] : index
+  %x_s2 = index.assume %x_s2_in [range(%x_s2_in, 0, 2147483647)] : index
+  %x_span = index.assume %x_span_in [range(%x_span_in, 1, 2147483647)] : index
+  %w_s0 = index.assume %w_s0_in [range(%w_s0_in, 0, 2147483647)] : index
+  %w_s1 = index.assume %w_s1_in [range(%w_s1_in, 0, 2147483647)] : index
+  %w_span = index.assume %w_span_in [range(%w_span_in, 1, 2147483647)] : index
+  %dst_span = index.assume %dst_span_in [range(%dst_span_in, 1, 2147483647)] : index
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c4 = index.constant 4 : index
+  %c8 = index.constant 8 : index
+  %c16 = index.constant 16 : index
+  %c32 = index.constant 32 : index
+  %c63 = index.constant 63 : index
+  %c64 = index.constant 64 : index
+  %zero = index.constant 0 : offset
+  %c0_f32 = scalar.constant 0.0 : f32
+  %tile = kernel.workgroup.id<x> : index
+  %t_raw = kernel.workitem.id<x> : index
+  %t = index.assume %t_raw [range(%t_raw, 0, 255)] : index
+
+  %cb = index.rem %tile, %n_cb : index
+  %t1 = index.div %tile, %n_cb : index
+  %tb = index.rem %t1, %n_tb : index
+  %seq = index.div %t1, %n_tb : index
+  %ch0 = index.mul %cb, %c64 : index
+  %tok0 = index.mul %tb, %c32 : index
+
+  %x_view = buffer.view %x[%zero] : buffer -> view<[%x_span]xf32>
+  %w_view = buffer.view %w[%zero] : buffer -> view<[%w_span]xf32>
+  %dst_view = buffer.view %dst[%zero] : buffer -> view<[%dst_span]xf32>
+  // One padding column keeps the reads of the compute phase on distinct banks.
+  %lds_bytes = index.constant 16640 : offset
+  %lds = buffer.alloca<workgroup> align(16) %lds_bytes : buffer
+  %tile_view = buffer.view %lds[%zero] : buffer -> view<64x65xf32>
+
+  // Load phase: lanes go along the tokens of one x row.
+  %width0 = index.add %nc, %c32 : index
+  %width = index.sub %width0, %c1 : index
+  %col_raw = index.rem %t, %c64 : index
+  %col = index.assume %col_raw [range(%col_raw, 0, 63)] : index
+  %row0 = index.div %t, %c64 : index
+  %x_tok = index.add %tok0, %col : index
+  %col_in = index.cmp ult, %col, %width : index
+  %tok_in = index.cmp ult, %x_tok, %ncs : index
+  %x_use = scalar.andi %col_in, %tok_in : i1
+  %xo0 = index.mul %x_tok, %x_s0 : index
+  %xo2 = index.mul %seq, %x_s2 : index
+  %x_part = index.add %xo0, %xo2 : index
+  scf.for %m = [%c0 to %c16 step %c1] {
+    %m4 = index.mul %m, %c4 : index
+    %lr_raw = index.add %row0, %m4 : index
+    %lr = index.assume %lr_raw [range(%lr_raw, 0, 63)] : index
+    %ch = index.add %ch0, %lr : index
+    %ch_in = index.cmp ult, %ch, %channels : index
+    %use = scalar.andi %x_use, %ch_in : i1
+    %v = scf.if %use -> (f32) {
+      %xo1 = index.mul %ch, %x_s1 : index
+      %x_idx = index.add %x_part, %xo1 : index
+      %x_off = index.assume %x_idx [range(%x_idx, 0, 2147483646)] : index
+      %x_ok = index.cmp ult, %x_off, %x_span : index
+      %l = scf.if %x_ok -> (f32) {
+        %xv = view.load %x_view[%x_off] : view<[%x_span]xf32> -> f32
+        scf.yield %xv : f32
+      } else {
+        scf.yield %c0_f32 : f32
+      }
+      scf.yield %l : f32
+    } else {
+      scf.yield %c0_f32 : f32
+    }
+    view.store %v, %tile_view[%lr, %col] : f32, view<64x65xf32>
+  }
+  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+
+  // Compute phase: lanes go along the channels of one dst row.
+  %lc = index.assume %col_raw [range(%col_raw, 0, 63)] : index
+  %out_ch = index.add %ch0, %lc : index
+  %ch_ok = index.cmp ult, %out_ch, %channels : index
+  %w_base = index.mul %out_ch, %w_s1 : index
+  %seq_tokens = index.mul %seq, %n_t : index
+  scf.if %ch_ok {
+    scf.for %m = [%c0 to %c8 step %c1] {
+      %m4 = index.mul %m, %c4 : index
+      %lt_raw = index.add %row0, %m4 : index
+      %lt = index.assume %lt_raw [range(%lt_raw, 0, 31)] : index
+      %tok = index.add %tok0, %lt : index
+      %tok_ok = index.cmp ult, %tok, %n_t : index
+      scf.if %tok_ok {
+        %sum = scf.for %k = [%c0 to %nc step %c1](%acc = %c0_f32 : f32) -> (f32) {
+          %ci_raw = index.add %lt, %k : index
+          %ci = index.assume %ci_raw [range(%ci_raw, 0, 63)] : index
+          %xv = view.load %tile_view[%lc, %ci] : view<64x65xf32> -> f32
+          %wk = index.mul %k, %w_s0 : index
+          %w_idx = index.add %w_base, %wk : index
+          %w_off = index.assume %w_idx [range(%w_idx, 0, 2147483646)] : index
+          %w_ok = index.cmp ult, %w_off, %w_span : index
+          %next = scf.if %w_ok -> (f32) {
+            %wv = view.load %w_view[%w_off] : view<[%w_span]xf32> -> f32
+            %p = scalar.mulf %xv, %wv : f32
+            %s = scalar.addf %acc, %p : f32
+            scf.yield %s : f32
+          } else {
+            scf.yield %acc : f32
+          }
+          scf.yield %next : f32
+        }
+        %dst_tok = index.add %seq_tokens, %tok : index
+        %dst_row = index.mul %dst_tok, %channels : index
+        %dst_idx = index.add %dst_row, %out_ch : index
+        %dst_off = index.assume %dst_idx [range(%dst_idx, 0, 2147483646)] : index
+        %dst_ok = index.cmp ult, %dst_off, %dst_span : index
+        scf.if %dst_ok {
+          view.store %sum, %dst_view[%dst_off] : f32, view<[%dst_span]xf32>
+        }
+      }
+    }
+  }
+  kernel.return
+}
+
+config.decl @ggml.elementwise.wg_size : %value: index where [range(%value, 64, 1024), multiple_of(%value, 64)]
+
+// One dst value for each work item, without workgroup memory. For few tokens: then the x rows are short.
+kernel.def target(@ggml_wave64) export("ggml_ssm_conv_f32_direct") @ggml_ssm_conv_f32_direct(%n: index) {
+  %one = index.constant 1 : index
+  %wg_size = config.get @ggml.elementwise.wg_size : index
+  %round = index.sub %wg_size, %one : index
+  %n_round = index.add %n, %round : index
+  %groups = index.div %n_round, %wg_size : index
+  kernel.launch.config workgroups(%groups, %one, %one) workgroup_size(%wg_size, %one, %one) : index
+} launch(%n_in: index, %channels_in: index, %n_t_in: index, %nc_in: index, %x_s0_in: index, %x_s1_in: index, %x_s2_in: index, %x_span_in: index, %w_s0_in: index, %w_s1_in: index, %w_span_in: index, %x: buffer, %w: buffer, %dst: buffer) {
+  // supports_ssm_conv checks these ranges.
+  %n = index.assume %n_in [range(%n_in, 1, 2147483647)] : index
+  %channels = index.assume %channels_in [range(%channels_in, 1, 2147483647)] : index
+  %n_t = index.assume %n_t_in [range(%n_t_in, 1, 2147483647)] : index
+  %nc = index.assume %nc_in [range(%nc_in, 1, 2147483647)] : index
+  %x_s0 = index.assume %x_s0_in [range(%x_s0_in, 0, 2147483647)] : index
+  %x_s1 = index.assume %x_s1_in [range(%x_s1_in, 0, 2147483647)] : index
+  %x_s2 = index.assume %x_s2_in [range(%x_s2_in, 0, 2147483647)] : index
+  %x_span = index.assume %x_span_in [range(%x_span_in, 1, 2147483647)] : index
+  %w_s0 = index.assume %w_s0_in [range(%w_s0_in, 0, 2147483647)] : index
+  %w_s1 = index.assume %w_s1_in [range(%w_s1_in, 0, 2147483647)] : index
+  %w_span = index.assume %w_span_in [range(%w_span_in, 1, 2147483647)] : index
+  %wg_size = config.get @ggml.elementwise.wg_size : index
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %group = kernel.workgroup.id<x> : index
+  %item = kernel.workitem.id<x> : index
+  %base = index.mul %group, %wg_size : index
+  %j_raw = index.add %base, %item : index
+  %j = index.assume %j_raw [range(%j_raw, 0, 2147483646)] : index
+  %zero = index.constant 0 : offset
+  %x_view = buffer.view %x[%zero] : buffer -> view<[%x_span]xf32>
+  %w_view = buffer.view %w[%zero] : buffer -> view<[%w_span]xf32>
+  %dst_view = buffer.view %dst[%zero] : buffer -> view<[%n]xf32>
+  %in_bounds = index.cmp ult, %j, %n : index
+  scf.if %in_bounds {
+    %ch = index.rem %j, %channels : index
+    %t0 = index.div %j, %channels : index
+    %tok = index.rem %t0, %n_t : index
+    %seq = index.div %t0, %n_t : index
+    %xo0 = index.mul %tok, %x_s0 : index
+    %xo1 = index.mul %ch, %x_s1 : index
+    %xo2 = index.mul %seq, %x_s2 : index
+    %xo01 = index.add %xo0, %xo1 : index
+    %x_base = index.add %xo01, %xo2 : index
+    %w_base = index.mul %ch, %w_s1 : index
+    %c0_f32 = scalar.constant 0.0 : f32
+    %sum = scf.for %k = [%c0 to %nc step %c1](%acc = %c0_f32 : f32) -> (f32) {
+      %xk = index.mul %k, %x_s0 : index
+      %wk = index.mul %k, %w_s0 : index
+      %x_idx = index.add %x_base, %xk : index
+      %w_idx = index.add %w_base, %wk : index
+      %x_off = index.assume %x_idx [range(%x_idx, 0, 2147483646)] : index
+      %w_off = index.assume %w_idx [range(%w_idx, 0, 2147483646)] : index
+      %x_ok = index.cmp ult, %x_off, %x_span : index
+      %next = scf.if %x_ok -> (f32) {
+        %w_ok = index.cmp ult, %w_off, %w_span : index
+        %r = scf.if %w_ok -> (f32) {
+          %xv = view.load %x_view[%x_off] : view<[%x_span]xf32> -> f32
+          %wv = view.load %w_view[%w_off] : view<[%w_span]xf32> -> f32
+          %p = scalar.mulf %xv, %wv : f32
+          %s = scalar.addf %acc, %p : f32
+          scf.yield %s : f32
+        } else {
+          scf.yield %acc : f32
+        }
+        scf.yield %r : f32
+      } else {
+        scf.yield %acc : f32
+      }
+      scf.yield %next : f32
+    }
+    view.store %sum, %dst_view[%j] : f32, view<[%n]xf32>
+  }
+  kernel.return
+}

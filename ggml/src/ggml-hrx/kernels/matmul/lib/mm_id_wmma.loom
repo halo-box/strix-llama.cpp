@@ -1,0 +1,458 @@
+// Parts of the 128 x 128 MUL_MAT_ID matrix-op kernel (matmul/mul_mat_id_wmma.loom).
+// x_stage holds [col][k] f16 rows with a pitch of 72. w_stage holds [k][row] f16 with a row pitch of 72 (128 rows).
+
+target.decl @ggml_gfx11
+target.decl @ggml_gfx12
+
+template.decl @ggml.q8_0.decode32_f16(%d_bits: i16, %q0: vector<8xi16>, %q1: vector<8xi16>) -> (vector<8xf16>, vector<8xf16>, vector<8xf16>, vector<8xf16>)
+
+func.decl @ggml_mma_lhs_lane_gfx12() -> (index, index)
+
+func.decl @ggml_mma_tile16(%x_stage: buffer, %x_rows: index, %w_stage: buffer, %col: index, %row: index, %acc: vector<8xf32>) -> (vector<8xf32>)
+
+// 2 x 4 tiles of 16 x 16 for each subgroup: columns col0 to col0+31, rows row0 to row0+63.
+template.decl @ggml.mma.k64_2x4(%x_stage: buffer, %w_stage: buffer, %col0: index, %row0: index, %acc00: vector<8xf32>, %acc01: vector<8xf32>, %acc02: vector<8xf32>, %acc03: vector<8xf32>, %acc10: vector<8xf32>, %acc11: vector<8xf32>, %acc12: vector<8xf32>, %acc13: vector<8xf32>) -> (vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>)
+
+template.def<@ggml.mma.k64_2x4> device target(@ggml_gfx11) requires [#target.subgroup.size<32>] priority(20) @ggml_mma_k64_2x4_gfx11(%x_stage: buffer, %w_stage: buffer, %col0: index, %row0: index, %acc00: vector<8xf32>, %acc01: vector<8xf32>, %acc02: vector<8xf32>, %acc03: vector<8xf32>, %acc10: vector<8xf32>, %acc11: vector<8xf32>, %acc12: vector<8xf32>, %acc13: vector<8xf32>) -> (vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>) {
+  %c16 = index.constant 16 : index
+  %c32 = index.constant 32 : index
+  %c48 = index.constant 48 : index
+  %c0_offset = index.constant 0 : offset
+  %m = index.constant 16 : index
+  %w_layout = encoding.layout.strided [1, 72] : encoding<layout>
+  %x_view = buffer.view %x_stage[%c0_offset] : buffer -> view<128x72xf16>
+  %w_view = buffer.view %w_stage[%c0_offset] : buffer -> view<64x128xf16, %w_layout>
+  %col1 = index.add %col0, %c16 : index
+  %row1 = index.add %row0, %c16 : index
+  %row2 = index.add %row0, %c32 : index
+  %row3 = index.add %row0, %c48 : index
+  %kh0 = index.constant 0 : index
+  %l0_0 = vector.fragment.load<lhs> %x_view[%col0, %kh0] shape [%m, %m] : view<128x72xf16> -> vector<16xf16>
+  %l1_0 = vector.fragment.load<lhs> %x_view[%col1, %kh0] shape [%m, %m] : view<128x72xf16> -> vector<16xf16>
+  %r0_0 = vector.fragment.load<rhs> %w_view[%kh0, %row0] shape [%m, %m] : view<64x128xf16, %w_layout> -> vector<16xf16>
+  %n00_0 = vector.mma %l0_0, %r0_0, %acc00 : vector<16xf16>, vector<16xf16>, vector<8xf32>
+  %n10_0 = vector.mma %l1_0, %r0_0, %acc10 : vector<16xf16>, vector<16xf16>, vector<8xf32>
+  %r1_0 = vector.fragment.load<rhs> %w_view[%kh0, %row1] shape [%m, %m] : view<64x128xf16, %w_layout> -> vector<16xf16>
+  %n01_0 = vector.mma %l0_0, %r1_0, %acc01 : vector<16xf16>, vector<16xf16>, vector<8xf32>
+  %n11_0 = vector.mma %l1_0, %r1_0, %acc11 : vector<16xf16>, vector<16xf16>, vector<8xf32>
+  %r2_0 = vector.fragment.load<rhs> %w_view[%kh0, %row2] shape [%m, %m] : view<64x128xf16, %w_layout> -> vector<16xf16>
+  %n02_0 = vector.mma %l0_0, %r2_0, %acc02 : vector<16xf16>, vector<16xf16>, vector<8xf32>
+  %n12_0 = vector.mma %l1_0, %r2_0, %acc12 : vector<16xf16>, vector<16xf16>, vector<8xf32>
+  %r3_0 = vector.fragment.load<rhs> %w_view[%kh0, %row3] shape [%m, %m] : view<64x128xf16, %w_layout> -> vector<16xf16>
+  %n03_0 = vector.mma %l0_0, %r3_0, %acc03 : vector<16xf16>, vector<16xf16>, vector<8xf32>
+  %n13_0 = vector.mma %l1_0, %r3_0, %acc13 : vector<16xf16>, vector<16xf16>, vector<8xf32>
+  %kh1 = index.constant 16 : index
+  %l0_1 = vector.fragment.load<lhs> %x_view[%col0, %kh1] shape [%m, %m] : view<128x72xf16> -> vector<16xf16>
+  %l1_1 = vector.fragment.load<lhs> %x_view[%col1, %kh1] shape [%m, %m] : view<128x72xf16> -> vector<16xf16>
+  %r0_1 = vector.fragment.load<rhs> %w_view[%kh1, %row0] shape [%m, %m] : view<64x128xf16, %w_layout> -> vector<16xf16>
+  %n00_1 = vector.mma %l0_1, %r0_1, %n00_0 : vector<16xf16>, vector<16xf16>, vector<8xf32>
+  %n10_1 = vector.mma %l1_1, %r0_1, %n10_0 : vector<16xf16>, vector<16xf16>, vector<8xf32>
+  %r1_1 = vector.fragment.load<rhs> %w_view[%kh1, %row1] shape [%m, %m] : view<64x128xf16, %w_layout> -> vector<16xf16>
+  %n01_1 = vector.mma %l0_1, %r1_1, %n01_0 : vector<16xf16>, vector<16xf16>, vector<8xf32>
+  %n11_1 = vector.mma %l1_1, %r1_1, %n11_0 : vector<16xf16>, vector<16xf16>, vector<8xf32>
+  %r2_1 = vector.fragment.load<rhs> %w_view[%kh1, %row2] shape [%m, %m] : view<64x128xf16, %w_layout> -> vector<16xf16>
+  %n02_1 = vector.mma %l0_1, %r2_1, %n02_0 : vector<16xf16>, vector<16xf16>, vector<8xf32>
+  %n12_1 = vector.mma %l1_1, %r2_1, %n12_0 : vector<16xf16>, vector<16xf16>, vector<8xf32>
+  %r3_1 = vector.fragment.load<rhs> %w_view[%kh1, %row3] shape [%m, %m] : view<64x128xf16, %w_layout> -> vector<16xf16>
+  %n03_1 = vector.mma %l0_1, %r3_1, %n03_0 : vector<16xf16>, vector<16xf16>, vector<8xf32>
+  %n13_1 = vector.mma %l1_1, %r3_1, %n13_0 : vector<16xf16>, vector<16xf16>, vector<8xf32>
+  %kh2 = index.constant 32 : index
+  %l0_2 = vector.fragment.load<lhs> %x_view[%col0, %kh2] shape [%m, %m] : view<128x72xf16> -> vector<16xf16>
+  %l1_2 = vector.fragment.load<lhs> %x_view[%col1, %kh2] shape [%m, %m] : view<128x72xf16> -> vector<16xf16>
+  %r0_2 = vector.fragment.load<rhs> %w_view[%kh2, %row0] shape [%m, %m] : view<64x128xf16, %w_layout> -> vector<16xf16>
+  %n00_2 = vector.mma %l0_2, %r0_2, %n00_1 : vector<16xf16>, vector<16xf16>, vector<8xf32>
+  %n10_2 = vector.mma %l1_2, %r0_2, %n10_1 : vector<16xf16>, vector<16xf16>, vector<8xf32>
+  %r1_2 = vector.fragment.load<rhs> %w_view[%kh2, %row1] shape [%m, %m] : view<64x128xf16, %w_layout> -> vector<16xf16>
+  %n01_2 = vector.mma %l0_2, %r1_2, %n01_1 : vector<16xf16>, vector<16xf16>, vector<8xf32>
+  %n11_2 = vector.mma %l1_2, %r1_2, %n11_1 : vector<16xf16>, vector<16xf16>, vector<8xf32>
+  %r2_2 = vector.fragment.load<rhs> %w_view[%kh2, %row2] shape [%m, %m] : view<64x128xf16, %w_layout> -> vector<16xf16>
+  %n02_2 = vector.mma %l0_2, %r2_2, %n02_1 : vector<16xf16>, vector<16xf16>, vector<8xf32>
+  %n12_2 = vector.mma %l1_2, %r2_2, %n12_1 : vector<16xf16>, vector<16xf16>, vector<8xf32>
+  %r3_2 = vector.fragment.load<rhs> %w_view[%kh2, %row3] shape [%m, %m] : view<64x128xf16, %w_layout> -> vector<16xf16>
+  %n03_2 = vector.mma %l0_2, %r3_2, %n03_1 : vector<16xf16>, vector<16xf16>, vector<8xf32>
+  %n13_2 = vector.mma %l1_2, %r3_2, %n13_1 : vector<16xf16>, vector<16xf16>, vector<8xf32>
+  %kh3 = index.constant 48 : index
+  %l0_3 = vector.fragment.load<lhs> %x_view[%col0, %kh3] shape [%m, %m] : view<128x72xf16> -> vector<16xf16>
+  %l1_3 = vector.fragment.load<lhs> %x_view[%col1, %kh3] shape [%m, %m] : view<128x72xf16> -> vector<16xf16>
+  %r0_3 = vector.fragment.load<rhs> %w_view[%kh3, %row0] shape [%m, %m] : view<64x128xf16, %w_layout> -> vector<16xf16>
+  %n00_3 = vector.mma %l0_3, %r0_3, %n00_2 : vector<16xf16>, vector<16xf16>, vector<8xf32>
+  %n10_3 = vector.mma %l1_3, %r0_3, %n10_2 : vector<16xf16>, vector<16xf16>, vector<8xf32>
+  %r1_3 = vector.fragment.load<rhs> %w_view[%kh3, %row1] shape [%m, %m] : view<64x128xf16, %w_layout> -> vector<16xf16>
+  %n01_3 = vector.mma %l0_3, %r1_3, %n01_2 : vector<16xf16>, vector<16xf16>, vector<8xf32>
+  %n11_3 = vector.mma %l1_3, %r1_3, %n11_2 : vector<16xf16>, vector<16xf16>, vector<8xf32>
+  %r2_3 = vector.fragment.load<rhs> %w_view[%kh3, %row2] shape [%m, %m] : view<64x128xf16, %w_layout> -> vector<16xf16>
+  %n02_3 = vector.mma %l0_3, %r2_3, %n02_2 : vector<16xf16>, vector<16xf16>, vector<8xf32>
+  %n12_3 = vector.mma %l1_3, %r2_3, %n12_2 : vector<16xf16>, vector<16xf16>, vector<8xf32>
+  %r3_3 = vector.fragment.load<rhs> %w_view[%kh3, %row3] shape [%m, %m] : view<64x128xf16, %w_layout> -> vector<16xf16>
+  %n03_3 = vector.mma %l0_3, %r3_3, %n03_2 : vector<16xf16>, vector<16xf16>, vector<8xf32>
+  %n13_3 = vector.mma %l1_3, %r3_3, %n13_2 : vector<16xf16>, vector<16xf16>, vector<8xf32>
+  template.return %n00_3, %n01_3, %n02_3, %n03_3, %n10_3, %n11_3, %n12_3, %n13_3 : vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>
+}
+
+template.def<@ggml.mma.k64_2x4> device target(@ggml_gfx12) requires [#target.subgroup.size<32>] priority(20) @ggml_mma_k64_2x4_gfx12(%x_stage: buffer, %w_stage: buffer, %col0: index, %row0: index, %acc00: vector<8xf32>, %acc01: vector<8xf32>, %acc02: vector<8xf32>, %acc03: vector<8xf32>, %acc10: vector<8xf32>, %acc11: vector<8xf32>, %acc12: vector<8xf32>, %acc13: vector<8xf32>) -> (vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>) {
+  %c0 = index.constant 0 : index
+  %c16 = index.constant 16 : index
+  %c32 = index.constant 32 : index
+  %c48 = index.constant 48 : index
+  %c64 = index.constant 64 : index
+  %c0_offset = index.constant 0 : offset
+  %m = index.constant 16 : index
+  %w_layout = encoding.layout.strided [1, 72] : encoding<layout>
+  %x_view = buffer.view %x_stage[%c0_offset] : buffer -> view<128x72xf16>
+  %w_view = buffer.view %w_stage[%c0_offset] : buffer -> view<64x128xf16, %w_layout>
+  %lane_row, %lane_k = func.call @ggml_mma_lhs_lane_gfx12() : () -> (index, index)
+  %x_row0 = index.add %col0, %lane_row : index
+  %x_row1 = index.add %x_row0, %c16 : index
+  %row1 = index.add %row0, %c16 : index
+  %row2 = index.add %row0, %c32 : index
+  %row3 = index.add %row0, %c48 : index
+  %r00, %r01, %r02, %r03, %r10, %r11, %r12, %r13 = scf.for %kh = [%c0 to %c64 step %c16](%a00 = %acc00 : vector<8xf32>, %a01 = %acc01 : vector<8xf32>, %a02 = %acc02 : vector<8xf32>, %a03 = %acc03 : vector<8xf32>, %a10 = %acc10 : vector<8xf32>, %a11 = %acc11 : vector<8xf32>, %a12 = %acc12 : vector<8xf32>, %a13 = %acc13 : vector<8xf32>) -> (vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>) unroll {
+    %xk = index.add %kh, %lane_k : index
+    %x0 = vector.load %x_view[%x_row0, %xk] : view<128x72xf16> -> vector<8xf16>
+    %x1 = vector.load %x_view[%x_row1, %xk] : view<128x72xf16> -> vector<8xf16>
+    %lhs0 = vector.fragment<lhs> %x0 shape [%m, %m] : vector<8xf16>
+    %lhs1 = vector.fragment<lhs> %x1 shape [%m, %m] : vector<8xf16>
+    %rhs0 = vector.fragment.load<rhs> %w_view[%kh, %row0] shape [%m, %m] : view<64x128xf16, %w_layout> -> vector<8xf16>
+    %rhs1 = vector.fragment.load<rhs> %w_view[%kh, %row1] shape [%m, %m] : view<64x128xf16, %w_layout> -> vector<8xf16>
+    %rhs2 = vector.fragment.load<rhs> %w_view[%kh, %row2] shape [%m, %m] : view<64x128xf16, %w_layout> -> vector<8xf16>
+    %rhs3 = vector.fragment.load<rhs> %w_view[%kh, %row3] shape [%m, %m] : view<64x128xf16, %w_layout> -> vector<8xf16>
+    %n00 = vector.mma %lhs0, %rhs0, %a00 : vector<8xf16>, vector<8xf16>, vector<8xf32>
+    %n10 = vector.mma %lhs1, %rhs0, %a10 : vector<8xf16>, vector<8xf16>, vector<8xf32>
+    %n01 = vector.mma %lhs0, %rhs1, %a01 : vector<8xf16>, vector<8xf16>, vector<8xf32>
+    %n11 = vector.mma %lhs1, %rhs1, %a11 : vector<8xf16>, vector<8xf16>, vector<8xf32>
+    %n02 = vector.mma %lhs0, %rhs2, %a02 : vector<8xf16>, vector<8xf16>, vector<8xf32>
+    %n12 = vector.mma %lhs1, %rhs2, %a12 : vector<8xf16>, vector<8xf16>, vector<8xf32>
+    %n03 = vector.mma %lhs0, %rhs3, %a03 : vector<8xf16>, vector<8xf16>, vector<8xf32>
+    %n13 = vector.mma %lhs1, %rhs3, %a13 : vector<8xf16>, vector<8xf16>, vector<8xf32>
+    scf.yield %n00, %n01, %n02, %n03, %n10, %n11, %n12, %n13 : vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>
+  }
+  template.return %r00, %r01, %r02, %r03, %r10, %r11, %r12, %r13 : vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>
+}
+
+template.def<@ggml.mma.k64_2x4> device requires [#target.subgroup.size<32>] priority(1) @ggml_mma_k64_2x4(%x_stage: buffer, %w_stage: buffer, %col0: index, %row0: index, %acc00: vector<8xf32>, %acc01: vector<8xf32>, %acc02: vector<8xf32>, %acc03: vector<8xf32>, %acc10: vector<8xf32>, %acc11: vector<8xf32>, %acc12: vector<8xf32>, %acc13: vector<8xf32>) -> (vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>) {
+  %c16 = index.constant 16 : index
+  %c32 = index.constant 32 : index
+  %c48 = index.constant 48 : index
+  %x_rows = index.constant 128 : index
+  %col1 = index.add %col0, %c16 : index
+  %row1 = index.add %row0, %c16 : index
+  %row2 = index.add %row0, %c32 : index
+  %row3 = index.add %row0, %c48 : index
+  %t00 = func.call @ggml_mma_tile16(%x_stage, %x_rows, %w_stage, %col0, %row0, %acc00) : (buffer, index, buffer, index, index, vector<8xf32>) -> (vector<8xf32>)
+  %t01 = func.call @ggml_mma_tile16(%x_stage, %x_rows, %w_stage, %col0, %row1, %acc01) : (buffer, index, buffer, index, index, vector<8xf32>) -> (vector<8xf32>)
+  %t02 = func.call @ggml_mma_tile16(%x_stage, %x_rows, %w_stage, %col0, %row2, %acc02) : (buffer, index, buffer, index, index, vector<8xf32>) -> (vector<8xf32>)
+  %t03 = func.call @ggml_mma_tile16(%x_stage, %x_rows, %w_stage, %col0, %row3, %acc03) : (buffer, index, buffer, index, index, vector<8xf32>) -> (vector<8xf32>)
+  %t10 = func.call @ggml_mma_tile16(%x_stage, %x_rows, %w_stage, %col1, %row0, %acc10) : (buffer, index, buffer, index, index, vector<8xf32>) -> (vector<8xf32>)
+  %t11 = func.call @ggml_mma_tile16(%x_stage, %x_rows, %w_stage, %col1, %row1, %acc11) : (buffer, index, buffer, index, index, vector<8xf32>) -> (vector<8xf32>)
+  %t12 = func.call @ggml_mma_tile16(%x_stage, %x_rows, %w_stage, %col1, %row2, %acc12) : (buffer, index, buffer, index, index, vector<8xf32>) -> (vector<8xf32>)
+  %t13 = func.call @ggml_mma_tile16(%x_stage, %x_rows, %w_stage, %col1, %row3, %acc13) : (buffer, index, buffer, index, index, vector<8xf32>) -> (vector<8xf32>)
+  template.return %t00, %t01, %t02, %t03, %t10, %t11, %t12, %t13 : vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>
+}
+
+// Raw weights of 32 values from k (a multiple of 32) of one row: word 0 to 8 of the result. The block index is clamped into
+// the span. Thus a row past the last row reads valid memory. row_base and w_span are in halves.
+template.decl @ggml.mmid.wload(%wtype: index, %weight: buffer, %w_span: index, %row_base: index, %k: index) -> (vector<9xi32>)
+
+// 32 decoded values in k order.
+template.decl @ggml.mmid.wdecode(%wtype: index, %raw: vector<9xi32>, %k: index) -> (vector<8xf16>, vector<8xf16>, vector<8xf16>, vector<8xf16>)
+
+// NVFP4 (type 40): words 0 to 4 are the scale word and the code words of sub-blocks 2h and 2h+1 (h = k / 32 % 2).
+template.def<@ggml.mmid.wload> device @ggml_mmid_wload_nvfp4(%wtype: index, %weight: buffer, %w_span: index, %row_base: index, %k: index) -> (vector<9xi32>) where [eq(%wtype, 40)] {
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c4 = index.constant 4 : index
+  %c18 = index.constant 18 : index
+  %c32 = index.constant 32 : index
+  %c64 = index.constant 64 : index
+  %c0_offset = index.constant 0 : offset
+  %zero = scalar.constant 0 : i32
+  %span18 = index.assume %w_span [range(%w_span, 18, 2147483647)] : index
+  %span_last = index.sub %span18, %c18 : index
+  %k_bounded = index.assume %k [range(%k, 0, 2147483646)] : index
+  %block = index.div %k_bounded, %c64 : index
+  %k32 = index.div %k_bounded, %c32 : index
+  %h = index.rem %k32, %c2 : index
+  %block_halves = index.mul %block, %c18 : index
+  %base0 = index.add %row_base, %block_halves : index
+  %base1 = index.assume %base0 [range(%base0, 0, 2147483600)] : index
+  %base = index.min %base1, %span_last : index
+  %word = index.div %base, %c2 : index
+  %h4 = index.mul %h, %c4 : index
+  %code0 = index.add %word, %c1 : index
+  %code = index.add %code0, %h4 : index
+  %c3 = index.constant 3 : index
+  %words_n0 = index.div %span18, %c2 : index
+  %words_n = index.assume %words_n0 [range(%words_n0, 9, 2147483647)] : index
+  %code_last = index.sub %words_n, %c4 : index
+  %limit0 = index.sub %words_n, %c3 : index
+  %code_c0 = index.min %code, %code_last : index
+  %code_c, %limit = index.assume %code_c0, %limit0 [lt(%code_c0, %limit0)] : index, index
+  %extent = index.add %limit, %c3 : index
+  %words = buffer.view %weight[%c0_offset] : buffer -> view<[%extent]xi32>
+  %word_in = index.assume %word [lt(%word, %code_c)] : index
+  %scales = view.load %words[%word_in] : view<[%extent]xi32> -> i32
+  %codes = vector.load %words[%code_c] : view<[%extent]xi32> -> vector<4xi32>
+  %c0w = vector.extract %codes[0] : vector<4xi32> -> i32
+  %c1w = vector.extract %codes[1] : vector<4xi32> -> i32
+  %c2w = vector.extract %codes[2] : vector<4xi32> -> i32
+  %c3w = vector.extract %codes[3] : vector<4xi32> -> i32
+  %raw = vector.from_elements %scales, %c0w, %c1w, %c2w, %c3w, %zero, %zero, %zero, %zero : vector<9xi32>
+  template.return %raw : vector<9xi32>
+}
+
+// Q8_0 (type 4): word 0 is the scale bits, words 1 to 8 the 32 codes of block k / 32.
+template.def<@ggml.mmid.wload> device @ggml_mmid_wload_q8_0(%wtype: index, %weight: buffer, %w_span: index, %row_base: index, %k: index) -> (vector<9xi32>) where [eq(%wtype, 4)] {
+  %c1 = index.constant 1 : index
+  %c9 = index.constant 9 : index
+  %c16 = index.constant 16 : index
+  %c17 = index.constant 17 : index
+  %c32 = index.constant 32 : index
+  %c0_offset = index.constant 0 : offset
+  %span17 = index.assume %w_span [range(%w_span, 17, 2147483647)] : index
+  %span_last = index.sub %span17, %c17 : index
+  %limit0 = index.sub %span17, %c16 : index
+  %k_bounded = index.assume %k [range(%k, 0, 2147483646)] : index
+  %block = index.div %k_bounded, %c32 : index
+  %block_halves = index.mul %block, %c17 : index
+  %base0 = index.add %row_base, %block_halves : index
+  %base1 = index.assume %base0 [range(%base0, 0, 2147483600)] : index
+  %clamped0 = index.min %base1, %span_last : index
+  %clamped, %limit = index.assume %clamped0, %limit0 [lt(%clamped0, %limit0)] : index, index
+  %extent = index.add %limit, %c16 : index
+  %halves = buffer.view %weight[%c0_offset] : buffer -> view<[%extent]xi16>
+  %q0_index = index.add %clamped, %c1 : index
+  %q1_index = index.add %clamped, %c9 : index
+  %d = view.load %halves[%clamped] : view<[%extent]xi16> -> i16
+  %q0 = vector.load %halves[%q0_index] : view<[%extent]xi16> -> vector<8xi16>
+  %q1 = vector.load %halves[%q1_index] : view<[%extent]xi16> -> vector<8xi16>
+  %d32 = scalar.extui %d : i16 to i32
+  %w0 = vector.bitcast %q0 : vector<8xi16> to vector<4xi32>
+  %w1 = vector.bitcast %q1 : vector<8xi16> to vector<4xi32>
+  %a0 = vector.extract %w0[0] : vector<4xi32> -> i32
+  %a1 = vector.extract %w0[1] : vector<4xi32> -> i32
+  %a2 = vector.extract %w0[2] : vector<4xi32> -> i32
+  %a3 = vector.extract %w0[3] : vector<4xi32> -> i32
+  %b0 = vector.extract %w1[0] : vector<4xi32> -> i32
+  %b1 = vector.extract %w1[1] : vector<4xi32> -> i32
+  %b2 = vector.extract %w1[2] : vector<4xi32> -> i32
+  %b3 = vector.extract %w1[3] : vector<4xi32> -> i32
+  %raw = vector.from_elements %d32, %a0, %a1, %a2, %a3, %b0, %b1, %b2, %b3 : vector<9xi32>
+  template.return %raw : vector<9xi32>
+}
+
+// UE4M3 scale byte sub of the scale word as f16, as in ggml_nvfp4_scale (motifs/nvfp4.loom).
+func.def inline @ggml_mmid_nvfp4_scale16(%word: i32, %sub: index) -> (f16) {
+  %s = index.cast %sub : index to i32
+  %c3 = scalar.constant 3 : i32
+  %c7 = scalar.constant 7 : i32
+  %c127 = scalar.constant 127 : i32
+  %c255 = scalar.constant 255 : i32
+  %shift = scalar.shli %s, %c3 : i32
+  %moved = scalar.shrui %word, %shift : i32
+  %byte = scalar.andi %moved, %c255 : i32
+  %low7 = scalar.andi %byte, %c127 : i32
+  %bits = scalar.shli %low7, %c7 : i32
+  %bits16 = scalar.trunci %bits : i32 to i16
+  %raw = scalar.bitcast %bits16 : i16 to f16
+  %k256 = scalar.constant 256.0 : f16
+  %value = scalar.mulf %raw, %k256 : f16
+  %zero = scalar.constant 0.0 : f16
+  %nan = scalar.cmpi eq, %byte, %c127 : i32
+  %clean = scf.select %nan, %zero, %value : f16
+  func.return %clean : f16
+}
+
+// f16 pair codes (see ggml_nvfp4_pair_shl) of the low (shift 9, 12) or high (shift 5, 8) nibbles of the two bytes at bits 0 and 16.
+func.def inline @ggml_mmid_nvfp4_pair(%s: i32, %mag_shift: i32, %sgn_shift: i32) -> (i32) {
+  %mag_mask = scalar.constant 234884608 : i32
+  %sgn_mask = scalar.constant -2147450880 : i32
+  %mag_moved = scalar.shli %s, %mag_shift : i32
+  %sgn_moved = scalar.shli %s, %sgn_shift : i32
+  %mag = scalar.andi %mag_moved, %mag_mask : i32
+  %sgn = scalar.andi %sgn_moved, %sgn_mask : i32
+  %pair = scalar.ori %mag, %sgn : i32
+  func.return %pair : i32
+}
+
+// 16 codes of one sub-block in k order from its two code words, times 2^14 and the scale d.
+func.def inline @ggml_mmid_nvfp4_sub16(%w0: i32, %w1: i32, %d: f16) -> (vector<8xf16>, vector<8xf16>) {
+  %c255 = scalar.constant 255 : i32
+  %c65280 = scalar.constant 65280 : i32
+  %c8 = scalar.constant 8 : i32
+  %c16 = scalar.constant 16 : i32
+  %m9 = scalar.constant 9 : i32
+  %s12 = scalar.constant 12 : i32
+  %m5 = scalar.constant 5 : i32
+  %s8 = scalar.constant 8 : i32
+  // Bytes 0 and 1 of a word at bits 0 and 16, bytes 2 and 3 likewise.
+  %a_lo = scalar.andi %w0, %c255 : i32
+  %a_b1 = scalar.andi %w0, %c65280 : i32
+  %a_b1s = scalar.shli %a_b1, %c8 : i32
+  %a01 = scalar.ori %a_lo, %a_b1s : i32
+  %a_hi = scalar.shrui %w0, %c16 : i32
+  %a_b2 = scalar.andi %a_hi, %c255 : i32
+  %a_b3 = scalar.andi %a_hi, %c65280 : i32
+  %a_b3s = scalar.shli %a_b3, %c8 : i32
+  %a23 = scalar.ori %a_b2, %a_b3s : i32
+  %b_lo = scalar.andi %w1, %c255 : i32
+  %b_b1 = scalar.andi %w1, %c65280 : i32
+  %b_b1s = scalar.shli %b_b1, %c8 : i32
+  %b01 = scalar.ori %b_lo, %b_b1s : i32
+  %b_hi = scalar.shrui %w1, %c16 : i32
+  %b_b2 = scalar.andi %b_hi, %c255 : i32
+  %b_b3 = scalar.andi %b_hi, %c65280 : i32
+  %b_b3s = scalar.shli %b_b3, %c8 : i32
+  %b23 = scalar.ori %b_b2, %b_b3s : i32
+  %p0 = func.call @ggml_mmid_nvfp4_pair(%a01, %m9, %s12) : (i32, i32, i32) -> (i32)
+  %p1 = func.call @ggml_mmid_nvfp4_pair(%a23, %m9, %s12) : (i32, i32, i32) -> (i32)
+  %p2 = func.call @ggml_mmid_nvfp4_pair(%b01, %m9, %s12) : (i32, i32, i32) -> (i32)
+  %p3 = func.call @ggml_mmid_nvfp4_pair(%b23, %m9, %s12) : (i32, i32, i32) -> (i32)
+  %p4 = func.call @ggml_mmid_nvfp4_pair(%a01, %m5, %s8) : (i32, i32, i32) -> (i32)
+  %p5 = func.call @ggml_mmid_nvfp4_pair(%a23, %m5, %s8) : (i32, i32, i32) -> (i32)
+  %p6 = func.call @ggml_mmid_nvfp4_pair(%b01, %m5, %s8) : (i32, i32, i32) -> (i32)
+  %p7 = func.call @ggml_mmid_nvfp4_pair(%b23, %m5, %s8) : (i32, i32, i32) -> (i32)
+  %low_words = vector.from_elements %p0, %p1, %p2, %p3 : vector<4xi32>
+  %high_words = vector.from_elements %p4, %p5, %p6, %p7 : vector<4xi32>
+  %low_codes = vector.bitcast %low_words : vector<4xi32> to vector<8xf16>
+  %high_codes = vector.bitcast %high_words : vector<4xi32> to vector<8xf16>
+  // code * 2^14 is the E2M1 value. Both products are exact in f16.
+  %pre = vector.splatf 16384.0 : vector<8xf16>
+  %dv = vector.splat %d : vector<8xf16>
+  %low0 = vector.mulf %low_codes, %pre : vector<8xf16>
+  %high0 = vector.mulf %high_codes, %pre : vector<8xf16>
+  %low = vector.mulf %low0, %dv : vector<8xf16>
+  %high = vector.mulf %high0, %dv : vector<8xf16>
+  func.return %low, %high : vector<8xf16>, vector<8xf16>
+}
+
+template.def<@ggml.mmid.wdecode> device priority(1) @ggml_mmid_wdecode_nvfp4(%wtype: index, %raw: vector<9xi32>, %k: index) -> (vector<8xf16>, vector<8xf16>, vector<8xf16>, vector<8xf16>) where [eq(%wtype, 40)] {
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c32 = index.constant 32 : index
+  %k_bounded = index.assume %k [range(%k, 0, 2147483646)] : index
+  %k32 = index.div %k_bounded, %c32 : index
+  %h = index.rem %k32, %c2 : index
+  %sub0 = index.mul %h, %c2 : index
+  %sub1 = index.add %sub0, %c1 : index
+  %scales = vector.extract %raw[0] : vector<9xi32> -> i32
+  %w0 = vector.extract %raw[1] : vector<9xi32> -> i32
+  %w1 = vector.extract %raw[2] : vector<9xi32> -> i32
+  %w2 = vector.extract %raw[3] : vector<9xi32> -> i32
+  %w3 = vector.extract %raw[4] : vector<9xi32> -> i32
+  %d0 = func.call @ggml_mmid_nvfp4_scale16(%scales, %sub0) : (i32, index) -> (f16)
+  %d1 = func.call @ggml_mmid_nvfp4_scale16(%scales, %sub1) : (i32, index) -> (f16)
+  %v0, %v1 = func.call @ggml_mmid_nvfp4_sub16(%w0, %w1, %d0) : (i32, i32, f16) -> (vector<8xf16>, vector<8xf16>)
+  %v2, %v3 = func.call @ggml_mmid_nvfp4_sub16(%w2, %w3, %d1) : (i32, i32, f16) -> (vector<8xf16>, vector<8xf16>)
+  template.return %v0, %v1, %v2, %v3 : vector<8xf16>, vector<8xf16>, vector<8xf16>, vector<8xf16>
+}
+
+// 16 NVFP4 values of one sub-block in k order times the scale: a byte permute maps each 3-bit code to the high byte of its f16
+// value times 256 (lut), the sign bit moves to bit 7. d_pk holds the UE4M3 scale / 256 twice. The products are exact.
+low.func.def inline target<amdgpu.gfx11.generic.core>(@ggml_gfx11) @ggml_mmid_nvfp4_deq16_low(%q0: reg<amdgpu.vgpr>, %q1: reg<amdgpu.vgpr>, %d_pk: reg<amdgpu.vgpr>) -> (reg<amdgpu.vgpr x8>) asm {
+  %lut_lo = v_mov_b32 1583110144
+  %lut_hi = v_mov_b32 1717854816
+  %zero = v_mov_b32 0
+  %m0_lo = v_and_b32_lit %q0, 117901063
+  %lut0_lo = v_perm_b32 %lut_hi, %lut_lo, %m0_lo
+  %s0_lo = v_lshlrev_b32_src0_inline %q0, 4
+  %s0_lo_m = v_and_b32_lit %s0_lo, 2155905152
+  %h0_lo = v_or_b32 %lut0_lo, %s0_lo_m
+  %m1_lo = v_and_b32_lit %q1, 117901063
+  %lut1_lo = v_perm_b32 %lut_hi, %lut_lo, %m1_lo
+  %s1_lo = v_lshlrev_b32_src0_inline %q1, 4
+  %s1_lo_m = v_and_b32_lit %s1_lo, 2155905152
+  %h1_lo = v_or_b32 %lut1_lo, %s1_lo_m
+  %q0_hi = v_lshrrev_b32_src0_inline %q0, 4
+  %m0_hi = v_and_b32_lit %q0_hi, 117901063
+  %lut0_hi = v_perm_b32 %lut_hi, %lut_lo, %m0_hi
+  %s0_hi_m = v_and_b32_lit %q0, 2155905152
+  %h0_hi = v_or_b32 %lut0_hi, %s0_hi_m
+  %q1_hi = v_lshrrev_b32_src0_inline %q1, 4
+  %m1_hi = v_and_b32_lit %q1_hi, 117901063
+  %lut1_hi = v_perm_b32 %lut_hi, %lut_lo, %m1_hi
+  %s1_hi_m = v_and_b32_lit %q1, 2155905152
+  %h1_hi = v_or_b32 %lut1_hi, %s1_hi_m
+  %p0 = v_perm_b32_src2_lit %zero, %h0_lo, 17563660
+  %p1 = v_perm_b32_src2_lit %zero, %h0_lo, 51118604
+  %p2 = v_perm_b32_src2_lit %zero, %h1_lo, 17563660
+  %p3 = v_perm_b32_src2_lit %zero, %h1_lo, 51118604
+  %p4 = v_perm_b32_src2_lit %zero, %h0_hi, 17563660
+  %p5 = v_perm_b32_src2_lit %zero, %h0_hi, 51118604
+  %p6 = v_perm_b32_src2_lit %zero, %h1_hi, 17563660
+  %p7 = v_perm_b32_src2_lit %zero, %h1_hi, 51118604
+  %r0 = v_pk_mul_f16 %p0, %d_pk
+  %r1 = v_pk_mul_f16 %p1, %d_pk
+  %r2 = v_pk_mul_f16 %p2, %d_pk
+  %r3 = v_pk_mul_f16 %p3, %d_pk
+  %r4 = v_pk_mul_f16 %p4, %d_pk
+  %r5 = v_pk_mul_f16 %p5, %d_pk
+  %r6 = v_pk_mul_f16 %p6, %d_pk
+  %r7 = v_pk_mul_f16 %p7, %d_pk
+  %out = concat(%r0, %r1, %r2, %r3, %r4, %r5, %r6, %r7) : (reg<amdgpu.vgpr>, reg<amdgpu.vgpr>, reg<amdgpu.vgpr>, reg<amdgpu.vgpr>, reg<amdgpu.vgpr>, reg<amdgpu.vgpr>, reg<amdgpu.vgpr>, reg<amdgpu.vgpr>) -> reg<amdgpu.vgpr x8>
+  return %out
+}
+
+// The UE4M3 scale byte sub of the scale word / 256 as f16 bits, twice. The code 0x7F is zero, as in ggml_nvfp4_scale.
+func.def inline @ggml_mmid_nvfp4_scale_pk(%word: i32, %sub: index) -> (vector<2xf16>) {
+  %s = index.cast %sub : index to i32
+  %c3 = scalar.constant 3 : i32
+  %c7 = scalar.constant 7 : i32
+  %c127 = scalar.constant 127 : i32
+  %c255 = scalar.constant 255 : i32
+  %zero = scalar.constant 0 : i32
+  %shift = scalar.shli %s, %c3 : i32
+  %moved = scalar.shrui %word, %shift : i32
+  %byte = scalar.andi %moved, %c255 : i32
+  %low7 = scalar.andi %byte, %c127 : i32
+  %nan = scalar.cmpi eq, %byte, %c127 : i32
+  %bits0 = scalar.shli %low7, %c7 : i32
+  %bits = scf.select %nan, %zero, %bits0 : i32
+  %bits16 = scalar.trunci %bits : i32 to i16
+  %pair = vector.splat %bits16 : vector<2xi16>
+  %d = vector.bitcast %pair : vector<2xi16> to vector<2xf16>
+  func.return %d : vector<2xf16>
+}
+
+template.def<@ggml.mmid.wdecode> device target(@ggml_gfx11) priority(20) @ggml_mmid_wdecode_nvfp4_gfx11(%wtype: index, %raw: vector<9xi32>, %k: index) -> (vector<8xf16>, vector<8xf16>, vector<8xf16>, vector<8xf16>) where [eq(%wtype, 40)] {
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c32 = index.constant 32 : index
+  %k_bounded = index.assume %k [range(%k, 0, 2147483646)] : index
+  %k32 = index.div %k_bounded, %c32 : index
+  %h = index.rem %k32, %c2 : index
+  %sub0 = index.mul %h, %c2 : index
+  %sub1 = index.add %sub0, %c1 : index
+  %scales = vector.extract %raw[0] : vector<9xi32> -> i32
+  %w0 = vector.slice %raw[1] : vector<9xi32> -> vector<1xi32>
+  %w1 = vector.slice %raw[2] : vector<9xi32> -> vector<1xi32>
+  %w2 = vector.slice %raw[3] : vector<9xi32> -> vector<1xi32>
+  %w3 = vector.slice %raw[4] : vector<9xi32> -> vector<1xi32>
+  %d0 = func.call @ggml_mmid_nvfp4_scale_pk(%scales, %sub0) : (i32, index) -> (vector<2xf16>)
+  %d1 = func.call @ggml_mmid_nvfp4_scale_pk(%scales, %sub1) : (i32, index) -> (vector<2xf16>)
+  %a = low.invoke @ggml_mmid_nvfp4_deq16_low(%w0, %w1, %d0) : (vector<1xi32>, vector<1xi32>, vector<2xf16>) -> (vector<16xf16>)
+  %b = low.invoke @ggml_mmid_nvfp4_deq16_low(%w2, %w3, %d1) : (vector<1xi32>, vector<1xi32>, vector<2xf16>) -> (vector<16xf16>)
+  %v0 = vector.slice %a[0] : vector<16xf16> -> vector<8xf16>
+  %v1 = vector.slice %a[8] : vector<16xf16> -> vector<8xf16>
+  %v2 = vector.slice %b[0] : vector<16xf16> -> vector<8xf16>
+  %v3 = vector.slice %b[8] : vector<16xf16> -> vector<8xf16>
+  template.return %v0, %v1, %v2, %v3 : vector<8xf16>, vector<8xf16>, vector<8xf16>, vector<8xf16>
+}
+
+template.def<@ggml.mmid.wdecode> device @ggml_mmid_wdecode_q8_0(%wtype: index, %raw: vector<9xi32>, %k: index) -> (vector<8xf16>, vector<8xf16>, vector<8xf16>, vector<8xf16>) where [eq(%wtype, 4)] {
+  %d32 = vector.extract %raw[0] : vector<9xi32> -> i32
+  %a0 = vector.extract %raw[1] : vector<9xi32> -> i32
+  %a1 = vector.extract %raw[2] : vector<9xi32> -> i32
+  %a2 = vector.extract %raw[3] : vector<9xi32> -> i32
+  %a3 = vector.extract %raw[4] : vector<9xi32> -> i32
+  %b0 = vector.extract %raw[5] : vector<9xi32> -> i32
+  %b1 = vector.extract %raw[6] : vector<9xi32> -> i32
+  %b2 = vector.extract %raw[7] : vector<9xi32> -> i32
+  %b3 = vector.extract %raw[8] : vector<9xi32> -> i32
+  %wa = vector.from_elements %a0, %a1, %a2, %a3 : vector<4xi32>
+  %wb = vector.from_elements %b0, %b1, %b2, %b3 : vector<4xi32>
+  %q0 = vector.bitcast %wa : vector<4xi32> to vector<8xi16>
+  %q1 = vector.bitcast %wb : vector<4xi32> to vector<8xi16>
+  %d = scalar.trunci %d32 : i32 to i16
+  %v0, %v1, %v2, %v3 = template.apply<@ggml.q8_0.decode32_f16>(%d, %q0, %q1) : (i16, vector<8xi16>, vector<8xi16>) -> (vector<8xf16>, vector<8xf16>, vector<8xf16>, vector<8xf16>)
+  template.return %v0, %v1, %v2, %v3 : vector<8xf16>, vector<8xf16>, vector<8xf16>, vector<8xf16>
+}

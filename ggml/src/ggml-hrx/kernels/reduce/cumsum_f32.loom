@@ -1,0 +1,126 @@
+// Inclusive prefix sum of f32 rows. One workgroup for each row. Strides are in elements, s0 is 1.
+// A tile has 4 values for each lane. The lanes scan their sums and add the total of the tiles before.
+
+config.decl @ggml.cumsum.wg_size : %value: index where [range(%value, 64, 1024), multiple_of(%value, 64)]
+
+target.decl @ggml_wave64
+
+// Value i of the row, 0 past ne0. The index is clamped so that the load stays in the buffer.
+func.def inline @ggml_hrx_cumsum_load(%buf: buffer, %span: index, %base: index, %i: index, %ne0: index) -> (f32) {
+  %zero = index.constant 0 : offset
+  %view = buffer.view %buf[%zero] : buffer -> view<[%span]xf32>
+  %c1 = index.constant 1 : index
+  %c0_f32 = scalar.constant 0.0 : f32
+  %top = index.sub %span, %c1 : index
+  %raw = index.add %base, %i : index
+  %clamped = index.min %raw, %top : index
+  %off = index.assume %clamped [range(%clamped, 0, 2147483646), le(%clamped, %top)] : index
+  %x = view.load %view[%off] : view<[%span]xf32> -> f32
+  %ok = index.cmp ult, %i, %ne0 : index
+  %r = scf.select %ok, %x, %c0_f32 : f32
+  func.return %r : f32
+}
+
+func.def inline @ggml_hrx_cumsum_store(%buf: buffer, %span: index, %base: index, %i: index, %ne0: index, %y: f32) {
+  %zero = index.constant 0 : offset
+  %view = buffer.view %buf[%zero] : buffer -> view<[%span]xf32>
+  %idx = index.add %base, %i : index
+  %off = index.assume %idx [range(%idx, 0, 2147483646)] : index
+  %in_row = index.cmp ult, %i, %ne0 : index
+  scf.if %in_row {
+    %ok = index.cmp ult, %off, %span : index
+    scf.if %ok {
+      view.store %y, %view[%off] : f32, view<[%span]xf32>
+    }
+  }
+  func.return
+}
+
+kernel.def target(@ggml_wave64) export("ggml_cumsum_f32") @ggml_cumsum_f32(%rows: index) {
+  %one = index.constant 1 : index
+  %wg_size = config.get @ggml.cumsum.wg_size : index
+  kernel.launch.config workgroups(%rows, %one, %one) workgroup_size(%wg_size, %one, %one) : index
+} launch(%ne0_in: index, %ne1_in: index, %ne2_in: index, %s1_in: index, %s2_in: index, %s3_in: index, %src_span_in: index, %d1_in: index, %d2_in: index, %d3_in: index, %dst_span_in: index, %src: buffer, %dst: buffer) {
+  // supports_cumsum checks these ranges.
+  %ne0 = index.assume %ne0_in [range(%ne0_in, 1, 2147483647)] : index
+  %ne1 = index.assume %ne1_in [range(%ne1_in, 1, 2147483647)] : index
+  %ne2 = index.assume %ne2_in [range(%ne2_in, 1, 2147483647)] : index
+  %s1 = index.assume %s1_in [range(%s1_in, 0, 2147483647)] : index
+  %s2 = index.assume %s2_in [range(%s2_in, 0, 2147483647)] : index
+  %s3 = index.assume %s3_in [range(%s3_in, 0, 2147483647)] : index
+  %src_span = index.assume %src_span_in [range(%src_span_in, 1, 2147483647)] : index
+  %d1 = index.assume %d1_in [range(%d1_in, 0, 2147483647)] : index
+  %d2 = index.assume %d2_in [range(%d2_in, 0, 2147483647)] : index
+  %d3 = index.assume %d3_in [range(%d3_in, 0, 2147483647)] : index
+  %dst_span = index.assume %dst_span_in [range(%dst_span_in, 1, 2147483647)] : index
+  %wg_size = config.get @ggml.cumsum.wg_size : index
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c3 = index.constant 3 : index
+  %c4 = index.constant 4 : index
+  %zero = index.constant 0 : offset
+  %four_b = index.constant 4 : offset
+  %c0_f32 = scalar.constant 0.0 : f32
+  %row = kernel.workgroup.id<x> : index
+  %item = kernel.workitem.id<x> : index
+
+  %i1 = index.rem %row, %ne1 : index
+  %t0 = index.div %row, %ne1 : index
+  %i2 = index.rem %t0, %ne2 : index
+  %i3 = index.div %t0, %ne2 : index
+  %so1 = index.mul %i1, %s1 : index
+  %so2 = index.mul %i2, %s2 : index
+  %so3 = index.mul %i3, %s3 : index
+  %so12 = index.add %so1, %so2 : index
+  %src_base = index.add %so12, %so3 : index
+  %do1 = index.mul %i1, %d1 : index
+  %do2 = index.mul %i2, %d2 : index
+  %do3 = index.mul %i3, %d3 : index
+  %do12 = index.add %do1, %do2 : index
+  %dst_base = index.add %do12, %do3 : index
+
+  // The last lane puts the tile total here for the other lanes.
+  %lds = buffer.alloca<workgroup> align(16) %four_b : buffer
+  %total_view = buffer.view %lds[%zero] : buffer -> view<1xf32>
+  %last_lane = index.sub %wg_size, %c1 : index
+  %is_last = index.cmp eq, %item, %last_lane : index
+
+  %tile = index.mul %wg_size, %c4 : index
+  %lane_first = index.mul %item, %c4 : index
+  %unused = scf.for %t = [%c0 to %ne0 step %tile](%carry = %c0_f32 : f32) -> (f32) {
+    %j0 = index.add %t, %lane_first : index
+    %j1 = index.add %j0, %c1 : index
+    %j2 = index.add %j0, %c2 : index
+    %j3 = index.add %j0, %c3 : index
+    %x0 = func.call @ggml_hrx_cumsum_load(%src, %src_span, %src_base, %j0, %ne0) : (buffer, index, index, index, index) -> (f32)
+    %x1 = func.call @ggml_hrx_cumsum_load(%src, %src_span, %src_base, %j1, %ne0) : (buffer, index, index, index, index) -> (f32)
+    %x2 = func.call @ggml_hrx_cumsum_load(%src, %src_span, %src_base, %j2, %ne0) : (buffer, index, index, index, index) -> (f32)
+    %x3 = func.call @ggml_hrx_cumsum_load(%src, %src_span, %src_base, %j3, %ne0) : (buffer, index, index, index, index) -> (f32)
+    %p1 = scalar.addf %x0, %x1 : f32
+    %p2 = scalar.addf %p1, %x2 : f32
+    %p3 = scalar.addf %p2, %x3 : f32
+    %before = kernel.workgroup.scan<addf> %p3 {direction = forward, mode = exclusive} : f32
+    %y0 = scalar.addf %before, %x0 : f32
+    %y1 = scalar.addf %before, %p1 : f32
+    %y2 = scalar.addf %before, %p2 : f32
+    %y3 = scalar.addf %before, %p3 : f32
+    %z0 = scalar.addf %carry, %y0 : f32
+    %z1 = scalar.addf %carry, %y1 : f32
+    %z2 = scalar.addf %carry, %y2 : f32
+    %z3 = scalar.addf %carry, %y3 : f32
+    func.call @ggml_hrx_cumsum_store(%dst, %dst_span, %dst_base, %j0, %ne0, %z0) : (buffer, index, index, index, index, f32)
+    func.call @ggml_hrx_cumsum_store(%dst, %dst_span, %dst_base, %j1, %ne0, %z1) : (buffer, index, index, index, index, f32)
+    func.call @ggml_hrx_cumsum_store(%dst, %dst_span, %dst_base, %j2, %ne0, %z2) : (buffer, index, index, index, index, f32)
+    func.call @ggml_hrx_cumsum_store(%dst, %dst_span, %dst_base, %j3, %ne0, %z3) : (buffer, index, index, index, index, f32)
+    // The next carry is the last value of this tile, so that the row does not go down at a tile edge.
+    scf.if %is_last {
+      view.store %z3, %total_view[0] : f32, view<1xf32>
+    }
+    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+    %next = view.load %total_view[0] : view<1xf32> -> f32
+    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+    scf.yield %next : f32
+  }
+  kernel.return
+}

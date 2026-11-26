@@ -1818,8 +1818,14 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     };
 
     // assign the input layer
-    // there is very little benefit to offloading the input layer, so always keep it on the CPU
     pimpl->dev_input = { cpu_dev, &pimpl->cpu_buft_list };
+    if (act_gpu_layers > 0 && (arch == LLM_ARCH_INKLING2_LOOP ||
+            (arch == LLM_ARCH_DFLASH && ml.get_tensor_meta("mask_embd.weight")))) {
+        const auto first = get_layer_buft_list(i_gpu_start);
+        if (llama_backend_has_feature(first.dev, "DEVICE_TOKEN_EMBEDDINGS")) {
+            pimpl->dev_input = first;
+        }
+    }
 
     // assign the repeating layers to the devices according to the splits
     pimpl->dev_layer.resize(n_layer_all);
@@ -2018,6 +2024,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 output_in_s = create_tensor(tn(LLM_TENSOR_OUTPUT, "input_scale"), {1}, TENSOR_NOT_REQUIRED);
             }
         }
+        post_arch_tensors(ml);
     }
 
     ml.done_getting_tensors();
@@ -2709,7 +2716,8 @@ llama_split_mode llama_model::split_mode() const {
 }
 
 bool llama_model::graph_depends_on_n_tokens() const {
-    return arch == LLM_ARCH_QWEN4EXP || arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE;
+    return arch == LLM_ARCH_QWEN4EXP || arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE ||
+           arch == LLM_ARCH_INKLING2 || arch == LLM_ARCH_INKLING2_LOOP;
 }
 
 bool llama_model::no_alloc() const {

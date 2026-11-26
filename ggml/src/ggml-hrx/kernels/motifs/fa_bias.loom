@@ -1,0 +1,50 @@
+// Indexed attention bias of FLASH_ATTN_EXT: mask + table[indices[ib + tok]] at row tb of the table.
+// The sum is rounded to f16, as the dense mask that it replaces is.
+
+template.decl @ggml.flash_attn.bias1(%t_view: view<[%t_span]xf32>, %t_span: index, %i_view: view<[%i_span]xi32>, %i_span: index, %n_bins: index, %ib: index, %tb: index, %tok: index, %m: f32) -> (f32)
+
+// bias1 with s subtracted from the table value first, as a SUB of the table before the FLASH_ATTN_EXT does.
+template.decl @ggml.flash_attn.bias1_sub(%t_view: view<[%t_span]xf32>, %t_span: index, %i_view: view<[%i_span]xi32>, %i_span: index, %n_bins: index, %ib: index, %tb: index, %tok: index, %m: f32, %s: f32) -> (f32)
+
+// The loads are clamped into their bindings. Thus they need no branch.
+func.def inline @ggml_hrx_fa_bias_table(%t_view: view<[%t_span]xf32>, %t_span: index, %i_view: view<[%i_span]xi32>, %i_span: index, %n_bins: index, %ib: index, %tb: index, %tok: index) -> (f32) {
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %i_raw0 = index.add %ib, %tok : index
+  %i_raw = index.assume %i_raw0 [range(%i_raw0, 0, 2147483646)] : index
+  %i_top = index.sub %i_span, %c1 : index
+  %i_idx0 = index.min %i_raw, %i_top : index
+  %i_idx = index.assume %i_idx0 [lt(%i_idx0, %i_span)] : index
+  %bin_i32 = view.load %i_view[%i_idx] : view<[%i_span]xi32> -> i32
+  %bin0 = index.cast %bin_i32 : i32 to index
+  %bin_top = index.sub %n_bins, %c1 : index
+  %bin1 = index.max %bin0, %c0 : index
+  %bin = index.min %bin1, %bin_top : index
+  %t_raw0 = index.add %tb, %bin : index
+  %t_raw = index.assume %t_raw0 [range(%t_raw0, 0, 2147483646)] : index
+  %t_top = index.sub %t_span, %c1 : index
+  %t_idx0 = index.min %t_raw, %t_top : index
+  %t_idx = index.assume %t_idx0 [lt(%t_idx0, %t_span)] : index
+  %b = view.load %t_view[%t_idx] : view<[%t_span]xf32> -> f32
+  func.return %b : f32
+}
+
+func.def inline @ggml_hrx_fa_bias_round(%m: f32, %b: f32) -> (f32) {
+  %s = scalar.addf %m, %b : f32
+  %h = scalar.fptrunc %s : f32 to f16
+  %r = scalar.extf %h : f16 to f32
+  func.return %r : f32
+}
+
+template.def<@ggml.flash_attn.bias1> device @ggml_hrx_fa_bias1(%t_view: view<[%t_span]xf32>, %t_span: index, %i_view: view<[%i_span]xi32>, %i_span: index, %n_bins: index, %ib: index, %tb: index, %tok: index, %m: f32) -> (f32) {
+  %b = func.call @ggml_hrx_fa_bias_table(%t_view, %t_span, %i_view, %i_span, %n_bins, %ib, %tb, %tok) : (view<[%t_span]xf32>, index, view<[%i_span]xi32>, index, index, index, index, index) -> (f32)
+  %r = func.call @ggml_hrx_fa_bias_round(%m, %b) : (f32, f32) -> (f32)
+  template.return %r : f32
+}
+
+template.def<@ggml.flash_attn.bias1_sub> device @ggml_hrx_fa_bias1_sub(%t_view: view<[%t_span]xf32>, %t_span: index, %i_view: view<[%i_span]xi32>, %i_span: index, %n_bins: index, %ib: index, %tb: index, %tok: index, %m: f32, %s: f32) -> (f32) {
+  %b = func.call @ggml_hrx_fa_bias_table(%t_view, %t_span, %i_view, %i_span, %n_bins, %ib, %tb, %tok) : (view<[%t_span]xf32>, index, view<[%i_span]xi32>, index, index, index, index, index) -> (f32)
+  %bs = scalar.subf %b, %s : f32
+  %r = func.call @ggml_hrx_fa_bias_round(%m, %bs) : (f32, f32) -> (f32)
+  template.return %r : f32
+}

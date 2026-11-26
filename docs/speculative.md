@@ -132,6 +132,20 @@ llama-server -m Qwen3-4B.gguf -md Qwen3-4B-DSpark.gguf \
 acceptance (from the draft's confidence head) falls below `P` (default 0 = disabled).
 Values above 0 require a draft with a confidence head.
 
+Inkling 2 ships its DSpark drafter as `mtp.safetensors` in the model directory. Export it from a local
+checkpoint with `--dspark`; the converter also reads the target's lm head and embedding norm from there:
+
+```bash
+python convert_hf_to_gguf.py /path/to/Inkling-2-Mini --dspark --outtype bf16 --outfile Inkling-2-Mini-DSpark.gguf
+
+llama-server -m Inkling-2-Mini.gguf -md Inkling-2-Mini-DSpark.gguf \
+    --spec-type draft-dspark --spec-draft-n-max 3 -fa on --jinja
+```
+
+The Inkling 2 drafter supports `--spec-draft-sampling probabilistic`:
+at a positive request temperature, each drawn token conditions the next one, and the target verifies the draft by
+rejection sampling.
+
 Currently only drafts with a Qwen3 backbone are supported; support for other backbones
 (e.g. Gemma4) is planned.
 
@@ -258,6 +272,8 @@ If a draft model is combined with a draftless decoding the draftless decoding ha
 ### Backend Sampling
 
 Use `--backend-sampling` to run supported target-model samplers on the model backend. Draft-model sampling uses the backend by default and can be controlled with `--spec-draft-backend-sampling` and `--no-spec-draft-backend-sampling`.
+
+With a draft at a temperature above 0, the backend sampler of `llama-server` returns only the sampled tokens, and it verifies a probabilistic draft (`--spec-draft-sampling probabilistic`) by rejection sampling in the target graph.
 
 Unsupported samplers and device layouts fall back to CPU sampling. Tensor split mode does not support backend sampling. A fixed seed produces repeatable random draws, but stochastic CPU and backend sampling can still select different tokens because floating-point operations can differ between implementations and devices. Use greedy sampling when exact output matching is required.
 

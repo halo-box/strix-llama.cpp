@@ -1,0 +1,360 @@
+// Unary ops, CLAMP, FILL, SCALE, REPEAT and ARANGE. Strides are in elements. p0 and p1 are f32 bits.
+
+config.decl @ggml.unary.op : %value: index where [range(%value, 0, 16)]
+// 1 means that src index k is (dst index k) % (src ne k). Only REPEAT sets it.
+config.decl @ggml.unary.src_mod : %value: index where [range(%value, 0, 1)]
+// Number of dims after the caller merges contiguous dims. 4 means 3 or 4.
+config.decl @ggml.unary.dims : %value: index where [range(%value, 1, 4)]
+
+config.decl @ggml.elementwise.wg_size : %value: index where [range(%value, 64, 1024), multiple_of(%value, 64)]
+
+target.decl @ggml_wave64
+
+func.def inline @ggml_hrx_unary_param(%bits: index) -> (f32) {
+  %bits_i32 = index.cast %bits : index to i32
+  %vec = vector.from_elements %bits_i32 : vector<1xi32>
+  %fvec = vector.bitcast %vec : vector<1xi32> to vector<1xf32>
+  %value = vector.extract %fvec[0] : vector<1xf32> -> f32
+  func.return %value : f32
+}
+
+// Cephes tanhf. The tanhf<afn> recipe 2 * logistic(2x) - 1 has a large relative error for small x.
+func.def inline @ggml_hrx_tanh(%x: f32) -> (f32) {
+  %one = scalar.constant 1.0 : f32
+  %two = scalar.constant 2.0 : f32
+  %small_max = scalar.constant 0.625 : f32
+  %k4 = scalar.constant -0.00570498872745 : f32
+  %k3 = scalar.constant 0.0206390887954 : f32
+  %k2 = scalar.constant -0.0537397155531 : f32
+  %k1 = scalar.constant 0.133314422036 : f32
+  %k0 = scalar.constant -0.333332819422 : f32
+  %ax = scalar.absf %x : f32
+  %ax2 = scalar.addf %ax, %ax : f32
+  %e = scalar.expf<afn> %ax2 : f32
+  %e1 = scalar.addf %e, %one : f32
+  %q = scalar.divf %two, %e1 : f32
+  %big_abs = scalar.subf %one, %q : f32
+  %big = scalar.copysignf %big_abs, %x : f32
+  %s = scalar.mulf %x, %x : f32
+  %p3 = scalar.fmaf %k4, %s, %k3 : f32
+  %p2 = scalar.fmaf %p3, %s, %k2 : f32
+  %p1 = scalar.fmaf %p2, %s, %k1 : f32
+  %p0 = scalar.fmaf %p1, %s, %k0 : f32
+  %ps = scalar.mulf %p0, %s : f32
+  %small = scalar.fmaf %ps, %x, %x : f32
+  %is_small = scalar.cmpf olt, %ax, %small_max : f32
+  %r = scf.select %is_small, %small, %big : f32
+  func.return %r : f32
+}
+
+// Must match the op codes in ops/unary.cpp. op is a config constant. Thus the compiler removes the unused cases.
+func.def inline @ggml_hrx_unary_op(%op: index, %x: f32, %p0: f32, %p1: f32) -> (f32) {
+  %zero = scalar.constant 0.0 : f32
+  %one = scalar.constant 1.0 : f32
+  %r = scf.switch %op -> (f32) {
+    case 1 {
+      %sqr = scalar.mulf %x, %x : f32
+      scf.yield %sqr : f32
+    }
+    case 2 {
+      %sqrt = scalar.sqrtf %x : f32
+      scf.yield %sqrt : f32
+    }
+    case 3 {
+      %log = scalar.logf<afn> %x : f32
+      scf.yield %log : f32
+    }
+    case 4 {
+      %sigmoid = scalar.logisticf %x : f32
+      scf.yield %sigmoid : f32
+    }
+    case 5 {
+      %tanh = func.call @ggml_hrx_tanh(%x) : (f32) -> (f32)
+      scf.yield %tanh : f32
+    }
+    case 6 {
+      // The CPU backend does MAX(MIN(x, max), min).
+      %upper = scalar.minnumf %x, %p1 : f32
+      %clamp = scalar.maxnumf %upper, %p0 : f32
+      scf.yield %clamp : f32
+    }
+    case 7 {
+      scf.yield %p0 : f32
+    }
+    case 8 {
+      %exp = scalar.expf<afn> %x : f32
+      scf.yield %exp : f32
+    }
+    case 9 {
+      %neg = scalar.negf %x : f32
+      scf.yield %neg : f32
+    }
+    case 10 {
+      %abs = scalar.absf %x : f32
+      scf.yield %abs : f32
+    }
+    case 11 {
+      %silu = scalar.siluf %x : f32
+      scf.yield %silu : f32
+    }
+    case 12 {
+      %relu_pos = scalar.cmpf ogt, %x, %zero : f32
+      %relu = scf.select %relu_pos, %x, %zero : f32
+      scf.yield %relu : f32
+    }
+    case 13 {
+      %gelu = scalar.geluf<tanh, afn> %x : f32
+      scf.yield %gelu : f32
+    }
+    case 14 {
+      %sgn = scalar.signf %x : f32
+      scf.yield %sgn : f32
+    }
+    case 15 {
+      %step_pos = scalar.cmpf ogt, %x, %zero : f32
+      %step = scf.select %step_pos, %one, %zero : f32
+      scf.yield %step : f32
+    }
+    case 16 {
+      %scale = scalar.fmaf %x, %p0, %p1 : f32
+      scf.yield %scale : f32
+    }
+    default {
+      scf.yield %x : f32
+    }
+  }
+  func.return %r : f32
+}
+
+// dims 1 and 2 skip the divisions for the higher dims. The caller merges contiguous dims.
+func.def inline @ggml_hrx_unary_idx4(%dims: index, %i: index, %ne0: index, %ne1: index, %ne2: index) -> (index, index, index, index) {
+  %c0 = index.constant 0 : index
+  %i0, %i1, %i2, %i3 = scf.switch %dims -> (index, index, index, index) {
+    case 1 {
+      scf.yield %i, %c0, %c0, %c0 : index, index, index, index
+    }
+    case 2 {
+      %d2_i0 = index.rem %i, %ne0 : index
+      %d2_i1 = index.div %i, %ne0 : index
+      scf.yield %d2_i0, %d2_i1, %c0, %c0 : index, index, index, index
+    }
+    default {
+      %d4_i0 = index.rem %i, %ne0 : index
+      %d4_q0 = index.div %i, %ne0 : index
+      %d4_i1 = index.rem %d4_q0, %ne1 : index
+      %d4_q1 = index.div %d4_q0, %ne1 : index
+      %d4_i2 = index.rem %d4_q1, %ne2 : index
+      %d4_i3 = index.div %d4_q1, %ne2 : index
+      scf.yield %d4_i0, %d4_i1, %d4_i2, %d4_i3 : index, index, index, index
+    }
+  }
+  func.return %i0, %i1, %i2, %i3 : index, index, index, index
+}
+
+// src and dst are contiguous and have the same shape. Each work item does 4 elements.
+kernel.def target(@ggml_wave64) export("ggml_unary_f32_vec4") @ggml_unary_f32_vec4(%n: index) {
+  %one = index.constant 1 : index
+  %wg_size = config.get @ggml.elementwise.wg_size : index
+  %wg_x2 = index.add %wg_size, %wg_size : index
+  %per_group = index.add %wg_x2, %wg_x2 : index
+  %round = index.sub %per_group, %one : index
+  %n_round = index.add %n, %round : index
+  %groups = index.div %n_round, %per_group : index
+  kernel.launch.config workgroups(%groups, %one, %one) workgroup_size(%wg_size, %one, %one) : index
+} launch(%n_in: index, %p0_bits: index, %p1_bits: index, %src: buffer, %dst: buffer) {
+  // The caller checks the range.
+  %n = index.assume %n_in [range(%n_in, 1, 2147483640)] : index
+  %op = config.get @ggml.unary.op : index
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c3 = index.constant 3 : index
+  %c4 = index.constant 4 : index
+  %c7 = index.constant 7 : index
+  %wg_size = config.get @ggml.elementwise.wg_size : index
+  %wg_x2 = index.add %wg_size, %wg_size : index
+  %per_group = index.add %wg_x2, %wg_x2 : index
+  %group = kernel.workgroup.id<x> : index
+  %item = kernel.workitem.id<x> : index
+  %base = index.mul %group, %per_group : index
+  %lane = index.mul %item, %c4 : index
+  %j_raw = index.add %base, %lane : index
+  %j = index.assume %j_raw [range(%j_raw, 0, 2147483640)] : index
+  %p0 = func.call @ggml_hrx_unary_param(%p0_bits) : (index) -> (f32)
+  %p1 = func.call @ggml_hrx_unary_param(%p1_bits) : (index) -> (f32)
+  // FILL does not read src.
+  %reads_src = index.cmp ne, %op, %c7 : index
+  %zero = index.constant 0 : offset
+  %zero4 = vector.splatf 0.0 : vector<4xf32>
+  %zero_f = scalar.constant 0.0 : f32
+  // src and dst can alias for in-place ops. Thus do not use noalias.
+  %src_view = buffer.view %src[%zero] : buffer -> view<[%n]xf32>
+  %dst_view = buffer.view %dst[%zero] : buffer -> view<[%n]xf32>
+  %j_last = index.add %j, %c3 : index
+  %full = index.cmp ult, %j_last, %n : index
+  scf.if %full {
+    %x = scf.if %reads_src -> (vector<4xf32>) {
+      %xv = vector.load %src_view[%j] : view<[%n]xf32> -> vector<4xf32>
+      scf.yield %xv : vector<4xf32>
+    } else {
+      scf.yield %zero4 : vector<4xf32>
+    }
+    %x0 = vector.extract %x[0] : vector<4xf32> -> f32
+    %x1 = vector.extract %x[1] : vector<4xf32> -> f32
+    %x2 = vector.extract %x[2] : vector<4xf32> -> f32
+    %x3 = vector.extract %x[3] : vector<4xf32> -> f32
+    %y0 = func.call @ggml_hrx_unary_op(%op, %x0, %p0, %p1) : (index, f32, f32, f32) -> (f32)
+    %y1 = func.call @ggml_hrx_unary_op(%op, %x1, %p0, %p1) : (index, f32, f32, f32) -> (f32)
+    %y2 = func.call @ggml_hrx_unary_op(%op, %x2, %p0, %p1) : (index, f32, f32, f32) -> (f32)
+    %y3 = func.call @ggml_hrx_unary_op(%op, %x3, %p0, %p1) : (index, f32, f32, f32) -> (f32)
+    %y = vector.from_elements %y0, %y1, %y2, %y3 : vector<4xf32>
+    vector.store %y, %dst_view[%j] : vector<4xf32>, view<[%n]xf32>
+  } else {
+    // The tail has at most 3 elements.
+    scf.for %k = [%c0 to %c3 step %c1] {
+      %t_raw = index.add %j, %k : index
+      %t = index.assume %t_raw [range(%t_raw, 0, 2147483646)] : index
+      %t_ok = index.cmp ult, %t, %n : index
+      scf.if %t_ok {
+        %xt = scf.if %reads_src -> (f32) {
+          %xs = view.load %src_view[%t] : view<[%n]xf32> -> f32
+          scf.yield %xs : f32
+        } else {
+          scf.yield %zero_f : f32
+        }
+        %yt = func.call @ggml_hrx_unary_op(%op, %xt, %p0, %p1) : (index, f32, f32, f32) -> (f32)
+        view.store %yt, %dst_view[%t] : f32, view<[%n]xf32>
+      }
+    }
+  }
+  kernel.return
+}
+
+// Any src and dst strides. dst has the shape ne. Each work item does 1 element.
+kernel.def target(@ggml_wave64) export("ggml_unary_f32") @ggml_unary_f32(%n: index) {
+  %one = index.constant 1 : index
+  %wg_size = config.get @ggml.elementwise.wg_size : index
+  %round = index.sub %wg_size, %one : index
+  %n_round = index.add %n, %round : index
+  %groups = index.div %n_round, %wg_size : index
+  kernel.launch.config workgroups(%groups, %one, %one) workgroup_size(%wg_size, %one, %one) : index
+} launch(%n_in: index, %ne0_in: index, %ne1_in: index, %ne2_in: index, %sn0_in: index, %sn1_in: index, %sn2_in: index, %sn3_in: index, %s0_in: index, %s1_in: index, %s2_in: index, %s3_in: index, %s_span_in: index, %d0_in: index, %d1_in: index, %d2_in: index, %d3_in: index, %d_span_in: index, %p0_bits: index, %p1_bits: index, %src: buffer, %dst: buffer) {
+  // The caller checks these ranges. The caller sets the stride of a size-1 dim to 0.
+  %n = index.assume %n_in [range(%n_in, 1, 2147483647)] : index
+  %ne0 = index.assume %ne0_in [range(%ne0_in, 1, 2147483647)] : index
+  %ne1 = index.assume %ne1_in [range(%ne1_in, 1, 2147483647)] : index
+  %ne2 = index.assume %ne2_in [range(%ne2_in, 1, 2147483647)] : index
+  %sn0 = index.assume %sn0_in [range(%sn0_in, 1, 2147483647)] : index
+  %sn1 = index.assume %sn1_in [range(%sn1_in, 1, 2147483647)] : index
+  %sn2 = index.assume %sn2_in [range(%sn2_in, 1, 2147483647)] : index
+  %sn3 = index.assume %sn3_in [range(%sn3_in, 1, 2147483647)] : index
+  %s0 = index.assume %s0_in [range(%s0_in, 0, 2147483647)] : index
+  %s1 = index.assume %s1_in [range(%s1_in, 0, 2147483647)] : index
+  %s2 = index.assume %s2_in [range(%s2_in, 0, 2147483647)] : index
+  %s3 = index.assume %s3_in [range(%s3_in, 0, 2147483647)] : index
+  %s_span = index.assume %s_span_in [range(%s_span_in, 1, 2147483647)] : index
+  %d0 = index.assume %d0_in [range(%d0_in, 0, 2147483647)] : index
+  %d1 = index.assume %d1_in [range(%d1_in, 0, 2147483647)] : index
+  %d2 = index.assume %d2_in [range(%d2_in, 0, 2147483647)] : index
+  %d3 = index.assume %d3_in [range(%d3_in, 0, 2147483647)] : index
+  %d_span = index.assume %d_span_in [range(%d_span_in, 1, 2147483647)] : index
+  %op = config.get @ggml.unary.op : index
+  %src_mod = config.get @ggml.unary.src_mod : index
+  %dims = config.get @ggml.unary.dims : index
+  %c1 = index.constant 1 : index
+  %c7 = index.constant 7 : index
+  %wg_size = config.get @ggml.elementwise.wg_size : index
+  %group = kernel.workgroup.id<x> : index
+  %item = kernel.workitem.id<x> : index
+  %base = index.mul %group, %wg_size : index
+  %i = index.add %base, %item : index
+  %in_bounds = index.cmp ult, %i, %n : index
+  %zero = index.constant 0 : offset
+  %zero_f = scalar.constant 0.0 : f32
+  %src_view = buffer.view %src[%zero] : buffer -> view<[%s_span]xf32>
+  %dst_view = buffer.view %dst[%zero] : buffer -> view<[%d_span]xf32>
+  scf.if %in_bounds {
+    %i0, %i1, %i2, %i3 = func.call @ggml_hrx_unary_idx4(%dims, %i, %ne0, %ne1, %ne2) : (index, index, index, index, index) -> (index, index, index, index)
+
+    %is_mod = index.cmp eq, %src_mod, %c1 : index
+    %j0, %j1, %j2, %j3 = scf.if %is_mod -> (index, index, index, index) {
+      %m0 = index.rem %i0, %sn0 : index
+      %m1 = index.rem %i1, %sn1 : index
+      %m2 = index.rem %i2, %sn2 : index
+      %m3 = index.rem %i3, %sn3 : index
+      scf.yield %m0, %m1, %m2, %m3 : index, index, index, index
+    } else {
+      scf.yield %i0, %i1, %i2, %i3 : index, index, index, index
+    }
+    %so0 = index.mul %j0, %s0 : index
+    %so1 = index.mul %j1, %s1 : index
+    %so2 = index.mul %j2, %s2 : index
+    %so3 = index.mul %j3, %s3 : index
+    %so01 = index.add %so0, %so1 : index
+    %so23 = index.add %so2, %so3 : index
+    %s_idx = index.add %so01, %so23 : index
+
+    %do0 = index.mul %i0, %d0 : index
+    %do1 = index.mul %i1, %d1 : index
+    %do2 = index.mul %i2, %d2 : index
+    %do3 = index.mul %i3, %d3 : index
+    %do01 = index.add %do0, %do1 : index
+    %do23 = index.add %do2, %do3 : index
+    %d_idx = index.add %do01, %do23 : index
+
+    // The prover reads only branch conditions. Thus cap the offsets and check one bound in each scf.if.
+    %s_off = index.assume %s_idx [range(%s_idx, 0, 2147483646)] : index
+    %d_off = index.assume %d_idx [range(%d_idx, 0, 2147483646)] : index
+    %p0 = func.call @ggml_hrx_unary_param(%p0_bits) : (index) -> (f32)
+    %p1 = func.call @ggml_hrx_unary_param(%p1_bits) : (index) -> (f32)
+    %reads_src = index.cmp ne, %op, %c7 : index
+    %d_ok = index.cmp ult, %d_off, %d_span : index
+    scf.if %d_ok {
+      %x = scf.if %reads_src -> (f32) {
+        %s_ok = index.cmp ult, %s_off, %s_span : index
+        %xs = scf.if %s_ok -> (f32) {
+          %xl = view.load %src_view[%s_off] : view<[%s_span]xf32> -> f32
+          scf.yield %xl : f32
+        } else {
+          scf.yield %zero_f : f32
+        }
+        scf.yield %xs : f32
+      } else {
+        scf.yield %zero_f : f32
+      }
+      %y = func.call @ggml_hrx_unary_op(%op, %x, %p0, %p1) : (index, f32, f32, f32) -> (f32)
+      view.store %y, %dst_view[%d_off] : f32, view<[%d_span]xf32>
+    }
+  }
+  kernel.return
+}
+
+// ARANGE: dst[i] = start + step * i. dst is contiguous.
+kernel.def target(@ggml_wave64) export("ggml_arange_f32") @ggml_arange_f32(%n: index) {
+  %one = index.constant 1 : index
+  %wg_size = config.get @ggml.elementwise.wg_size : index
+  %round = index.sub %wg_size, %one : index
+  %n_round = index.add %n, %round : index
+  %groups = index.div %n_round, %wg_size : index
+  kernel.launch.config workgroups(%groups, %one, %one) workgroup_size(%wg_size, %one, %one) : index
+} launch(%n_in: index, %start_bits: index, %step_bits: index, %dst: buffer) {
+  // The caller checks the range.
+  %n = index.assume %n_in [range(%n_in, 1, 2147483647)] : index
+  %wg_size = config.get @ggml.elementwise.wg_size : index
+  %group = kernel.workgroup.id<x> : index
+  %item = kernel.workitem.id<x> : index
+  %base = index.mul %group, %wg_size : index
+  %i = index.add %base, %item : index
+  %in_bounds = index.cmp ult, %i, %n : index
+  %zero = index.constant 0 : offset
+  %dst_view = buffer.view %dst[%zero] : buffer -> view<[%n]xf32>
+  scf.if %in_bounds {
+    %start = func.call @ggml_hrx_unary_param(%start_bits) : (index) -> (f32)
+    %step = func.call @ggml_hrx_unary_param(%step_bits) : (index) -> (f32)
+    %i_i32 = index.cast %i : index to i32
+    %i_f32 = scalar.sitofp %i_i32 : i32 to f32
+    %off = scalar.mulf %step, %i_f32 : f32
+    %y = scalar.addf %start, %off : f32
+    view.store %y, %dst_view[%i] : f32, view<[%n]xf32>
+  }
+  kernel.return
+}

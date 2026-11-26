@@ -474,6 +474,7 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  -C, --cpu-mask <hex,hex>                          (default: %s)\n", join(cmd_params_defaults.cpu_mask, ",").c_str());
     printf("  --cpu-strict <0|1>                                (default: %s)\n", join(cmd_params_defaults.cpu_strict, ",").c_str());
     printf("  --poll <0...100>                                  (default: %s)\n", join(cmd_params_defaults.poll, ",").c_str());
+    printf("  --hrx-npu                                         use the HRX GPU with XDNA2 for eligible prefill matrix multiplications\n");
     printf("  -ngl, --n-gpu-layers <n>                          (default: %s)\n", join(cmd_params_defaults.n_gpu_layers, ",").c_str());
     printf("  -ncmoe, --n-cpu-moe <n>                           (default: %s)\n", join(cmd_params_defaults.n_cpu_moe, ",").c_str());
     printf("  -sm, --split-mode <none|layer|row|tensor>         (default: %s)\n", join(transform_to_str(cmd_params_defaults.split_mode, split_mode_str), ",").c_str());
@@ -729,6 +730,8 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 }
                 auto p = parse_int_range(argv[i]);
                 params.poll.insert(params.poll.end(), p.begin(), p.end());
+            } else if (arg == "--hrx-npu") {
+                params.devices.push_back({ common_hrx_npu_device(), nullptr });
             } else if (arg == "-ngl" || arg == "--n-gpu-layers") {
                 if (++i >= argc) {
                     invalid_param = true;

@@ -17,6 +17,8 @@
 #    define LLAMA_ATTRIBUTE_FORMAT(...)
 #endif
 
+bool llama_backend_has_feature(ggml_backend_dev_t dev, const char * name);
+
 //
 // logging
 //

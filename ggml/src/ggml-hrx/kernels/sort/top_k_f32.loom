@@ -1,0 +1,325 @@
+// top_k of f32 rows: the indices of the k largest values of a row, in the order of the index. One workgroup for each row.
+// Ties at the k-th value take the lowest indices. Radix select on a 32-bit key: 4 passes of 8 bits find the key of the
+// k-th value, then one pass writes the indices that come before it.
+// A long row can go in two steps: each chunk of the row gives its top k as (key, index) pairs (out_pairs), then the
+// pairs of all chunks give the top k of the row (in_pairs). Strides are in elements, s0 is 1.
+
+// 1: the rows are (key, index) pairs of an earlier step, row r at 2 * r * ne0.
+config.decl @ggml.top_k.in_pairs : %value: index where [range(%value, 0, 1)]
+// 1: write k (key, index) pairs for each row (one row for each chunk) at 2 * k * row. 0: write the i32 indices to dst.
+config.decl @ggml.top_k.out_pairs : %value: index where [range(%value, 0, 1)]
+// 1: keep the keys (and indices) of the row in workgroup memory. Then the chunk must be at most cap values.
+config.decl @ggml.top_k.lds : %value: index where [range(%value, 0, 1)]
+config.decl @ggml.top_k.cap : %value: index where [range(%value, 64, 8192), multiple_of(%value, 64)]
+config.decl @ggml.top_k.wg_size : %value: index where [range(%value, 256, 1024), multiple_of(%value, 64)]
+
+target.decl @ggml_wave64
+
+// Unsigned key in the reverse order of the f32 values: the largest value has the smallest key. -0 and +0 are equal.
+func.def inline @ggml_hrx_top_k_key(%x: f32) -> (i32) {
+  %c0_f32 = scalar.constant 0.0 : f32
+  %c0_i32 = scalar.constant 0 : i32
+  %mag = scalar.constant 2147483647 : i32
+  %bits0 = scalar.bitcast %x : f32 to i32
+  %is_zero = scalar.cmpf oeq, %x, %c0_f32 : f32
+  %bits = scf.select %is_zero, %c0_i32, %bits0 : i32
+  %neg = scalar.cmpi slt, %bits, %c0_i32 : i32
+  %flipped = scalar.xori %bits, %mag : i32
+  %key = scf.select %neg, %bits, %flipped : i32
+  func.return %key : i32
+}
+
+// Key and index of value j of the row. valid is false past n.
+func.def inline @ggml_hrx_top_k_elem(%in_pairs: i1, %use_lds: i1, %src: buffer, %src_span: index, %src_base: index, %first: index, %n: index, %j: index, %lds_keys: buffer, %lds_ids: buffer, %cap: index) -> (i32, i32, i1) {
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %zero = index.constant 0 : offset
+  %valid = index.cmp ult, %j, %n : index
+  %first_j = index.add %first, %j : index
+  %pos_i32 = index.cast %first_j : index to i32
+  %key, %idx = scf.if %use_lds -> (i32, i32) {
+    %top = index.sub %cap, %c1 : index
+    %jc = index.min %j, %top : index
+    %jl = index.assume %jc [range(%jc, 0, 8191), le(%jc, %top)] : index
+    %keys = buffer.view %lds_keys[%zero] : buffer -> view<[%cap]xi32>
+    %ids = buffer.view %lds_ids[%zero] : buffer -> view<[%cap]xi32>
+    %k = view.load %keys[%jl] : view<[%cap]xi32> -> i32
+    %i = scf.if %in_pairs -> (i32) {
+      %il = view.load %ids[%jl] : view<[%cap]xi32> -> i32
+      scf.yield %il : i32
+    } else {
+      scf.yield %pos_i32 : i32
+    }
+    scf.yield %k, %i : i32, i32
+  } else {
+    %rk, %ri = scf.if %in_pairs -> (i32, i32) {
+      // op_top_k gives at least one pair.
+      %span2 = index.assume %src_span [range(%src_span, 2, 2147483647)] : index
+      %top = index.sub %span2, %c2 : index
+      %j2 = index.mul %j, %c2 : index
+      %raw = index.add %src_base, %j2 : index
+      %rc = index.min %raw, %top : index
+      %off = index.assume %rc [range(%rc, 0, 2147483645), le(%rc, %top)] : index
+      %off1 = index.add %off, %c1 : index
+      %view = buffer.view %src[%zero] : buffer -> view<[%src_span]xi32>
+      %k = view.load %view[%off] : view<[%src_span]xi32> -> i32
+      %i = view.load %view[%off1] : view<[%src_span]xi32> -> i32
+      scf.yield %k, %i : i32, i32
+    } else {
+      %top = index.sub %src_span, %c1 : index
+      %raw = index.add %src_base, %first_j : index
+      %rc = index.min %raw, %top : index
+      %off = index.assume %rc [range(%rc, 0, 2147483646), le(%rc, %top)] : index
+      %view = buffer.view %src[%zero] : buffer -> view<[%src_span]xf32>
+      %x = view.load %view[%off] : view<[%src_span]xf32> -> f32
+      %k = func.call @ggml_hrx_top_k_key(%x) : (f32) -> (i32)
+      scf.yield %k, %pos_i32 : i32, i32
+    }
+    scf.yield %rk, %ri : i32, i32
+  }
+  func.return %key, %idx, %valid : i32, i32, i1
+}
+
+// Writes the result for slot of the row: the index, or the (key, index) pair.
+func.def inline @ggml_hrx_top_k_put(%out_pairs: i1, %dst: buffer, %dst_span: index, %dst_base: index, %slot: index, %key: i32, %idx: i32) {
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %zero = index.constant 0 : offset
+  %view = buffer.view %dst[%zero] : buffer -> view<[%dst_span]xi32>
+  scf.if %out_pairs {
+    %s2 = index.mul %slot, %c2 : index
+    %raw = index.add %dst_base, %s2 : index
+    %off = index.assume %raw [range(%raw, 0, 2147483645)] : index
+    %off1 = index.add %off, %c1 : index
+    %ok = index.cmp ult, %off1, %dst_span : index
+    scf.if %ok {
+      view.store %key, %view[%off] : i32, view<[%dst_span]xi32>
+      view.store %idx, %view[%off1] : i32, view<[%dst_span]xi32>
+    }
+  } else {
+    %raw = index.add %dst_base, %slot : index
+    %off = index.assume %raw [range(%raw, 0, 2147483646)] : index
+    %ok = index.cmp ult, %off, %dst_span : index
+    scf.if %ok {
+      view.store %idx, %view[%off] : i32, view<[%dst_span]xi32>
+    }
+  }
+  func.return
+}
+
+kernel.def target(@ggml_wave64) export("ggml_top_k_f32") @ggml_top_k_f32(%rows: index) {
+  %one = index.constant 1 : index
+  %wg_size = config.get @ggml.top_k.wg_size : index
+  kernel.launch.config workgroups(%rows, %one, %one) workgroup_size(%wg_size, %one, %one) : index
+} launch(%ne0_in: index, %chunk_in: index, %chunks_in: index, %k_in: index, %ne1_in: index, %ne2_in: index, %s1_in: index, %s2_in: index, %s3_in: index, %src_span_in: index, %d1_in: index, %d2_in: index, %d3_in: index, %dst_span_in: index, %src: buffer, %dst: buffer) {
+  // supports_top_k and op_top_k check these ranges.
+  %ne0 = index.assume %ne0_in [range(%ne0_in, 1, 2147483647)] : index
+  %chunk = index.assume %chunk_in [range(%chunk_in, 1, 2147483647)] : index
+  %chunks = index.assume %chunks_in [range(%chunks_in, 1, 2147483647)] : index
+  %k = index.assume %k_in [range(%k_in, 1, 2147483647)] : index
+  %ne1 = index.assume %ne1_in [range(%ne1_in, 1, 2147483647)] : index
+  %ne2 = index.assume %ne2_in [range(%ne2_in, 1, 2147483647)] : index
+  %s1 = index.assume %s1_in [range(%s1_in, 0, 2147483647)] : index
+  %s2 = index.assume %s2_in [range(%s2_in, 0, 2147483647)] : index
+  %s3 = index.assume %s3_in [range(%s3_in, 0, 2147483647)] : index
+  %src_span = index.assume %src_span_in [range(%src_span_in, 1, 2147483647)] : index
+  %d1 = index.assume %d1_in [range(%d1_in, 0, 2147483647)] : index
+  %d2 = index.assume %d2_in [range(%d2_in, 0, 2147483647)] : index
+  %d3 = index.assume %d3_in [range(%d3_in, 0, 2147483647)] : index
+  %dst_span = index.assume %dst_span_in [range(%dst_span_in, 1, 2147483647)] : index
+  %in_pairs_cfg = config.get @ggml.top_k.in_pairs : index
+  %out_pairs_cfg = config.get @ggml.top_k.out_pairs : index
+  %lds_cfg = config.get @ggml.top_k.lds : index
+  %cap = config.get @ggml.top_k.cap : index
+  %wg_size = config.get @ggml.top_k.wg_size : index
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c4 = index.constant 4 : index
+  %c8 = index.constant 8 : index
+  %c24 = index.constant 24 : index
+  %c256 = index.constant 256 : index
+  %zero = index.constant 0 : offset
+  %one_b = index.constant 1 : offset
+  %c0_i32 = scalar.constant 0 : i32
+  %c1_i32 = scalar.constant 1 : i32
+  %c8_i32 = scalar.constant 8 : i32
+  %c16_i32 = scalar.constant 16 : i32
+  %c31_i32 = scalar.constant 31 : i32
+  %c255_i32 = scalar.constant 255 : i32
+  %low16 = scalar.constant 65535 : i32
+  %all_i32 = scalar.constant -1 : i32
+  %max_i32 = scalar.constant 2147483647 : i32
+  %in_pairs = index.cmp eq, %in_pairs_cfg, %c1 : index
+  %out_pairs = index.cmp eq, %out_pairs_cfg, %c1 : index
+  %use_lds = index.cmp eq, %lds_cfg, %c1 : index
+  %vrow = kernel.workgroup.id<x> : index
+  %item = kernel.workitem.id<x> : index
+
+  // Row and chunk of this workgroup.
+  %ci = index.rem %vrow, %chunks : index
+  %row = index.div %vrow, %chunks : index
+  %i1 = index.rem %row, %ne1 : index
+  %t0 = index.div %row, %ne1 : index
+  %i2 = index.rem %t0, %ne2 : index
+  %i3 = index.div %t0, %ne2 : index
+  %so1 = index.mul %i1, %s1 : index
+  %so2 = index.mul %i2, %s2 : index
+  %so3 = index.mul %i3, %s3 : index
+  %so12 = index.add %so1, %so2 : index
+  %src_base = index.add %so12, %so3 : index
+  %do1 = index.mul %i1, %d1 : index
+  %do2 = index.mul %i2, %d2 : index
+  %do3 = index.mul %i3, %d3 : index
+  %do12 = index.add %do1, %do2 : index
+  %dst_row_base = index.add %do12, %do3 : index
+  %k2 = index.mul %k, %c2 : index
+  %pair_base = index.mul %vrow, %k2 : index
+  %dst_base = scf.select %out_pairs, %pair_base, %dst_row_base : index
+
+  // Values first .. first + n of the row. A short last chunk can have fewer than k values.
+  %first = index.mul %ci, %chunk : index
+  %left = index.sub %ne0, %first : index
+  %n = index.min %left, %chunk : index
+  %k_eff = index.min %k, %n : index
+  %k_eff_i32 = index.cast %k_eff : index to i32
+
+  %cap4 = index.mul %cap, %c4 : index
+  %cap_bytes = index.scale %cap4, %one_b : index, offset -> offset
+  %keys_lds = buffer.alloca<workgroup> align(16) %cap_bytes : buffer
+  %ids_lds = buffer.alloca<workgroup> align(16) %cap_bytes : buffer
+  %hist_bytes = index.constant 1024 : offset
+  %hist_lds = buffer.alloca<workgroup> align(16) %hist_bytes : buffer
+  %state_bytes = index.constant 16 : offset
+  %state_lds = buffer.alloca<workgroup> align(16) %state_bytes : buffer
+  %keys = buffer.view %keys_lds[%zero] : buffer -> view<[%cap]xi32>
+  %ids = buffer.view %ids_lds[%zero] : buffer -> view<[%cap]xi32>
+  %hist = buffer.view %hist_lds[%zero] : buffer -> view<256xi32>
+  %state = buffer.view %state_lds[%zero] : buffer -> view<4xi32>
+
+  // Slots past the values of a short chunk get pairs that no later step takes before a real value.
+  %short = index.cmp ult, %k_eff, %k : index
+  %pad_out = scalar.andi %short, %out_pairs : i1
+  scf.if %pad_out {
+    scf.for %s = [%k_eff to %k step %wg_size] {
+      %sl = index.add %s, %item : index
+      %in_k = index.cmp ult, %sl, %k : index
+      scf.if %in_k {
+        func.call @ggml_hrx_top_k_put(%out_pairs, %dst, %dst_span, %dst_base, %sl, %all_i32, %max_i32) : (i1, buffer, index, index, index, i32, i32)
+      }
+    }
+  }
+
+  // Copy the keys of the row to workgroup memory.
+  %false = scalar.constant false : i1
+  scf.if %use_lds {
+    scf.for %j = [%item to %n step %wg_size] {
+      %key, %idx, %valid = func.call @ggml_hrx_top_k_elem(%in_pairs, %false, %src, %src_span, %src_base, %first, %n, %j, %keys_lds, %ids_lds, %cap) : (i1, i1, buffer, index, index, index, index, index, buffer, buffer, index) -> (i32, i32, i1)
+      %top = index.sub %cap, %c1 : index
+      %jc = index.min %j, %top : index
+      %jl = index.assume %jc [range(%jc, 0, 8191), le(%jc, %top)] : index
+      view.store %key, %keys[%jl] : i32, view<[%cap]xi32>
+      scf.if %in_pairs {
+        view.store %idx, %ids[%jl] : i32, view<[%cap]xi32>
+      }
+    }
+  }
+
+  // Radix passes. prefix holds the found high bits of the key of the k-th value. k_rem is the rank of that value among
+  // the values with this prefix.
+  %prefix, %k_rem = scf.for %p = [%c0 to %c4 step %c1](%pre = %c0_i32 : i32, %rem = %k_eff_i32 : i32) -> (i32, i32) {
+    %p8 = index.mul %p, %c8 : index
+    %shift_ix = index.sub %c24, %p8 : index
+    %shift = index.cast %shift_ix : index to i32
+    %hi_shift0 = scalar.addi %shift, %c8_i32 : i32
+    %hi_shift = scalar.minsi %hi_shift0, %c31_i32 : i32
+    %hi_mask0 = scalar.shli %all_i32, %hi_shift : i32
+    %is_first_pass = index.cmp eq, %p, %c0 : index
+    %hi_mask = scf.select %is_first_pass, %c0_i32, %hi_mask0 : i32
+    %pre_hi = scalar.andi %pre, %hi_mask : i32
+
+    %in_hist = index.cmp ult, %item, %c256 : index
+    scf.if %in_hist {
+      view.store %c0_i32, %hist[%item] : i32, view<256xi32>
+    }
+    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+
+    scf.for %j = [%item to %n step %wg_size] {
+      %key, %idx, %valid = func.call @ggml_hrx_top_k_elem(%in_pairs, %use_lds, %src, %src_span, %src_base, %first, %n, %j, %keys_lds, %ids_lds, %cap) : (i1, i1, buffer, index, index, index, index, index, buffer, buffer, index) -> (i32, i32, i1)
+      %key_hi = scalar.andi %key, %hi_mask : i32
+      %match = scalar.cmpi eq, %key_hi, %pre_hi : i32
+      scf.if %match {
+        %sh = scalar.shrui %key, %shift : i32
+        %digit = scalar.andi %sh, %c255_i32 : i32
+        %d0 = index.cast %digit : i32 to index
+        %d = index.assume %d0 [range(%d0, 0, 255)] : index
+        view.atomic.reduce<addi> %c1_i32, %hist[%d] {ordering = relaxed, scope = workgroup} : i32, view<256xi32>
+      }
+    }
+    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+
+    // The bin of the k-th value: the count before it is below rem, the count up to it is at least rem.
+    %h = scf.if %in_hist -> (i32) {
+      %hv = view.load %hist[%item] : view<256xi32> -> i32
+      scf.yield %hv : i32
+    } else {
+      scf.yield %c0_i32 : i32
+    }
+    %before = kernel.workgroup.scan<addi> %h {direction = forward, mode = exclusive} : i32
+    %upto = scalar.addi %before, %h : i32
+    %lt_rem = scalar.cmpi slt, %before, %rem : i32
+    %ge_rem = scalar.cmpi sge, %upto, %rem : i32
+    %hit0 = scalar.andi %lt_rem, %ge_rem : i1
+    %hit = scalar.andi %hit0, %in_hist : i1
+    scf.if %hit {
+      %bin = index.cast %item : index to i32
+      view.store %bin, %state[0] : i32, view<4xi32>
+      view.store %before, %state[1] : i32, view<4xi32>
+    }
+    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+    %bin_sel = view.load %state[0] : view<4xi32> -> i32
+    %before_sel = view.load %state[1] : view<4xi32> -> i32
+    %bin_bits = scalar.shli %bin_sel, %shift : i32
+    %next_pre = scalar.ori %pre, %bin_bits : i32
+    %next_rem = scalar.subi %rem, %before_sel : i32
+    scf.yield %next_pre, %next_rem : i32, i32
+  }
+
+  // Values with a key below prefix are taken. Of the values with key prefix, the first k_rem by index are taken.
+  // Each tile has one value for each lane. The count of taken values before a value gives its slot.
+  %lt_count, %eq_count = scf.for %t = [%c0 to %n step %wg_size](%lt_base = %c0_i32 : i32, %eq_base = %c0_i32 : i32) -> (i32, i32) {
+    %j = index.add %t, %item : index
+    %key, %idx, %valid = func.call @ggml_hrx_top_k_elem(%in_pairs, %use_lds, %src, %src_span, %src_base, %first, %n, %j, %keys_lds, %ids_lds, %cap) : (i1, i1, buffer, index, index, index, index, index, buffer, buffer, index) -> (i32, i32, i1)
+    %lt0 = scalar.cmpi ult, %key, %prefix : i32
+    %eq0 = scalar.cmpi eq, %key, %prefix : i32
+    %lt = scalar.andi %lt0, %valid : i1
+    %eq = scalar.andi %eq0, %valid : i1
+    %lt_v = scf.select %lt, %c1_i32, %c0_i32 : i32
+    %eq_v0 = scf.select %eq, %c1_i32, %c0_i32 : i32
+    %eq_v = scalar.shli %eq_v0, %c16_i32 : i32
+    %packed = scalar.addi %lt_v, %eq_v : i32
+    %excl = kernel.workgroup.scan<addi> %packed {direction = forward, mode = exclusive} : i32
+    %total = kernel.workgroup.reduce<addi> %packed : i32
+    %lt_before = scalar.andi %excl, %low16 : i32
+    %eq_before = scalar.shrui %excl, %c16_i32 : i32
+    %lt_rank = scalar.addi %lt_base, %lt_before : i32
+    %eq_rank = scalar.addi %eq_base, %eq_before : i32
+    %eq_capped = scalar.minsi %eq_rank, %k_rem : i32
+    %eq_taken = scalar.cmpi slt, %eq_rank, %k_rem : i32
+    %eq_take = scalar.andi %eq, %eq_taken : i1
+    %take = scalar.ori %lt, %eq_take : i1
+    scf.if %take {
+      %slot_i32 = scalar.addi %lt_rank, %eq_capped : i32
+      %slot0 = index.cast %slot_i32 : i32 to index
+      %slot = index.assume %slot0 [range(%slot0, 0, 2147483646)] : index
+      func.call @ggml_hrx_top_k_put(%out_pairs, %dst, %dst_span, %dst_base, %slot, %key, %idx) : (i1, buffer, index, index, index, i32, i32)
+    }
+    %lt_tile = scalar.andi %total, %low16 : i32
+    %eq_tile = scalar.shrui %total, %c16_i32 : i32
+    %lt_next = scalar.addi %lt_base, %lt_tile : i32
+    %eq_next = scalar.addi %eq_base, %eq_tile : i32
+    scf.yield %lt_next, %eq_next : i32, i32
+  }
+  kernel.return
+}

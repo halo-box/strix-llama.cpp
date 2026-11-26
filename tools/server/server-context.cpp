@@ -304,6 +304,7 @@ struct server_slot {
 
     // draft candidates per token in spec_draft; only draft-simple and draft-mtp fill it
     std::vector<std::vector<llama_token_data>> spec_draft_q;
+    bool spec_backend_verify = false; // the backend sampler verifies the draft of the current batch by rejection sampling
     llama_tokens spec_prompt;
     std::vector<int32_t> spec_i_batch;
     common_prompt_checkpoint spec_ckpt;
@@ -630,6 +631,7 @@ struct server_slot {
         bool add_ok = true;
         // the audio stream has no token before the first step, track the position with a dummy token
         const llama_token tok_track = sampled == LLAMA_TOKEN_NULL ? 0 : sampled;
+        spec_backend_verify = false;
         if (spec_draft.empty()) {
             // no speculative decoding
             i_batch = batch.size();
@@ -675,6 +677,9 @@ struct server_slot {
             for (auto token : spec_draft) {
                 add_ok &= batch.add(this->id, token, pos0++, true, false);
             }
+
+            spec_backend_verify = use_spec_rejection() && !spec_draft_q.empty() &&
+                common_sampler_spec_set_draft(smpl.get(), spec_draft, spec_draft_q);
         }
 
         GGML_ASSERT(add_ok && "batch must be large enough to hold the sampled and draft tokens");
@@ -2310,6 +2315,10 @@ private:
 
             // TODO: getting pre sampling logits is not yet supported with backend sampling
             use_backend_sampling &= !need_pre_sample_logits;
+
+            // the backend sampler returns only tokens and verifies a probabilistic draft (see common_sampler_spec_set_draft)
+            task.params.sampling.spec_verify = spec && params_base.speculative.draft.probabilistic &&
+                    !params_base.speculative.has_synth() && task.params.sampling.temp > 0.0f && task.params.sampling.n_probs == 0;
 
             // TODO: check verify if this actually works with TTS
             use_backend_sampling &= task.type != SERVER_TASK_TYPE_TTS;
@@ -5308,9 +5317,10 @@ private:
                     // disagree when logits depend on batch shape, and each disagreement restores
                     // the same checkpoint again - the slot stops making progress
                     accepted = server_accept_replay(slot.smpl.get(), slot.ctx_tgt, spec_i_batch, slot.spec_draft);
-                } else if (use_rejection) {
+                } else if (use_rejection && !slot.spec_backend_verify) {
                     accepted = common_sampler_sample_and_accept_n_rejection(slot.smpl.get(), slot.ctx_tgt, spec_i_batch, slot.spec_draft, slot.spec_draft_q);
                 } else {
+                    // with spec_backend_verify, each row returned its draft token only if the rejection step kept it
                     accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, spec_i_batch, slot.spec_draft);
                 }
 

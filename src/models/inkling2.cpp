@@ -190,10 +190,16 @@ ggml_tensor * llama_model_inkling2::graph::mix_stacked(const std::vector<ggml_te
     return ggml_mul_mat(ctx0, ggml_cont(ctx0, ggml_transpose(ctx0, states)), scores);
 }
 
+static bool prefers_stacked_depth_mix(const ggml_tensor * query) {
+    const auto dev = query->buffer ? ggml_backend_buft_get_device(ggml_backend_buffer_get_type(query->buffer)) : nullptr;
+    return llama_backend_has_feature(dev, "STACKED_DEPTH_MIX");
+}
+
 // attention over the depth, one [n_embd, n_tokens] tensor per query: per-source norm, one score matmul, elementwise weighted sum (no transpose, no small-k mat-vec)
 std::vector<ggml_tensor *> llama_model_inkling2::graph::mix_split(const std::vector<ggml_tensor *> & blocks, ggml_tensor * cur, ggml_tensor * query) {
     const int64_t nq = query->ne[1];
-    if (n_tokens < kMixSplitMinTokens) {
+    // The stacked reduction preserves the qualified HRX logits on gfx1151 at prefill widths.
+    if (n_tokens < kMixSplitMinTokens || prefers_stacked_depth_mix(query)) {
         ggml_tensor * mixed = mix_stacked(blocks, cur, query);
         std::vector<ggml_tensor *> out(nq);
         for (int64_t i = 0; i < nq; ++i) {
@@ -292,7 +298,6 @@ ggml_tensor * llama_model_inkling2::graph::control(ggml_tensor * cur, ggml_tenso
 
 ggml_tensor * llama_model_inkling2::graph::build_inputs() {
     inp  = build_inp_mem_hybrid_iswa_rel(hparams.n_relative_extent, hparams.n_swa);
-    attn = inp->get_attn();
     recr = inp->get_recr();
 
     ggml_tensor * inp_pos = build_inp_pos();
@@ -339,7 +344,13 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
 
     // attention inputs: SWA layers mix one, full-attention layers one each for Q, K and V
     ggml_tensor * inputs[3] = {cur, cur, cur};
-    if (layer.attn_res_query) {
+    if (is_swa && layer.attn_res_query && prefers_stacked_depth_mix(layer.attn_res_query)) {
+        // Separate views keep the three HRX controller inputs on their qualified decode paths.
+        ggml_tensor * mixed = mix_stacked(blocks, cur, layer.attn_res_query);
+        for (ggml_tensor * & input : inputs) {
+            input = ggml_cont(ctx0, ggml_view_2d(ctx0, mixed, n_embd, n_tokens, mixed->nb[2], 0));
+        }
+    } else if (layer.attn_res_query) {
         std::vector<ggml_tensor *> mixed = mix_split(blocks, cur, layer.attn_res_query);
         for (int j = 0; j < 3; ++j) {
             inputs[j] = mixed[is_swa ? 0 : j];
@@ -390,30 +401,18 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
         cb(Vcur, "Vcur", il);
         cb(Rcur, "Rcur", il);
 
-        ggml_tensor * rel_pos = is_swa ? inp->self_rel_pos_swa : inp->self_rel_pos;
-
-        const int64_t n_stream = (is_swa ? attn->self_attn_mask_swa.raw : attn->self_attn_mask.raw)->ne[3];
-        const int64_t n_kv     = rel_pos->ne[0];
-
         ggml_tensor * sinks = build_lora_mm(layer.attn_sink_proj, inputs[0]);
 
-        // project r on the bias table first, then gather by distance: only the gathered bias is n_kv x n_tokens x n_head
         ggml_tensor * table = ggml_mul_mat(ctx0, ggml_pad(ctx0, layer.attn_rel_bias, 0, 1, 0, 0), Rcur);
 
         // the sink logit t is per query: exp(s - t)/(1 + sum(exp(s - t))) = exp(s)/(exp(t) + sum(exp(s))), with a zero sink
         table = ggml_sub(ctx0, table, ggml_reshape_3d(ctx0, sinks, 1, n_head, n_tokens));
-        table = ggml_cont(ctx0, ggml_permute(ctx0, table, 1, 0, 2, 3));
-
-        ggml_tensor * kq_b = ggml_get_rows(ctx0, table, rel_pos);
-        kq_b = ggml_reshape_4d(ctx0, kq_b, n_head, n_kv, n_tokens/n_stream, n_stream);
-        kq_b = ggml_cont(ctx0, ggml_permute(ctx0, kq_b, 2, 0, 1, 3));
-        cb(kq_b, "kq_b", il);
 
         sinks = ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, n_head), 0.0f);
 
         cur = build_attn(inp,
                 nullptr, nullptr, nullptr,
-                Qcur, Kcur, Vcur, kq_b, sinks, 1.0f/sqrtf(n_embd_head), il);
+                Qcur, Kcur, Vcur, table, sinks, 1.0f/sqrtf(n_embd_head), il);
 
         cur = ggml_mul(ctx0, cur, ggml_sigmoid(ctx0, build_lora_mm(layer.wqkv_gate, inputs[0])));
         cur = convolve(build_lora_mm(layer.wo, cur), layer.attn_post_conv, nullptr, state, history, recr, 2*n_embd_k_gqa);
@@ -470,6 +469,9 @@ void llama_model_inkling2::graph::build_output(ggml_tensor * cur, const std::vec
     cur = mix_split(blocks, cur, model.output_res_query)[0];
     cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
 
+    // DSpark target features: the last one is the final norm output of every token
+    res->t_layer_inp[n_layer] = cur;
+
     if (inp_out_ids) {
         cur = ggml_get_rows(ctx0, cur, inp_out_ids);
     }
@@ -499,6 +501,8 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
 
     std::vector<ggml_tensor *> blocks;
     for (int il = 0; il < n_layer; ++il) {
+        // DSpark target features: the partial block at the layer input
+        res->t_layer_inp[il] = cur;
         cur = build_layer(il, il, cur, blocks);
     }
 

@@ -20,6 +20,7 @@ The following sections describe how to build with different backends and options
 * [CUDA](#cuda)
 * [MUSA](#musa)
 * [HIP](#hip)
+* [HRX](#hrx)
 * [Vulkan](#vulkan)
 * [CANN](#cann)
 * [ZenDNN](#zendnn)
@@ -428,6 +429,37 @@ The environment variable [`HIP_VISIBLE_DEVICES`](https://rocm.docs.amd.com/en/la
 ### Unified Memory
 
 On Linux it is possible to use unified memory architecture (UMA) to share main memory between the CPU and integrated GPU by setting environment variable `GGML_CUDA_ENABLE_UNIFIED_MEMORY=1`. However, this hurts performance for non-integrated GPUs (but enables working with integrated GPUs).
+
+## HRX
+
+This provides GPU acceleration on AMD RDNA3, RDNA3.5 and RDNA4 GPUs (gfx1100, gfx1101, gfx1102, gfx1103, gfx1150, gfx1151, gfx1152, gfx1200, gfx1201) through the HRX runtime. The backend is experimental. Kernels are written in Loom and compiled for the GPU at first use, so ROCm is not required.
+
+See the [Linux HRX build and verification guide](backend/HRX.md) for the pinned SDK, Release build, portable package and Strix Halo tests.
+
+The devices are named `HRX0`, `HRX1`, ... Use `--list-devices` to show them and `--device HRX0` to select one.
+
+The backend runs TinyStories-15M (`stories15M-q4_0.gguf`) and Inkling 2 Mini (`inkling2_loop`, the Unsloth `Mainline_Support` GGUFs) fully on the GPU. It supports these ops with F32 activations:
+
+* `MUL_MAT` with F32, F16, BF16, Q4_0 and Q8_0 weights, and `MUL_MAT_ID` with F32, F16, Q8_0 and NVFP4 weights
+* `FLASH_ATTN_EXT` (F16 KV cache, optional per-head mask and sinks) and `SET_ROWS`
+* `SOFT_MAX` (with or without a mask), `RMS_NORM`, `ROPE`, `SUM_ROWS`, `ARGSORT` and `SSM_CONV`
+* `ADD`, `SUB`, `MUL` and `DIV` with broadcasting, `SCALE`, `CLAMP`, `FILL`, `SQR`, `SQRT`, `LOG`, the unary ops `SIGMOID`, `TANH`, `EXP`, `NEG`, `ABS`, `SILU`, `RELU`, `GELU`, `SGN` and `STEP`, and `SWIGLU`
+* `GET_ROWS` (F32, F16, BF16 and Q8_0 rows), `CPY`, `DUP` and `CONT` (from F32, F16 or I32), `REPEAT`, `PAD` and `CONCAT`
+
+Other ops and types run on the CPU.
+
+### Inkling 2 Mini with DSpark on Strix Halo
+
+Build `llama-server` with HRX enabled. Use the matching target and draft GGUF files from the Inkling 2 Mini `Mainline_Support` directory.
+
+```bash
+models=/path/to/Mainline_Support
+scripts/serve-inkling2-dspark-hrx.sh \
+    "$models/Inkling-2-Mini-UD-Q4_K_XL.gguf" \
+    "$models/dspark-Inkling-2-Mini-Q8_0.gguf" --port 8080
+```
+
+An HRX-enabled build prefers HRX for `inkling2_loop`. An explicit `--device` selection takes precedence. The launcher uses greedy DSpark decoding with up to three draft tokens. Add `--hrx-npu` to offload eligible prefill matrix multiplications to XDNA2. See the [HRX build and run guide](backend/HRX.md) for the release build and the million-token configuration.
 
 ## Vulkan
 
