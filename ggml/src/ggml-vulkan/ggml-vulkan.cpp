@@ -7064,7 +7064,7 @@ void ggml_vk_init(ggml_backend_vk_context * ctx, size_t idx) {
     ctx->fa_dequant_gate_logged = false;
     memset(ctx->fa_union_est_ratio, 0, sizeof(ctx->fa_union_est_ratio));
     ctx->fa_union_declines = 0;
-    // Fixed size of 1KB, for deterministic behavior
+    // initial size: graph_compute grows it to fit the graph before the build, never after a run (see ggml-org#17514)
     ctx->prealloc_size_add_rms_partials = 1024;
 
     ctx->fence = ctx->device->device.createFence({});
@@ -17000,7 +17000,6 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
                 ggml_vk_count_fusion(ctx->device, "ADD_RMS_NORM_PARTIALS");
                 ggml_vk_path_census_add("ADD_RMS_NORM_PARTIALS");
             } else {
-                // the partials buffer is full: this RMS_NORM runs unfused
                 ggml_vk_path_census_add("ADD_RMS_NORM_PARTIALS_NO_ROOM");
             }
         }
@@ -20751,9 +20750,8 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     ctx->do_add_rms_partials_offset_calculation = false;
     ctx->ssm_conv_direct_matches.clear();
 
-    // A fused single-row ADD -> RMS_NORM pair takes its own slice of the partials buffer, and the offset resets only here, so
-    // the buffer must hold every pair of this graph: a pair past its end runs the unfused RMS_NORM. Every single-row f32
-    // RMS_NORM counts, an upper bound on the pairs ggml_vk_build_graph fuses. ggml_vk_preallocate_buffers grows the buffer below.
+    // every fused single-row ADD -> RMS_NORM pair takes its own partials slice until the offset resets here: size the
+    // buffer for all single-row f32 RMS_NORMs of the graph (an upper bound on the pairs), or the last pairs run unfused
     if (ctx->device->add_rms_fusion && !ctx->device->disable_fusion) {
         size_t partials_size = 0;
         for (int i = 0; i < cgraph->n_nodes; ++i) {
