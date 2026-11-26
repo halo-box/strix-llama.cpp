@@ -1,9 +1,6 @@
 cmake_minimum_required(VERSION 3.14)
 
-# Usage: cmake -DKERNEL_DIR=<dir> -DOUTPUT=<file.cpp> -P embed-kernels.cmake
-
 file(GLOB_RECURSE kernel_files RELATIVE "${KERNEL_DIR}" "${KERNEL_DIR}/*.loom")
-file(GLOB_RECURSE generated_files RELATIVE "${GENERATED_KERNEL_DIR}" "${GENERATED_KERNEL_DIR}/*.loom")
 list(APPEND kernel_files ${generated_files})
 list(SORT kernel_files)
 
