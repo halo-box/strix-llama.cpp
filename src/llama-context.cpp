@@ -1083,7 +1083,7 @@ void llama_context::sched_reserve() {
     }
 
     std::vector<uint32_t> range_ends;
-    if (!cparams.training && !model.no_alloc() && model.graph_depends_on_n_tokens()) {
+    if (!cparams.training && !model.no_alloc() && (model.graph_depends_on_n_tokens() || cparams.n_rs_seq > 0)) {
         range_ends = reserve_token_ranges(mctx.get(), n_seqs, n_tokens);
     }
 

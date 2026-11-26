@@ -95,7 +95,9 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
     const int64_t n_seqs       = s->ne[3];
     const int64_t n_seq_tokens = q->ne[2];
 
-    const bool keep = cparams.n_rs_seq > 0;
+    // after a ubatch wider than n_rs_seq + 1 tokens per sequence the memory refuses a partial rollback (rs_max),
+    // so no snapshot slot but the final state is ever read: run the plain scan
+    const bool keep = cparams.n_rs_seq > 0 && n_seq_tokens <= (int64_t) cparams.n_rs_seq + 1;
 
     if (!keep) {
         auto attn_out = build_delta_net(q, k, v, g, b, s);
