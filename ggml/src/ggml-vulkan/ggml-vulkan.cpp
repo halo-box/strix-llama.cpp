@@ -3945,7 +3945,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                                               (use_subgroups16 && w == DMMV_WG_SIZE_LARGE) ? SHADER_REDUCTION_MODE_HYBRID :
                                               SHADER_REDUCTION_MODE_SHMEM;
 
-        for (uint32_t i = 0; i < mul_mat_vec_max_cols; ++i) {
+        for (uint32_t i = 0; i < mul_mat_vec_pipeline_cols; ++i) {
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_F32 ][i], "mul_mat_vec_f32_f32_f32",  arr_dmmv_f32_f32_f32_len[reduc],  arr_dmmv_f32_f32_f32_data[reduc],  "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {1, 1, 1}, {wg_size_subgroup, 1, i+1}, 1, false, use_subgroups, force_subgroup_size);
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_F16 ][i], "mul_mat_vec_f16_f32_f32",  arr_dmmv_f16_f32_f32_len[reduc],  arr_dmmv_f16_f32_f32_data[reduc],  "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2, 1, 1}, {wg_size_subgroup, 2, i+1}, 1, false, use_subgroups, force_subgroup_size);
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_BF16][i], "mul_mat_vec_bf16_f32_f32", arr_dmmv_bf16_f32_f32_len[reduc], arr_dmmv_bf16_f32_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2, 1, 1}, {wg_size_subgroup, 2, i+1}, 1, false, use_subgroups, force_subgroup_size);
@@ -7147,7 +7147,7 @@ vk_pipeline ggml_vk_get_to_fp16(ggml_backend_vk_context * ctx, ggml_type type) {
 static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec(ggml_backend_vk_context * ctx, ggml_type a_type, ggml_type b_type, uint32_t num_cols, uint32_t m, uint32_t k) {
     VK_LOG_DEBUG("ggml_vk_get_dequantize_mul_mat_vec()");
     GGML_ASSERT(b_type == GGML_TYPE_F32 || b_type == GGML_TYPE_F16 || b_type == GGML_TYPE_Q8_1);
-    GGML_ASSERT(num_cols >= 1 && num_cols <= mul_mat_vec_max_cols);
+    GGML_ASSERT(num_cols >= 1 && num_cols <= mul_mat_vec_pipeline_cols);
 
     if (b_type == GGML_TYPE_Q8_1) {
         switch (a_type) {
@@ -9061,6 +9061,43 @@ static bool ggml_vk_mmv_exact_batch_chunk(ggml_backend_vk_context * ctx, const g
            ggml_is_contiguous(src1) && ggml_is_contiguous(dst) && ctx->num_additional_fused_ops == 0;
 }
 
+// One mat-vec pass over 9..16 columns reads the weights once, where the int8 matmul is slow at these widths on gfx1151.
+static bool ggml_vk_mmv_wide(ggml_backend_vk_context * ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
+    const vk_device & device = ctx->device;
+    // measured on gfx1151 (Strix Halo) only; smaller RDNA3 APUs keep the stock path
+    if (device->vendor_id != VK_VENDOR_ID_AMD || device->properties.deviceID != 0x1586 ||
+        dst->ne[1] <= mul_mat_vec_max_cols || dst->ne[1] > mul_mat_vec_pipeline_cols ||
+        ggml_vk_mul_mat_exact_batch(dst) || src1->ne[2] * src1->ne[3] != 1 || src1->type != GGML_TYPE_F32 ||
+        !ggml_is_contiguous(src1) || !ggml_is_contiguous(dst) || ctx->num_additional_fused_ops != 0) {
+        return false;
+    }
+    // RADV gfx1151, 2026-11-19: one pass only inside an (m, k) region where it was at least 3% faster than the stock path
+    // for every one of the 190 dense weight shapes of 19 common GGUF models in it (n = 9/10/12/14/16, a width between two
+    // measured ones takes the wider rule), and at least 3 shapes support the region. q4_K m=6144 k=5120 at n=12: 0.51x.
+    // It loses on thin k (q8_0 m=10240 k=320), on small m (q4_K m=64-192 at n=13-14: up to 1.31x, q8_0 m=32 at n=12:
+    // 1.03x, q8_0 m=64-256 at n=15-16: up to 1.67x) and as n grows (16 accumulators per row). q5_K m=1024 and iq4_xs
+    // m=9728 with k=2560 are faster alone at n=13-14 but make Qwen3-4B IQ4_XS 2-5% slower at 14 rows, so above 12
+    // columns both need k >= 4096. Re-measure when the int8 matmul gets a 9-16 column tile or RADV changes its code
+    // generation for these shaders; drop the cells that no longer win.
+    const int64_t n = dst->ne[1];
+    const int64_t m = src0->ne[1];
+    const int64_t k = src0->ne[0];
+    const auto in = [&](int64_t m0, int64_t m1, int64_t k0) { return m >= m0 && m <= m1 && k >= k0; };
+    switch (src0->type) {
+        case GGML_TYPE_Q4_K:   return m >= 256 && (n <= 12 ? k >= 1024 : n <= 14 ? k >= 4096 : in(512, 15360, 2048));
+        case GGML_TYPE_Q5_K:   return in(1024, 202048, n <= 12 ? 2560 : 4096);
+        case GGML_TYPE_Q6_K:   return n == 9 ? in(1536, 248320, 1024) : n == 10 ? in(1536, 248320, 1536) :
+                                      n <= 12 ? in(10240, 248320, 1024) : n <= 14 && in(17408, 248320, 2048);
+        case GGML_TYPE_Q8_0:   return n == 9 ? in(64, 12288, 512) : n <= 12 ? in(64, 12288, 2048) :
+                                      n <= 14 ? in(320, 2880, 2048) : in(1024, 4096, 4096);
+        case GGML_TYPE_Q4_0:   return n <= 12 ? in(1024, 17408, 2560) : in(1024, 2560, 2560);
+        case GGML_TYPE_Q4_1:   return n <= 12 ? in(1024, 12288, 4096) : n <= 14 ? in(1024, 5120, 4096) : in(1024, 2560, 4096);
+        case GGML_TYPE_IQ4_XS: return n <= 12 ? in(5120, 17408, 2560) : in(5120, n <= 14 ? 17408 : 12288, 4096);
+        case GGML_TYPE_IQ4_NL: return n <= 10 && in(5120, 17408, 5120);
+        default:               return false;
+    }
+}
+
 static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx, bool swap_inputs = false) {
     ggml_tensor * dst = cgraph->nodes[node_idx];
     if (swap_inputs) {
@@ -9075,6 +9112,10 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
                        src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) && ggml_is_contiguous(dst) &&
                        ctx->num_additional_fused_ops == 0;
     GGML_ASSERT(ne11 <= mul_mat_vec_max_cols || plain);
+    if (ggml_vk_mmv_wide(ctx, src0, src1, dst)) {
+        ggml_vk_mul_mat_vec_q_f16_cols(ctx, subctx, cgraph, node_idx, 0, ne11, /*allow_quantize_y=*/ true);
+        return;
+    }
     // An exact batch keeps n == 1's integer-dot choice in every chunk and is always split past mul_mat_vec_max_cols.
     const bool exact_batch = ggml_vk_mul_mat_exact_batch(dst);
     if (ne11 > mul_mat_vec_max_cols && plain && std::min(ggml_vk_mmv_good_cols(src0->type, ne11), mul_mat_vec_max_cols) < ne11) {
@@ -9937,6 +9978,7 @@ void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, const st
     // mul_mat_vec supports batching ne12*ne13 when ne11==1, or treating ne11 as the batch size (up to four)
     // when ne12 and ne13 are one.
     } else if ((dst->ne[1] == 1 || (dst->ne[1] <= ggml_vk_mul_mat_vec_max_cols(ctx->device) && src1->ne[2] * src1->ne[3] == 1) ||
+                ggml_vk_mmv_wide(ctx, src0, src1, dst) ||
                 ggml_vk_mmv_can_chunk(ctx, src0, src1, dst) || ggml_vk_mmv_exact_batch_chunk(ctx, src1, dst)) &&
                (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16 || ggml_is_quantized(src0->type))) {
         ggml_vk_mul_mat_vec_q_f16(ctx, subctx, cgraph, node_idx);
