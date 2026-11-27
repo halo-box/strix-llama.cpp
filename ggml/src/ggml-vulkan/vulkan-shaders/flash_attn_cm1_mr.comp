@@ -36,6 +36,7 @@
 // KV % 64 == 0, f32 accumulation, no split_k, mask shared across heads.
 
 #include "types.glsl"
+#define FA_F16_MATH
 #include "flash_attn_base.glsl"
 
 const uint32_t NSG = 8;                  // wave32 subgroups

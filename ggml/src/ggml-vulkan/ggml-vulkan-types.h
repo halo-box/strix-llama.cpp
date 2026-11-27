@@ -434,6 +434,7 @@ static constexpr uint32_t FA_FLAG_MULTI_ROW    = 256;   // host only: build the 
 static constexpr uint32_t FA_FLAG_MR_LAZY      = 512;   // multi-row: skip identity O rescales
 static constexpr uint32_t FA_FLAG_MR_NOEB      = 1024;   // multi-row: no loop-end barrier
 static constexpr uint32_t FA_FLAG_MR_VPOST     = 2048;  // multi-row: V^T loads before the softmax barrier
+static constexpr uint32_t FA_FLAG_INDEXED_BIAS = 4096;  // add the indexed relative-position bias where the mask is loaded
 
 struct vk_fa_pipeline_state {
     uint32_t HSK, HSV;

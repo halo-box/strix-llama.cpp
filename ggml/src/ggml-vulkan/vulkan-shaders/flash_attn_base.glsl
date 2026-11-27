@@ -38,6 +38,9 @@ const bool NAN_SAFE_V       = (Flags & 64) != 0;
 // coopmat1 P x V B-operand fragment is one contiguous 32-byte run per lane instead of 16 kv-strided halves.
 // coopmat1 only, f16 V, aligned, no shmem staging and no NAN_SAFE_V (both stage V rows from the row-major layout).
 const bool V_TRANSPOSED     = (Flags & 128) != 0;
+// Indexed relative-position bias (FA_FLAG_INDEXED_BIAS): the mask value of a key is f16(mask + table[bins[key]]), the
+// table row is per query row and head, bins are per query row. No GQA fold: every tile row is one query of head iq2.
+const bool INDEXED_BIAS     = (Flags & 4096) != 0;
 // Use -FLT_MAX/2 rather than -inf to reduce the possibility of NaNs, e.g. when computing Mold-M.
 #define NEG_FLT_MAX_OVER_2 uintBitsToFloat(0xFEFFFFFF)
 // Lowest finite f16, mask value for inactive sparse KV slots
@@ -102,6 +105,9 @@ layout (binding = 6) readonly buffer MO {uint32_t data_mask_opt[];};
 layout (binding = 7) readonly buffer KVB {uint32_t data_kv_dyn[];};
 
 layout (binding = 7) readonly buffer SP {int32_t data_sparse[];};
+
+layout (binding = 8) readonly buffer BT {float data_bias_table[];};
+layout (binding = 9) readonly buffer BI {int32_t data_bias_bins[];};
 
 #define MASK_OPT_ALL_NEG_INF 1
 // a mask value at or below this (f16 -inf, or the lowest finite f16 some mask writers use for it) hides the key
@@ -169,6 +175,21 @@ uint32_t i, N, KV, split_k_index, Tr, start_j, end_j,
          gqa_iq1, iq2, iq3, rk2, rk3, rv2, rv3, ik2, ik3, iv2, iv3,
          q_stride, k_stride, v_stride, m_stride, m_row_len, sparse_base, gqa_ratio, split_k_num, output_k_num;
 bool partial_output;
+
+// mask m of query row `row` at key `col` plus the indexed bias, rounded to f16 as the dense mask; p.m0 = table row length
+float fa_bias_mask(float m, uint32_t row, uint32_t col) {
+    if (!INDEXED_BIAS) {
+        return m;
+    }
+    const uint32_t qrow = iq3 * p.N + row;
+    const uint32_t bin = uint32_t(data_bias_bins[qrow * m_row_len + col]);
+    const float v = m + data_bias_table[(qrow * p.neq2 + iq2) * uint32_t(p.m0) + bin];
+#if defined(FA_F16_MATH)
+    return float(float16_t(v));
+#else
+    return unpackHalf2x16(packHalf2x16(vec2(v, 0.0))).x;
+#endif
+}
 
 void init_indices()
 {
