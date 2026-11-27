@@ -20,6 +20,10 @@ layout (push_constant) uniform parameter2
     uint nb[12][4];
 
     uint rms_partials;
+
+    // WEIGHTED: the weight of source s is w[w_offs(s) + i01*w_stride] (8-bit offsets, four per uint)
+    uint w_offs[3];
+    uint w_stride;
 } p;
 
 // No readonly/writeonly decorations. Workaround for MoltenVK Bug, see https://github.com/ggml-org/llama.cpp/issues/15498
@@ -61,6 +65,44 @@ layout (binding = 10, std430) buffer PartialBuf10 {float partial_sums[];} partia
 layout (binding = 11, std430) buffer PartialBuf11 {float partial_sums[];} partials11;
 
 layout(constant_id = 0) const uint num_srcs = 2;
+
+#if defined(WEIGHTED)
+// the per-row weights (one f32 tensor), bound after the destination; no readonly (MoltenVK, see above)
+layout (binding = 0) buffer W0 {float data_w[];} w0;
+layout (binding = 1) buffer W1 {float data_w[];} w1;
+layout (binding = 2) buffer W2 {float data_w[];} w2;
+layout (binding = 3) buffer W3 {float data_w[];} w3;
+layout (binding = 4) buffer W4 {float data_w[];} w4;
+layout (binding = 5) buffer W5 {float data_w[];} w5;
+layout (binding = 6) buffer W6 {float data_w[];} w6;
+layout (binding = 7) buffer W7 {float data_w[];} w7;
+layout (binding = 8) buffer W8 {float data_w[];} w8;
+layout (binding = 9) buffer W9 {float data_w[];} w9;
+layout (binding = 10) buffer W10 {float data_w[];} w10;
+layout (binding = 11) buffer W11 {float data_w[];} w11;
+
+float load_w(uint b, uint i) {
+    switch (b) {
+    case 0:  return w0.data_w[i];
+    case 1:  return w1.data_w[i];
+    case 2:  return w2.data_w[i];
+    case 3:  return w3.data_w[i];
+    case 4:  return w4.data_w[i];
+    case 5:  return w5.data_w[i];
+    case 6:  return w6.data_w[i];
+    case 7:  return w7.data_w[i];
+    case 8:  return w8.data_w[i];
+    case 9:  return w9.data_w[i];
+    case 10: return w10.data_w[i];
+    case 11: return w11.data_w[i];
+    default: return 0.0f;
+    }
+}
+
+uint w_off(uint s) {
+    return (p.w_offs[s >> 2] >> (8 * (s & 3))) & 0xFF;
+}
+#endif
 
 FLOAT_TYPE load_a(uint b, uint i) {
     switch (b) {
@@ -159,10 +201,19 @@ void main() {
         uint i00, i01, i02, i03;
         get_indices(idx, i00, i01, i02, i03, p.ne20, p.ne21, p.ne22, p.ne23);
 
+#if defined(WEIGHTED)
+        // the MUL nodes' products, each rounded to f32 before the sum (precise: no fused multiply-add)
+        precise FLOAT_TYPE sum = FLOAT_TYPE(0);
+        [[unroll]] for (uint s = 0; s < num_srcs; ++s) {
+            precise FLOAT_TYPE t = load_a(s, src_idx(s, i00, i01, i02, i03)) * FLOAT_TYPE(load_w(num_srcs + 1, w_off(s) + i01*p.w_stride));
+            sum += t;
+        }
+#else
         FLOAT_TYPE sum = FLOAT_TYPE(0);
         [[unroll]] for (uint s = 0; s < num_srcs; ++s) {
             sum += load_a(s, src_idx(s, i00, i01, i02, i03));
         }
+#endif
         sum_sq += sum*sum;
         store_d(num_srcs, dst_idx(i00, i01, i02, i03), sum);
 

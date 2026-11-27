@@ -560,6 +560,10 @@ struct vk_op_multi_add_push_constants {
     uint32_t nb[MAX_PARAMETER_COUNT][4];
 
     uint32_t rms_partials;
+
+    // multi_add_w: the offset of each source's weight (8 bits, four per uint) and the weight's row stride, in floats
+    uint32_t w_offs[3];
+    uint32_t w_stride;
 };
 
 static_assert(MAX_PARAMETER_COUNT == 12);

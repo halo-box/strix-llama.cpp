@@ -921,6 +921,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_multi_add[MAX_FUSED_ADDS];
     vk_pipeline pipeline_multi_add_f16in[MAX_FUSED_ADDS];   // f16 sources, f32 sum and store (MoE combine of f16 expert outputs)
     vk_pipeline pipeline_multi_add_rms[MAX_FUSED_ADDS];
+    vk_pipeline pipeline_multi_add_w[MAX_FUSED_ADDS];       // MULTI_ADD_W: each f32 source times a per-row weight
 
     vk_pipeline pipeline_add_id_f32;
 
@@ -1508,6 +1509,7 @@ struct ggml_backend_vk_context {
     bool fused_mmid_cpy16 {};   // MUL_MAT_ID(+MUL)+CPY(f16): the expert GEMM stores f16 into the cast destination
     bool fused_mmid_glu {};     // MUL_MAT_ID+CPY(f16)+SWIGLU: the gate GEMM stores silu(gate) * up as f16
     bool fused_mmid_pair_glu {};   // MUL_MAT_ID+CPY(f16) x 2 + SWIGLU: gate, up and the SwiGLU in one weight-streaming launch
+    bool fused_mix_sum {};             // MULTI_ADD_W: k weighted MULs + their ADD chain as one multi_add_w pass
     bool fused_situ {};                // SITU(_SIGNS): the SITU expert activation chain as one situ.comp pass
     bool fused_mmid_pair_glu_f32 {};   // ... its f32 chain: MUL_MAT_ID x 2 + an f32 SWIGLU
     bool fused_hc_post_norm_inj {};  // HC_POST_NORM_GATE_CPY + RESHAPE + MUL_MAT: the norm kernel also computes the inject
