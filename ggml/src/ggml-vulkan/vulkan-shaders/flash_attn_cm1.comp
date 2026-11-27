@@ -18,6 +18,7 @@
 #extension GL_KHR_cooperative_matrix : enable
 
 #include "types.glsl"
+#define FA_F16_MATH
 #include "flash_attn_base.glsl"
 #if !defined(BFLOAT16)
 #include "flash_attn_dequant.glsl"
@@ -181,7 +182,8 @@ void main() {
                 continue;
             }
             // Only load if the block is not all zeros
-            if (mask_opt_bits != MASK_OPT_ALL_ZERO) {
+            // a bias makes an all-zero mask block non-zero
+            if (INDEXED_BIAS || mask_opt_bits != MASK_OPT_ALL_ZERO) {
                 bool nem1_bounds_check = !(gqa_ratio > 1) && (p.nem1 % Br) != 0;
 
                 float max_mask = NEG_FLT_MAX_OVER_2;
@@ -200,25 +202,25 @@ void main() {
                                 m = f16vec4(mv);
                                 max_mask = max(max_mask, float(mv));
                             } else if (!nem1_bounds_check || i * Br + r * 4 + 3 < p.nem1) {
-                                m = f16vec4(data_m[m_offset + (i * Br + r * 4    ) * m_stride + (j * Bc + c)],
-                                            data_m[m_offset + (i * Br + r * 4 + 1) * m_stride + (j * Bc + c)],
-                                            data_m[m_offset + (i * Br + r * 4 + 2) * m_stride + (j * Bc + c)],
-                                            data_m[m_offset + (i * Br + r * 4 + 3) * m_stride + (j * Bc + c)]);
+                                m = f16vec4(fa_bias_mask(float(data_m[m_offset + (i * Br + r * 4) * m_stride + (j * Bc + c)]), i * Br + r * 4, j * Bc + c),
+                                            fa_bias_mask(float(data_m[m_offset + (i * Br + r * 4 + 1) * m_stride + (j * Bc + c)]), i * Br + r * 4 + 1, j * Bc + c),
+                                            fa_bias_mask(float(data_m[m_offset + (i * Br + r * 4 + 2) * m_stride + (j * Bc + c)]), i * Br + r * 4 + 2, j * Bc + c),
+                                            fa_bias_mask(float(data_m[m_offset + (i * Br + r * 4 + 3) * m_stride + (j * Bc + c)]), i * Br + r * 4 + 3, j * Bc + c));
                                 max_mask = max(max(max(max(max_mask, float(m[0])), float(m[1])), float(m[2])), float(m[3]));
                             } else if (i * Br + r * 4 + 2 < p.nem1) {
-                                m = f16vec4(data_m[m_offset + (i * Br + r * 4    ) * m_stride + (j * Bc + c)],
-                                            data_m[m_offset + (i * Br + r * 4 + 1) * m_stride + (j * Bc + c)],
-                                            data_m[m_offset + (i * Br + r * 4 + 2) * m_stride + (j * Bc + c)],
+                                m = f16vec4(fa_bias_mask(float(data_m[m_offset + (i * Br + r * 4) * m_stride + (j * Bc + c)]), i * Br + r * 4, j * Bc + c),
+                                            fa_bias_mask(float(data_m[m_offset + (i * Br + r * 4 + 1) * m_stride + (j * Bc + c)]), i * Br + r * 4 + 1, j * Bc + c),
+                                            fa_bias_mask(float(data_m[m_offset + (i * Br + r * 4 + 2) * m_stride + (j * Bc + c)]), i * Br + r * 4 + 2, j * Bc + c),
                                             0.0);
                                 max_mask = max(max(max(max_mask, float(m[0])), float(m[1])), float(m[2]));
                             } else if (i * Br + r * 4 + 1 < p.nem1) {
-                                m = f16vec4(data_m[m_offset + (i * Br + r * 4    ) * m_stride + (j * Bc + c)],
-                                            data_m[m_offset + (i * Br + r * 4 + 1) * m_stride + (j * Bc + c)],
+                                m = f16vec4(fa_bias_mask(float(data_m[m_offset + (i * Br + r * 4) * m_stride + (j * Bc + c)]), i * Br + r * 4, j * Bc + c),
+                                            fa_bias_mask(float(data_m[m_offset + (i * Br + r * 4 + 1) * m_stride + (j * Bc + c)]), i * Br + r * 4 + 1, j * Bc + c),
                                             0.0,
                                             0.0);
                                 max_mask = max(max(max_mask, float(m[0])), float(m[1]));
                             } else if (i * Br + r * 4 < p.nem1) {
-                                m = f16vec4(data_m[m_offset + (i * Br + r * 4    ) * m_stride + (j * Bc + c)],
+                                m = f16vec4(fa_bias_mask(float(data_m[m_offset + (i * Br + r * 4) * m_stride + (j * Bc + c)]), i * Br + r * 4, j * Bc + c),
                                             0.0,
                                             0.0,
                                             0.0);
@@ -375,7 +377,7 @@ void main() {
             barrier();
         }
 
-        if (MASK_ENABLE && mask_opt_bits != MASK_OPT_ALL_ZERO) {
+        if (MASK_ENABLE && (INDEXED_BIAS || mask_opt_bits != MASK_OPT_ALL_ZERO)) {
             [[unroll]] for (uint32_t idx = 0; idx < Bc * Br / 4; idx += gl_WorkGroupSize.x) {
                 uint32_t c = (idx + tid) / (Br / 4);
                 uint32_t r = (idx + tid) % (Br / 4);

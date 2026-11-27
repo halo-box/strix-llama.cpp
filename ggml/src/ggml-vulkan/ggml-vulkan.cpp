@@ -2528,7 +2528,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             }
             name = aligned ? "flash_attn_f32_f16_aligned" : "flash_attn_f32_f16";
         }
-        ggml_vk_create_pipeline(device, fa.second, name, spv_size, spv_data, "main", 8,
+        ggml_vk_create_pipeline(device, fa.second, name, spv_size, spv_data, "main", 10,
                                 sizeof(vk_flash_attn_push_constants), {Br, 1, 1},
                                 get_fa_spec_constants(fa.first), aligned ? Bc : 1, true,
                                 !fa_ds, !fa_ds ? fa_sgs : 0);
@@ -2571,7 +2571,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                     name = "flash_attn_f32_f16_mr_cm1";
                 }
             }
-            ggml_vk_create_pipeline(device, fa.second, name, spv_size, spv_data, "main", 8,
+            ggml_vk_create_pipeline(device, fa.second, name, spv_size, spv_data, "main", 10,
                                     sizeof(vk_flash_attn_push_constants), {Br, 1, 1},
                                     get_fa_spec_constants(fa.first), aligned ? Bc : 1, true,
                                     !fa_ds, !fa_ds ? fa_sgs : 0);
@@ -2608,7 +2608,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 if (f32acc) { spv_data = flash_attn_f32_f16_cm2_data;        spv_size = flash_attn_f32_f16_cm2_len;        name = "flash_attn_f32_f16_f32acc_cm2"; }
                 else        { spv_data = flash_attn_f32_f16_f16acc_cm2_data; spv_size = flash_attn_f32_f16_f16acc_cm2_len; name = "flash_attn_f32_f16_f16acc_cm2"; }
             }
-            ggml_vk_create_pipeline(device, fa.second, name, spv_size, spv_data, "main", 8,
+            ggml_vk_create_pipeline(device, fa.second, name, spv_size, spv_data, "main", 10,
                                     sizeof(vk_flash_attn_push_constants), {Br, 1, 1},
                                     get_fa_spec_constants(fa.first), aligned ? Bc : 1, true, false, 0);
         }
@@ -11655,7 +11655,7 @@ static bool ggml_vk_flash_attn_top_k(ggml_backend_vk_context * ctx, vk_context &
                     };
 
                     ggml_vk_dispatch_pipeline(ctx, subctx, raw_pipeline,
-                        {tile_q, k_buf, k_buf, tile_mask, tile_q, split_buf, tile_q, tile_q},
+                        {tile_q, k_buf, k_buf, tile_mask, tile_q, split_buf, tile_q, tile_q, tile_q, tile_q},
                         raw_pc, {tile_n, NH, NS});
                     ggml_vk_perf_mark_subop(ctx, subctx, "FA_TOP_K_RAW (sub-op)");
 
@@ -12118,6 +12118,9 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     uint32_t nem2 = mask ? mask->ne[2] : 0;
     uint32_t nem3 = mask ? mask->ne[3] : 0;
 
+    // indexed bias (src[8] table, src[9] bins): the shaders add table[bins[key]] where they load the f16 mask
+    const bool indexed_bias = ggml_flash_attn_ext_has_indexed_bias(dst);
+
     const uint32_t HSK = nek0;
     const uint32_t HSV = nev0;
     uint32_t N = neq1;
@@ -12238,7 +12241,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     const uint32_t max_gqa = std::min(tuning_params.block_rows, 32u);
 
     if (N <= 8 && qk_ratio > 1 && qk_ratio <= max_gqa &&
-        qk_ratio * nek2 == neq2 && nek2 == nev2 && nem2 <= 1) {
+        qk_ratio * nek2 == neq2 && nek2 == nev2 && nem2 <= 1 && !indexed_bias) {
         // grouped query attention - make the N dimension equal to gqa_ratio, reduce
         // workgroups proportionally in y dimension. The shader will detect gqa_ratio > 1
         // and change addressing calculations to index Q's dimension 2.
@@ -12273,7 +12276,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
         return (t->type != GGML_TYPE_F16 && t->type != GGML_TYPE_BF16) ||
                (t->nb[1] | t->nb[2] | t->nb[3]) % (4 * sizeof(ggml_fp16_t)) == 0;
     };
-    const bool use_sparse = !disable_sparse && n_kv_max > 0 && mask &&
+    const bool use_sparse = !disable_sparse && !indexed_bias && n_kv_max > 0 && mask &&
                             max_bias == 0.0f && logit_softcap == 0.0f &&
                             (tuning_params.path != FA_COOPMAT2 || (sparse_gather_aligned(k) && sparse_gather_aligned(v))) &&
                             nem0 == KV &&
@@ -12361,7 +12364,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     const bool fa_mr_on = HSK == 256 && radv_rdna3;
     const uint32_t qk_ratio_mr = nek2 > 0 ? (uint32_t)(neq2 / nek2) : 0;
     const uint32_t mr_h = (qk_ratio_mr % 2) == 0 ? 2u : 1u;
-    const bool use_mr = fa_mr_on && vt_ok && f32acc && !nan_safe_v &&
+    const bool use_mr = fa_mr_on && vt_ok && f32acc && !nan_safe_v && !indexed_bias &&
                         k_type_eff == GGML_TYPE_F16 && HSK == HSV && qk_ratio_mr > 0 &&
                         neq2 == (int64_t)qk_ratio_mr * nek2 && nek2 == nev2 &&
                         (mask == nullptr || (mask->type == GGML_TYPE_F16 && nem2 <= 1 && nem3 <= 1 &&
@@ -12397,6 +12400,10 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     if (use_vt) {
         fa_pipeline_state.flags |= FA_FLAG_V_TRANSPOSED;
     }
+    if (indexed_bias) {
+        GGML_ASSERT(!fa_compact.active && !use_sparse);
+        fa_pipeline_state.flags |= FA_FLAG_INDEXED_BIAS;
+    }
     if (use_mr) {
         // schedule options, Qwen3.8-27B pp2048 at d32768, FA op time on gfx1151:
         //   FA_FLAG_MR_LAZY:  skip the O rescale of row blocks whose running max did not move  1171 -> 1095 ms
@@ -12421,7 +12428,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     bool xe_fa_supported_dtype = q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16 &&
                                  mask != nullptr && mask->type == GGML_TYPE_F16;
     // the Xe kernels read V row-major and use prealloc_x as their own scratch
-    xe_fa_opt = xe_fa_supported_platform && xe_fa_supported_usage && xe_fa_supported_dtype && !use_vt;
+    xe_fa_opt = xe_fa_supported_platform && xe_fa_supported_usage && xe_fa_supported_dtype && !use_vt && !indexed_bias;
     std::pair<vk_pipeline, vk_pipeline> xe_fa_pipeline_dual_phases = { nullptr , nullptr };
     vk_pipeline xe_fa_pipeline = nullptr;
     size_t size_q_staging = 0;
@@ -12626,7 +12633,8 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
 
     const uint32_t n_head_kv   = neq2;
     const uint32_t n_head_log2 = 1u << (uint32_t) floorf(log2f((float) n_head_kv));
-    const float m0 = powf(2.0f, -(max_bias       ) / n_head_log2);
+    // with the indexed bias (no ALiBi) m0 carries the table row length, exact as a float
+    const float m0 = indexed_bias ? (float) ggml_flash_attn_ext_get_bias_table(dst)->ne[0] : powf(2.0f, -(max_bias       ) / n_head_log2);
     const float m1 = powf(2.0f, -(max_bias / 2.0f) / n_head_log2);
 
     vk_subbuffer q_buf = ggml_vk_tensor_subbuffer(ctx, q);
@@ -12640,6 +12648,8 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
         mask_buf = fa_compact.mc_buf;
     }
     vk_subbuffer sinks_buf = sinks ? ggml_vk_tensor_subbuffer(ctx, sinks) : q_buf;
+    vk_subbuffer bias_table_buf = indexed_bias ? ggml_vk_tensor_subbuffer(ctx, ggml_flash_attn_ext_get_bias_table(dst)) : q_buf;
+    vk_subbuffer bias_idx_buf = indexed_bias ? ggml_vk_tensor_subbuffer(ctx, ggml_flash_attn_ext_get_bias_indices(dst)) : q_buf;
     vk_subbuffer mask_opt_buf = use_mask_opt ? ggml_vk_subbuffer(ctx, ctx->prealloc_y, 0) : q_buf;
     vk_subbuffer sparse_buf = use_sparse ? ggml_vk_subbuffer(ctx, ctx->prealloc_y, 0) : q_buf;
     if (use_mask_opt || use_sparse) {
@@ -12843,7 +12853,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
 
         vk_subbuffer split_k_buf = ggml_vk_subbuffer(ctx, ctx->prealloc_split_k, 0);
         ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
-                                    {q_buf, k_buf, v_buf, mask_buf, sinks_buf, split_k_buf, mask_opt_buf, fa_compact.dynamic_kv ? fa_compact.kv_buf : sparse_buf},
+                                    {q_buf, k_buf, v_buf, mask_buf, sinks_buf, split_k_buf, mask_opt_buf, fa_compact.dynamic_kv ? fa_compact.kv_buf : sparse_buf, bias_table_buf, bias_idx_buf},
                                     pc, { dispatch_x, workgroups_y, workgroups_z });
 
         ggml_vk_sync_buffers(ctx, subctx);
@@ -12858,7 +12868,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
             workgroups_x *= pipeline->wg_denoms[0];
         }
         ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
-                                    {q_buf, k_buf, v_buf, mask_buf, sinks_buf, dst_buf, mask_opt_buf, fa_compact.dynamic_kv ? fa_compact.kv_buf : sparse_buf},
+                                    {q_buf, k_buf, v_buf, mask_buf, sinks_buf, dst_buf, mask_opt_buf, fa_compact.dynamic_kv ? fa_compact.kv_buf : sparse_buf, bias_table_buf, bias_idx_buf},
                                     pc, { workgroups_x, workgroups_y, workgroups_z });
     }
 
@@ -23075,10 +23085,24 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
             }
         case GGML_OP_FLASH_ATTN_EXT:
             {
-                if (op->src[5] != nullptr || ggml_flash_attn_ext_has_indexed_bias(op)) {
+                if (op->src[5] != nullptr) {
                     return false;
                 }
                 bool coopmat2 = device->coopmat2;
+                if (ggml_flash_attn_ext_has_indexed_bias(op)) {
+                    // the scalar and coopmat1 shaders add it where they load a broadcast f16 mask
+                    const ggml_tensor * table = ggml_flash_attn_ext_get_bias_table(op);
+                    const ggml_tensor * bins  = ggml_flash_attn_ext_get_bias_indices(op);
+                    float max_bias = 0.0f;
+                    memcpy(&max_bias, (const float *) op->op_params + 1, sizeof(float));
+                    if (coopmat2 || op->src[6] != nullptr || op->src[3] == nullptr || op->src[3]->type != GGML_TYPE_F16 ||
+                        op->src[3]->ne[2] != 1 || op->src[3]->ne[0] != op->src[1]->ne[1] || max_bias != 0.0f ||
+                        table->type != GGML_TYPE_F32 || !ggml_is_contiguous(table) || table->ne[0] >= (1 << 24) ||
+                        bins->type != GGML_TYPE_I32 || !ggml_is_contiguous(bins) ||
+                        ggml_nelements(table) >= INT32_MAX || ggml_nelements(bins) >= INT32_MAX) {  // 32-bit shader indices
+                        return false;
+                    }
+                }
                 // maskless selected-key attention (src[6] without a mask): only flash_attn_sel reads the list, the dense kernel would attend to all cells
                 if (op->src[6] != nullptr && op->src[3] == nullptr) {
                     return ggml_vk_flash_attn_sel_pipeline(device, op) != nullptr;
