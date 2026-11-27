@@ -4523,6 +4523,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         for (uint32_t i = 0; i < MAX_FUSED_ADDS; ++i) {
             ggml_vk_create_pipeline2(device, device->pipeline_multi_add[i],     "multi_add_f32_"     + std::to_string(i+1), multi_add_f32_len,     multi_add_f32_data,     "main", MAX_PARAMETER_COUNT, sizeof(vk_op_multi_add_push_constants), {512, 1, 1}, {i+2}, 1);
             ggml_vk_create_pipeline2(device, device->pipeline_multi_add_rms[i], "multi_add_rms_f32_" + std::to_string(i+1), multi_add_rms_f32_len, multi_add_rms_f32_data, "main", MAX_PARAMETER_COUNT, sizeof(vk_op_multi_add_push_constants), {512, 1, 1}, {i+2}, 1);
+            ggml_vk_create_pipeline2(device, device->pipeline_multi_add_w[i],   "multi_add_w_f32_"   + std::to_string(i+1), multi_add_w_f32_len,   multi_add_w_f32_data,   "main", MAX_PARAMETER_COUNT, sizeof(vk_op_multi_add_push_constants), {512, 1, 1}, {i+2}, 1);
             ggml_vk_create_pipeline2(device, device->pipeline_multi_add_f16in[i], "multi_add_f16in_f32_" + std::to_string(i+1), multi_add_f16in_f32_len, multi_add_f16in_f32_data, "main", MAX_PARAMETER_COUNT, sizeof(vk_op_multi_add_push_constants), {512, 1, 1}, {i+2}, 1);
         }
     }
@@ -14319,7 +14320,7 @@ void ggml_vk_multi_add(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_c
     }
     tensors[num_srcs] = dst;
 
-    vk_op_multi_add_push_constants pc;
+    vk_op_multi_add_push_constants pc {};
     pc.ne20 = (uint32_t)dst->ne[0];
     pc.ne21 = (uint32_t)dst->ne[1];
     pc.ne22 = (uint32_t)dst->ne[2];
@@ -14380,6 +14381,200 @@ void ggml_vk_multi_add(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_c
     std::array<uint32_t, 3> elements;
 
     uint32_t ne = ggml_nelements(dst);
+    if (ne > 262144) {
+        elements = { 512, 512, CEIL_DIV(ne, 262144) };
+    } else if (ne > 512) {
+        elements = { 512, CEIL_DIV(ne, 512), 1 };
+    } else {
+        elements = { ne, 1, 1 };
+    }
+
+    static_assert(MAX_PARAMETER_COUNT == 12);
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+        {
+            ggml_vk_subbuffer(ctx, buf[0], offset[0]),
+            ggml_vk_subbuffer(ctx, buf[1], offset[1]),
+            ggml_vk_subbuffer(ctx, buf[2], offset[2]),
+            ggml_vk_subbuffer(ctx, buf[3], offset[3]),
+            ggml_vk_subbuffer(ctx, buf[4], offset[4]),
+            ggml_vk_subbuffer(ctx, buf[5], offset[5]),
+            ggml_vk_subbuffer(ctx, buf[6], offset[6]),
+            ggml_vk_subbuffer(ctx, buf[7], offset[7]),
+            ggml_vk_subbuffer(ctx, buf[8], offset[8]),
+            ggml_vk_subbuffer(ctx, buf[9], offset[9]),
+            ggml_vk_subbuffer(ctx, buf[10], offset[10]),
+            ggml_vk_subbuffer(ctx, buf[11], offset[11]),
+        }, pc, elements);
+}
+
+// MUL of an f32 [n, T] source by a [1, T] view (a depth-mix term: a normed block times its softmax score)
+static bool ggml_vk_is_weighted_mul(const ggml_tensor * t) {
+    const ggml_tensor * x = t->src[0];
+    const ggml_tensor * w = t->src[1];
+    return t->op == GGML_OP_MUL && t->type == GGML_TYPE_F32 && x != nullptr && w != nullptr &&
+           x->type == GGML_TYPE_F32 && w->type == GGML_TYPE_F32 && w->view_src != nullptr &&
+           ggml_are_same_shape(t, x) && x->ne[2] == 1 && x->ne[3] == 1 &&
+           w->ne[0] == 1 && w->ne[1] == x->ne[1] && w->ne[2] == 1 && w->ne[3] == 1;
+}
+
+// MULTI_ADD_W: k weighted MULs t_j and their ADD chain ((t0 + t1) + t2) + ... starting at i, within [i, i + window).
+// idx gets the MULs, then the ADDs; returns k (2 to MAX_FUSED_ADDS + 1), 0 if none.
+static int ggml_vk_match_mix_sum(const ggml_cgraph * g, int i, int window, int idx[2 * (MAX_FUSED_ADDS + 1)]) {
+    const int hi = std::min(g->n_nodes, i + window);
+    const ggml_tensor * t0 = g->nodes[i];
+    if (!ggml_vk_is_weighted_mul(t0)) {
+        return 0;
+    }
+    const ggml_tensor * root = t0->src[1]->view_src;
+    const ggml_tensor * terms[MAX_FUSED_ADDS + 1] = { t0 };
+    const ggml_tensor * adds[MAX_FUSED_ADDS] = {};
+    int k = 1;
+    const ggml_tensor * acc = t0;
+    while (k < MAX_FUSED_ADDS + 1) {
+        // the ADD that sums acc (as src[0]) with the next weighted term
+        const ggml_tensor * a = nullptr;
+        for (int n = i + 1; n < hi; ++n) {
+            const ggml_tensor * c = g->nodes[n];
+            if (c->op == GGML_OP_ADD && c->src[0] == acc) {
+                a = c;
+                break;
+            }
+        }
+        const ggml_tensor * t = a ? a->src[1] : nullptr;
+        if (t == nullptr || a->type != GGML_TYPE_F32 || !ggml_are_same_shape(a, t0) || !ggml_vk_is_weighted_mul(t) ||
+            !ggml_are_same_shape(t, t0) || t->src[1]->view_src != root || t->src[1]->nb[1] != t0->src[1]->nb[1]) {
+            break;
+        }
+        // distinct terms, none computed from the chain (the reorder emits all MULs before the ADDs)
+        bool fresh = true;
+        for (int j = 0; j < k; ++j) {
+            fresh = fresh && terms[j] != t && t->src[0] != terms[j] && (j == 0 || t->src[0] != adds[j - 1]);
+        }
+        if (!fresh || t->src[0] == a) {
+            break;
+        }
+        adds[k - 1] = a;
+        terms[k++] = t;
+        acc = a;
+    }
+    if (k < 2) {
+        return 0;
+    }
+    // every node inside the window
+    auto const & index_of = [&](const ggml_tensor * t) -> int {
+        for (int n = i; n < hi; ++n) {
+            if (g->nodes[n] == t) {
+                return n;
+            }
+        }
+        return -1;
+    };
+    for (int j = 0; j < k; ++j) {
+        idx[j] = index_of(terms[j]);
+        if (idx[j] < 0) {
+            return 0;
+        }
+    }
+    for (int j = 0; j < k - 1; ++j) {
+        idx[k + j] = index_of(adds[j]);
+        if (idx[k + j] < 0) {
+            return 0;
+        }
+    }
+    return k;
+}
+
+// the chain at i as consecutive nodes in that order, its products and partial sums used only inside it; 0 if not fusable
+static int ggml_vk_can_fuse_mix_sum(ggml_backend_vk_context * ctx, const ggml_cgraph * g, int i) {
+    if (!ctx->device->multi_add || g->nodes[i]->op != GGML_OP_MUL || ctx->device->pipeline_multi_add_w[0] == nullptr) {
+        return 0;
+    }
+    int idx[2 * (MAX_FUSED_ADDS + 1)];
+    int k = ggml_vk_match_mix_sum(g, i, 2 * (MAX_FUSED_ADDS + 1), idx);
+    if (k == 0) {
+        return 0;
+    }
+    // the whole chain consecutive (graph_optimize, make_consecutive): k + 1 tensors plus the weights must fit the bindings
+    bool ok = k + 2 <= MAX_PARAMETER_COUNT;
+    for (int n = 0; n < 2 * k - 1 && ok; ++n) {
+        ok = idx[n] == i + n;
+    }
+    const ggml_tensor * root = g->nodes[i]->src[1]->view_src;
+    for (int n = 0; n < 2 * k - 1 && ok; ++n) {
+        const ggml_tensor * t = g->nodes[i + n];
+        if (n < 2 * k - 2 && (ggml_node_get_use_count(g, i + n) != 1 || (t->flags & GGML_TENSOR_FLAG_OUTPUT))) {
+            ok = false;
+        }
+        if (n < k) {
+            // the weight offsets are packed in 8 bits; sources and weights are bound without misalignment
+            const size_t off = t->src[1]->view_offs / sizeof(float);
+            ok = ok && t->src[1]->view_offs % sizeof(float) == 0 && off < 256 && get_misalign_bytes(ctx, root) == 0 &&
+                 get_misalign_bytes(ctx, t->src[0]) == 0 && t->src[0]->nb[0] == sizeof(float);
+        }
+    }
+    return ok && get_misalign_bytes(ctx, g->nodes[i + 2 * k - 2]) == 0 ? k : 0;
+}
+
+static void ggml_vk_multi_add_w(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_cgraph * cgraph, int node_idx) {
+    const int k = (ctx->num_additional_fused_ops + 2) / 2;
+    const ggml_tensor * dst = cgraph->nodes[node_idx + ctx->num_additional_fused_ops];
+    const ggml_tensor * root = cgraph->nodes[node_idx]->src[1]->view_src;
+
+    const ggml_tensor * tensors[MAX_PARAMETER_COUNT];
+    const uint32_t num_tensors = k + 1;
+    GGML_ASSERT(num_tensors + 1 <= MAX_PARAMETER_COUNT);
+    for (int j = 0; j < k; ++j) {
+        tensors[j] = cgraph->nodes[node_idx + j]->src[0];
+    }
+    tensors[k] = dst;
+
+    vk_op_multi_add_push_constants pc {};
+    pc.ne20 = (uint32_t)dst->ne[0];
+    pc.ne21 = (uint32_t)dst->ne[1];
+    pc.ne22 = (uint32_t)dst->ne[2];
+    pc.ne23 = (uint32_t)dst->ne[3];
+    for (uint32_t i = 0; i < num_tensors; ++i) {
+        const ggml_tensor * t = tensors[i];
+        pc.nb[i][0] = (uint32_t)(t->nb[0] / sizeof(float));
+        pc.nb[i][1] = (uint32_t)(t->nb[1] / sizeof(float));
+        pc.nb[i][2] = (uint32_t)(t->nb[2] / sizeof(float));
+        pc.nb[i][3] = (uint32_t)(t->nb[3] / sizeof(float));
+    }
+    for (int j = 0; j < k; ++j) {
+        const uint32_t off = (uint32_t)(cgraph->nodes[node_idx + j]->src[1]->view_offs / sizeof(float));
+        GGML_ASSERT(off < 256);
+        pc.w_offs[j / 4] |= off << (8 * (j % 4));
+    }
+    pc.w_stride = (uint32_t)(cgraph->nodes[node_idx]->src[1]->nb[1] / sizeof(float));
+
+    vk_pipeline pipeline = ctx->device->pipeline_multi_add_w[k - 2];
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    vk_buffer buf[MAX_PARAMETER_COUNT];
+    size_t offset[MAX_PARAMETER_COUNT];
+    auto const & locate = [&](const ggml_tensor * t, vk_buffer & b, size_t & o) {
+        b = nullptr;
+        o = 0;
+        if (ctx->device->uma) {
+            ggml_vk_host_get(ctx->device, t->data, b, o);
+        }
+        if (b == nullptr) {
+            b = ((ggml_backend_vk_buffer_context *)t->buffer->context)->dev_buffer;
+            o = vk_tensor_offset(t) + t->view_offs;
+        }
+        GGML_ASSERT(b != nullptr);
+    };
+    for (uint32_t i = 0; i < num_tensors; ++i) {
+        locate(tensors[i], buf[i], offset[i]);
+    }
+    locate(root, buf[num_tensors], offset[num_tensors]);
+    for (uint32_t i = num_tensors + 1; i < MAX_PARAMETER_COUNT; ++i) {
+        buf[i] = buf[0];
+        offset[i] = 0;
+    }
+
+    std::array<uint32_t, 3> elements;
+    const uint32_t ne = ggml_nelements(dst);
     if (ne > 262144) {
         elements = { 512, 512, CEIL_DIV(ne, 262144) };
     } else if (ne > 512) {
@@ -17405,7 +17600,9 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
 
         break;
     case GGML_OP_MUL:
-        if (ctx->num_additional_fused_ops) {
+        if (ctx->fused_mix_sum) {
+            ggml_vk_multi_add_w(ctx, compute_ctx, cgraph, node_idx);
+        } else if (ctx->num_additional_fused_ops) {
             ggml_vk_snake_dispatch_fused(ctx, compute_ctx, cgraph, node_idx);
         } else {
             ggml_vk_mul(ctx, compute_ctx, src0, src1, node);
@@ -21172,6 +21369,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->fused_mmid_pair_glu = false;
         ctx->fused_mmid_pair_glu_f32 = false;
         ctx->fused_situ = false;
+        ctx->fused_mix_sum = false;
         ctx->fused_rms_norm_mode = RMS_NORM_COUNT;
         ctx->fused_concat_tail = -1;
         ctx->fused_ssm_conv_direct = -1;
@@ -21202,6 +21400,12 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                                    : (hc_moe_inj ? "HC_MOE_EPI_INJ" : cpy ? "HC_MOE_EPI" : "HC_MOE_EPI_F32");
                 std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, false);
                 op_srcs_fused_elementwise[hc_moe_front + 6] = cpy;
+            } else if (const int mix_k = ggml_vk_can_fuse_mix_sum(ctx, cgraph, i)) {
+                ctx->num_additional_fused_ops = 2 * mix_k - 2;
+                ctx->fused_mix_sum = true;
+                fusion_string = "MULTI_ADD_W";
+                // the weights are read at other indices than the output: no node counts as elementwise
+                std::fill_n(op_srcs_fused_elementwise, 2 * mix_k - 1, false);
             } else if (const int situ_n = ggml_vk_can_fuse_situ(ctx, cgraph, i)) {
                 ctx->num_additional_fused_ops = situ_n - 1;
                 ctx->fused_situ = true;
@@ -21629,6 +21833,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_mmid_pair_glu = false;
                 ctx->fused_mmid_pair_glu_f32 = false;
                 ctx->fused_situ = false;
+                ctx->fused_mix_sum = false;
                 ctx->fused_rms_norm_mode = RMS_NORM_COUNT;
                 fusion_string = nullptr;
             }
@@ -21701,6 +21906,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->fused_mmid_pair_glu = false;
         ctx->fused_mmid_pair_glu_f32 = false;
         ctx->fused_situ = false;
+        ctx->fused_mix_sum = false;
     }
 
     ctx->last_total_flops = total_flops;
@@ -22743,56 +22949,96 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
         graph->nodes[i] = new_order[i];
     }
 
-    // SITU: the reorder above interleaves the activation chain with the independent router-weight nodes; move the chain's
-    // nodes next to its last node, in the kernel's order (ggml_vk_match_situ). Only the chain reads its intermediates, so the
-    // nodes passed over do not depend on them; the gate_up projection stays allocated through the fused write.
-    if (!ctx->device->disable_fusion && ctx->device->pipeline_situ_f32[0] != nullptr) {
-        for (int i = 0; i < graph->n_nodes; ++i) {
-            int idx[10];
-            const int n = graph->nodes[i]->op == GGML_OP_SCALE ? ggml_vk_match_situ(graph, i, 48, idx) : 0;
-            if (n == 0) {
+    // Move a fused chain's nodes (SITU, MULTI_ADD_W) next to its last node, in the kernel's order, when the reorder above
+    // interleaved them with independent nodes. Returns where the scan continues: last, i - 1 after a move, i if it cannot move.
+    auto const & make_consecutive = [&](int i, const int * idx, int n, const std::vector<const ggml_tensor *> & inputs) -> int {
+        const int last = *std::max_element(idx, idx + n);
+        bool done = last - i + 1 == n;
+        for (int k = 0; k < n && done; ++k) {
+            done = idx[k] == i + k;
+        }
+        if (done) {
+            if (params && params->add_alloc_dep) {
+                for (const ggml_tensor * in : inputs) {
+                    params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(in->view_src ? in->view_src : in), graph->nodes[last]);
+                }
+            }
+            return last;
+        }
+        std::vector<bool> in_chain(last - i + 1, false);
+        for (int k = 0; k < n; ++k) {
+            if (idx[k] < i || in_chain[idx[k] - i]) {
+                return i;
+            }
+            in_chain[idx[k] - i] = true;
+        }
+        auto const & base = [](const ggml_tensor * t) { return t->view_src ? t->view_src : t; };
+        for (int j = i; j <= last; ++j) {
+            if (in_chain[j - i]) {
                 continue;
             }
-            const int last = *std::max_element(idx, idx + n);
-            std::vector<bool> in_chain(last - i + 1, false);
-            for (int k = 0; k < n; ++k) {
-                in_chain[idx[k] - i] = true;
-            }
-            bool ok = true;
-            for (int j = i; j <= last && ok; ++j) {
-                if (in_chain[j - i]) {
-                    continue;
-                }
-                for (int k = 0; k < n - 1 && ok; ++k) {
+            // a node passed over must not read the chain's intermediates, nor write (through a view) what the chain reads
+            if (graph->nodes[j]->view_src != nullptr && !is_empty(graph->nodes[j])) {
+                for (int k = 0; k < n; ++k) {
                     for (uint32_t sidx = 0; sidx < GGML_MAX_SRC; ++sidx) {
-                        if (graph->nodes[j]->src[sidx] == graph->nodes[idx[k]]) {
-                            ok = false;
+                        const ggml_tensor * src = graph->nodes[idx[k]]->src[sidx];
+                        if (src && base(src) == graph->nodes[j]->view_src) {
+                            return i;
                         }
                     }
                 }
             }
-            if (!ok) {
+            for (int k = 0; k < n; ++k) {
+                if (idx[k] == last) {
+                    continue;
+                }
+                for (uint32_t sidx = 0; sidx < GGML_MAX_SRC; ++sidx) {
+                    if (graph->nodes[j]->src[sidx] == graph->nodes[idx[k]]) {
+                        return i;
+                    }
+                }
+            }
+        }
+        std::vector<ggml_tensor *> run;
+        for (int j = i; j <= last; ++j) {
+            if (!in_chain[j - i]) {
+                run.push_back(graph->nodes[j]);
+            }
+        }
+        std::vector<ggml_tensor *> chain(n);
+        for (int k = 0; k < n; ++k) {
+            chain[k] = graph->nodes[idx[k]];
+        }
+        run.insert(run.end(), chain.begin(), chain.end());
+        std::copy(run.begin(), run.end(), graph->nodes + i);
+        // the scan reaches the chain again, now consecutive, and adds its allocation dependencies there
+        return i - 1;
+    };
+    if (!ctx->device->disable_fusion && ctx->device->pipeline_situ_f32[0] != nullptr) {
+        for (int i = 0; i < graph->n_nodes; ++i) {
+            int idx[10];
+            const int n = graph->nodes[i]->op == GGML_OP_SCALE ? ggml_vk_match_situ(graph, i, 48, idx) : 0;
+            if (n > 0) {
+                const ggml_tensor * gate = graph->nodes[i]->src[0];
+                const ggml_tensor * up   = graph->nodes[idx[5]]->src[0];
+                i = make_consecutive(i, idx, n, { gate, up });
+            }
+        }
+    }
+    if (!ctx->device->disable_fusion && ctx->device->multi_add && ctx->device->pipeline_multi_add_w[0] != nullptr) {
+        for (int i = 0; i < graph->n_nodes; ++i) {
+            int idx[2 * (MAX_FUSED_ADDS + 1)];
+            const int k = graph->nodes[i]->op == GGML_OP_MUL ? ggml_vk_match_mix_sum(graph, i, 64, idx) : 0;
+            if (k == 0) {
                 continue;
             }
-            std::vector<ggml_tensor *> run;
-            for (int j = i; j <= last; ++j) {
-                if (!in_chain[j - i]) {
-                    run.push_back(graph->nodes[j]);
-                }
+            // the sources and the weights stay allocated through the sum
+            std::vector<const ggml_tensor *> ins;
+            for (int j = 0; j < k; ++j) {
+                ins.push_back(graph->nodes[idx[j]]->src[0]);
             }
-            const int first = i + (int) run.size();
-            std::vector<ggml_tensor *> chain(n);
-            for (int k = 0; k < n; ++k) {
-                chain[k] = graph->nodes[idx[k]];
-            }
-            run.insert(run.end(), chain.begin(), chain.end());
-            std::copy(run.begin(), run.end(), graph->nodes + i);
-            if (params && params->add_alloc_dep) {
-                for (const ggml_tensor * in : { chain[0]->src[0], chain[5]->src[0] }) {
-                    params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(in->view_src ? in->view_src : in), chain[n - 1]);
-                }
-            }
-            i = first + n - 1;
+            ins.push_back(graph->nodes[idx[0]]->src[1]);
+            i = make_consecutive(i, idx, 2 * k - 1, ins);
         }
     }
 

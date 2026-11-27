@@ -4345,6 +4345,48 @@ struct test_cont_sigmoid_mul : public test_case {
     }
 };
 
+// a softmax-weighted sum of k [n, T] sources per query, as Inkling 2's depth mix builds it (models/inkling2.cpp mix_split):
+// MUL by a [1, T] view of the scores per source, then an ADD chain: the Vulkan MULTI_ADD_W fusion, one per query
+struct test_mix_sum : public test_case {
+    const int n, tokens, k, nq;
+    test_mix_sum(int n, int tokens, int k, int nq) : n(n), tokens(tokens), k(k), nq(nq) {}
+    std::string op_desc(ggml_tensor *) override { return "MIX_SUM"; }
+    std::string vars() override { return VARS_TO_STR4(n, tokens, k, nq); }
+    bool run_whole_graph() override { return true; }
+    // through the scheduler: graph_optimize makes each chain consecutive and keeps its inputs allocated through it
+    bool use_scheduler_allocation() override { return true; }
+    // GGML_VK_TEST_REQUIRE_MIX_SUM=1: one fused dispatch per query
+    bool checks_engagement() override { return true; }
+    bool verify_engagement(ggml_backend_t backend, std::string & msg) override {
+        if (engagement_required(backend, "GGML_VK_TEST_REQUIRE_MIX_SUM", "MULTI_ADD_W") && dispatch_census_count(backend, "MULTI_ADD_W") != nq) {
+            msg = "MULTI_ADD_W dispatches: " + std::to_string(dispatch_census_count(backend, "MULTI_ADD_W"));
+            return false;
+        }
+        return true;
+    }
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        // computed sources shared by the queries, as in the model (the allocator may reuse their memory after the last sum)
+        std::vector<ggml_tensor *> src(k);
+        for (int j = 0; j < k; ++j) {
+            src[j] = ggml_rms_norm(ctx, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, tokens), 1e-6f);
+        }
+        ggml_tensor * scores = ggml_soft_max(ctx, ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, nq, tokens));
+        ggml_tensor * out = nullptr;
+        for (int i = 0; i < nq; ++i) {
+            ggml_tensor * acc = nullptr;
+            for (int jj = 0; jj < k; ++jj) {
+                const int j = jj + 1 < k ? k - 2 - jj : k - 1;
+                ggml_tensor * w = ggml_view_2d(ctx, scores, 1, tokens, scores->nb[2], j*scores->nb[0] + i*scores->nb[1]);
+                ggml_tensor * t = ggml_mul(ctx, src[j], w);
+                acc = acc ? ggml_add(ctx, acc, t) : t;
+            }
+            // one output: the query sums concatenated
+            out = out ? ggml_concat(ctx, out, acc, 1) : acc;
+        }
+        return out;
+    }
+};
+
 // the SITU expert activation on the halves of a merged gate_up projection (llama-graph.cpp LLM_FFN_SITU), optionally followed
 // by a per-channel MUL (the down projection's Hadamard signs): the Vulkan SITU(_SIGNS) fusion
 struct test_situ : public test_case {
@@ -16281,6 +16323,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     for (int tokens : {64, 512, 2049}) {
         test_cases.emplace_back(new test_hc_combine_norm_inject(2560, 4, tokens));
+    }
+    for (int k : {2, 3, 5, 9, 10}) {
+        for (int nq : {1, 3}) {
+            test_cases.emplace_back(new test_mix_sum(256, 37, k, nq));
+        }
+        test_cases.emplace_back(new test_mix_sum(2304, 512, k, 3));
     }
     for (bool signs : {false, true}) {
         for (int tokens : {1, 7, 33}) {
