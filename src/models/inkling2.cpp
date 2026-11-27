@@ -212,7 +212,11 @@ std::vector<ggml_tensor *> llama_model_inkling2::graph::mix_split(const std::vec
     std::vector<ggml_tensor *> src;
     src.reserve(blocks.size() + 1);
     for (ggml_tensor * block : blocks) {
-        src.push_back(ggml_rms_norm(ctx0, ggml_reshape_2d(ctx0, block, n_embd, n_tokens), 1e-6f));
+        ggml_tensor * & norm = block_norms[block];
+        if (norm == nullptr) {
+            norm = ggml_rms_norm(ctx0, ggml_reshape_2d(ctx0, block, n_embd, n_tokens), 1e-6f);
+        }
+        src.push_back(norm);
     }
     src.push_back(ggml_rms_norm(ctx0, ggml_reshape_2d(ctx0, cur, n_embd, n_tokens), 1e-6f));
 

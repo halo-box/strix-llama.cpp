@@ -2476,6 +2476,8 @@ struct llama_model_inkling2 : public llama_model_base {
         // below this many tokens mix_stacked: on Strix Halo 8060S Vulkan (2026-11-23) the split form cost about 3% tg128 at
         // one token and gained 12-13% pp512 at 512; any value between them keeps both (re-measure for other backends)
         static constexpr int64_t kMixSplitMinTokens = 32;
+        // mix_split's per-source norm of each finished block, built once per graph: a block is mixed again by every later layer
+        std::unordered_map<const ggml_tensor *, ggml_tensor *> block_norms;
         ggml_tensor * clip(ggml_tensor * cur, ggml_tensor * scale, float threshold);
         ggml_tensor * convolve(
                 ggml_tensor * cur,
