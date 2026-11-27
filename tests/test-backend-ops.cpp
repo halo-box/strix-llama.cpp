@@ -4345,6 +4345,48 @@ struct test_cont_sigmoid_mul : public test_case {
     }
 };
 
+// the SITU expert activation on the halves of a merged gate_up projection (llama-graph.cpp LLM_FFN_SITU), optionally followed
+// by a per-channel MUL (the down projection's Hadamard signs): the Vulkan SITU(_SIGNS) fusion
+struct test_situ : public test_case {
+    const int n_ff, n_used, tokens;
+    const bool signs;
+    test_situ(int n_ff, int n_used, int tokens, bool signs) : n_ff(n_ff), n_used(n_used), tokens(tokens), signs(signs) {}
+    std::string op_desc(ggml_tensor *) override { return "SITU"; }
+    std::string vars() override { return VARS_TO_STR4(n_ff, n_used, tokens, signs); }
+    bool run_whole_graph() override { return true; }
+    // through the scheduler: graph_optimize makes the chain consecutive and keeps gate_up allocated through it
+    bool use_scheduler_allocation() override { return true; }
+    // GGML_VK_TEST_REQUIRE_SITU=1: the chain runs as one fused dispatch
+    bool checks_engagement() override { return true; }
+    bool verify_engagement(ggml_backend_t backend, std::string & msg) override {
+        const char * l = signs ? "SITU_SIGNS" : "SITU";
+        if (engagement_required(backend, "GGML_VK_TEST_REQUIRE_SITU", l) && dispatch_census_count(backend, l) != 1) {
+            msg = std::string(l) + " dispatches: " + std::to_string(dispatch_census_count(backend, l));
+            return false;
+        }
+        return true;
+    }
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const float beta = 1.5f, lb = 3.0f;
+        ggml_tensor * gate_up = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2 * n_ff, n_used, tokens);
+        ggml_tensor * gate = ggml_view_3d(ctx, gate_up, n_ff, n_used, tokens, gate_up->nb[1], gate_up->nb[2], 0);
+        ggml_tensor * up   = ggml_view_3d(ctx, gate_up, n_ff, n_used, tokens, gate_up->nb[1], gate_up->nb[2], n_ff * gate_up->nb[0]);
+        ggml_tensor * act = ggml_scale(ctx, ggml_tanh(ctx, ggml_scale(ctx, gate, 1.0f/beta)), beta);
+        act = ggml_mul(ctx, act, ggml_sigmoid(ctx, gate));
+        up = ggml_scale(ctx, ggml_tanh(ctx, ggml_scale(ctx, up, 1.0f/lb)), lb);
+        ggml_tensor * out = ggml_mul(ctx, act, up);
+        if (signs) {
+            out = ggml_mul(ctx, out, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_ff));
+        }
+        return out;
+    }
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t, -4.0f, 4.0f);
+        }
+    }
+};
+
 struct test_hc_combine_norm_inject : public test_case {
     const int embd, hc, tokens;
     ggml_tensor * out_res = nullptr, * out_norm = nullptr, * out_inj = nullptr;
@@ -16239,6 +16281,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     for (int tokens : {64, 512, 2049}) {
         test_cases.emplace_back(new test_hc_combine_norm_inject(2560, 4, tokens));
+    }
+    for (bool signs : {false, true}) {
+        for (int tokens : {1, 7, 33}) {
+            test_cases.emplace_back(new test_situ(64, 8, tokens, signs));
+        }
+        test_cases.emplace_back(new test_situ(1152, 8, 512, signs));
     }
     for (bool flat : {false, true}) {
         for (int tokens : {1, 7, 2048}) {

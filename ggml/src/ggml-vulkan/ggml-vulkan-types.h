@@ -1012,6 +1012,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_reglu[2];
     vk_pipeline pipeline_swiglu[2];
     vk_pipeline pipeline_swiglu_oai[2];
+    vk_pipeline pipeline_situ_f32[2];   // [with the per-channel signs MUL]
     vk_pipeline pipeline_swiglu_clamp[2];
     vk_pipeline pipeline_geglu_erf[2];
     vk_pipeline pipeline_geglu_quick[2];
@@ -1507,6 +1508,7 @@ struct ggml_backend_vk_context {
     bool fused_mmid_cpy16 {};   // MUL_MAT_ID(+MUL)+CPY(f16): the expert GEMM stores f16 into the cast destination
     bool fused_mmid_glu {};     // MUL_MAT_ID+CPY(f16)+SWIGLU: the gate GEMM stores silu(gate) * up as f16
     bool fused_mmid_pair_glu {};   // MUL_MAT_ID+CPY(f16) x 2 + SWIGLU: gate, up and the SwiGLU in one weight-streaming launch
+    bool fused_situ {};                // SITU(_SIGNS): the SITU expert activation chain as one situ.comp pass
     bool fused_mmid_pair_glu_f32 {};   // ... its f32 chain: MUL_MAT_ID x 2 + an f32 SWIGLU
     bool fused_hc_post_norm_inj {};  // HC_POST_NORM_GATE_CPY + RESHAPE + MUL_MAT: the norm kernel also computes the inject
     int fused_hc_moe_epi {};   // HC_MOE_EPI: number of ADD nodes (routed slot adds + the shared-expert add) in front of the HC post norm chain
