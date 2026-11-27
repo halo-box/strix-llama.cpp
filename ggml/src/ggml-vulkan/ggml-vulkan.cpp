@@ -4638,6 +4638,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     CREATE_GLU(geglu_erf)
     CREATE_GLU(geglu_quick)
 #undef CREATE_GLU
+    ggml_vk_create_pipeline(device, device->pipeline_loop_ctrl_f32, "loop_ctrl_f32", loop_ctrl_f32_len, loop_ctrl_f32_data, "main", 6, 3 * sizeof(uint32_t), {512, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_situ_f32[0], "situ_f32", situ_f32_len, situ_f32_data, "main", 4, sizeof(vk_op_glu_push_constants), {512, 1, 1}, {0}, 1, true);
     ggml_vk_create_pipeline(device, device->pipeline_situ_f32[1], "situ_signs_f32", situ_f32_len, situ_f32_data, "main", 4, sizeof(vk_op_glu_push_constants), {512, 1, 1}, {1}, 1, true);
 
@@ -16024,6 +16025,119 @@ static int ggml_vk_can_fuse_situ(ggml_backend_vk_context * ctx, const ggml_cgrap
     return n;
 }
 
+// LOOP_CTRL: Inkling 2's loop controller mix (models/inkling2.cpp control), out = (cur - tanh(f)*cur) + tanh(g)*msg, starting
+// at the TANH of f at i. idx gets TANH f, MUL, TANH g, MUL, SUB, ADD; returns true when found within [i, i + window).
+static bool ggml_vk_match_loop_ctrl(const ggml_cgraph * g, int i, int window, int idx[6]) {
+    const int hi = std::min(g->n_nodes, i + window);
+    auto const & is_tanh = [](const ggml_tensor * t) { return t->op == GGML_OP_UNARY && ggml_get_unary_op(t) == GGML_UNARY_OP_TANH; };
+    auto const & user = [&](const ggml_tensor * t, ggml_op op, int s) -> int {
+        for (int k = i + 1; k < hi; ++k) {
+            if (g->nodes[k]->op == op && g->nodes[k]->src[s] == t) {
+                return k;
+            }
+        }
+        return -1;
+    };
+    auto const & index_of = [&](const ggml_tensor * t) -> int {
+        for (int k = i + 1; k < hi; ++k) {
+            if (g->nodes[k] == t) {
+                return k;
+            }
+        }
+        return -1;
+    };
+    const ggml_tensor * f = g->nodes[i];
+    if (!is_tanh(f)) {
+        return false;
+    }
+    idx[0] = i;
+    idx[1] = user(f, GGML_OP_MUL, 0);                                   // f * cur
+    if (idx[1] < 0) {
+        return false;
+    }
+    const ggml_tensor * fc  = g->nodes[idx[1]];
+    const ggml_tensor * cur = fc->src[1];
+    idx[4] = user(fc, GGML_OP_SUB, 1);                                  // cur - f*cur
+    if (idx[4] < 0 || g->nodes[idx[4]]->src[0] != cur) {
+        return false;
+    }
+    idx[5] = user(g->nodes[idx[4]], GGML_OP_ADD, 0);                    // + g*msg
+    if (idx[5] < 0) {
+        return false;
+    }
+    const ggml_tensor * gm = g->nodes[idx[5]]->src[1];
+    if (gm == nullptr || gm->op != GGML_OP_MUL || !is_tanh(gm->src[0])) {
+        return false;
+    }
+    idx[2] = index_of(gm->src[0]);
+    idx[3] = index_of(gm);
+    if (idx[2] < 0 || idx[3] < 0) {
+        return false;
+    }
+    const ggml_tensor * ins[4] = { f->src[0], gm->src[0]->src[0], cur, gm->src[1] };
+    for (int k = 0; k < 6; ++k) {
+        const ggml_tensor * t = g->nodes[idx[k]];
+        if (t->type != GGML_TYPE_F32 || !ggml_are_same_shape(t, cur) || !ggml_is_contiguous(t)) {
+            return false;
+        }
+    }
+    for (const ggml_tensor * t : ins) {
+        if (t == nullptr || t->type != GGML_TYPE_F32 || !ggml_are_same_shape(t, cur) || !ggml_is_contiguous(t)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// the chain at i as consecutive nodes in that order, intermediates used only inside it, all bound without misalignment
+static bool ggml_vk_can_fuse_loop_ctrl(ggml_backend_vk_context * ctx, const ggml_cgraph * g, int i) {
+    int idx[6];
+    if (ctx->device->pipeline_loop_ctrl_f32 == nullptr || !ggml_vk_match_loop_ctrl(g, i, 6, idx)) {
+        return false;
+    }
+    for (int k = 0; k < 6; ++k) {
+        const ggml_tensor * t = g->nodes[i + k];
+        if (idx[k] != i + k || get_misalign_bytes(ctx, t) != 0 ||
+            (k < 5 && (ggml_node_get_use_count(g, i + k) != 1 || (t->flags & GGML_TENSOR_FLAG_OUTPUT)))) {
+            return false;
+        }
+        for (int s = 0; s < 2; ++s) {
+            if (t->src[s] && get_misalign_bytes(ctx, t->src[s]) != 0) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+static void ggml_vk_loop_ctrl(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_cgraph * cgraph, int node_idx) {
+    const ggml_tensor * const * n = cgraph->nodes + node_idx;
+    const ggml_tensor * dst = n[5];
+    const uint32_t ne = (uint32_t) ggml_nelements(dst);
+    const std::array<uint32_t, 3> pc = { ne, 0, ctx->do_add_rms_partials };
+    vk_pipeline pipeline = ctx->device->pipeline_loop_ctrl_f32;
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    std::array<uint32_t, 3> elements;
+    if (ne > 262144) {
+        elements = { 512, 512, CEIL_DIV(ne, 262144) };
+    } else if (ne > 512) {
+        elements = { 512, CEIL_DIV(ne, 512), 1 };
+    } else {
+        elements = { ne, 1, 1 };
+    }
+    const vk_subbuffer dst_buf = ggml_vk_tensor_subbuffer(ctx, dst);
+    // f, g (the TANH inputs), cur, msg, out, the ADD_RMS_NORM partials (out again when unused)
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, {
+            ggml_vk_tensor_subbuffer(ctx, n[0]->src[0]),
+            ggml_vk_tensor_subbuffer(ctx, n[2]->src[0]),
+            ggml_vk_tensor_subbuffer(ctx, n[1]->src[1]),
+            ggml_vk_tensor_subbuffer(ctx, n[3]->src[1]),
+            dst_buf,
+            ctx->do_add_rms_partials ? ggml_vk_subbuffer(ctx, ctx->prealloc_add_rms_partials, ctx->prealloc_size_add_rms_partials_offset) : dst_buf,
+        }, pc, elements);
+}
+
 static void ggml_vk_situ(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_cgraph * cgraph, int node_idx) {
     const ggml_tensor * const * n = cgraph->nodes + node_idx;
     const bool signs = ctx->num_additional_fused_ops == 9;
@@ -17410,7 +17524,8 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
     ggml_tensor * src2 = node->src[2];
     ggml_tensor * src3 = node->src[3];
 
-    if (node->op == GGML_OP_ADD && !ctx->fused_hc_moe_epi) {
+    // LOOP_CTRL ends with the ADD and writes the partials like it
+    if ((node->op == GGML_OP_ADD || ctx->fused_loop_ctrl) && !ctx->fused_hc_moe_epi) {
         int next_node_idx = node_idx + 1 + ctx->num_additional_fused_ops;
         if (next_node_idx < cgraph->n_nodes &&
             cgraph->nodes[next_node_idx]->op == GGML_OP_RMS_NORM &&
@@ -17743,6 +17858,10 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
         }
         if (ctx->fused_topk_moe_mode != TOPK_MOE_COUNT) {
             ggml_vk_topk_moe(ctx, compute_ctx, cgraph, node_idx);
+            break;
+        }
+        if (ctx->fused_loop_ctrl) {
+            ggml_vk_loop_ctrl(ctx, compute_ctx, cgraph, node_idx);
             break;
         }
         if (ctx->num_additional_fused_ops) {
@@ -21369,6 +21488,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->fused_mmid_pair_glu = false;
         ctx->fused_mmid_pair_glu_f32 = false;
         ctx->fused_situ = false;
+        ctx->fused_loop_ctrl = false;
         ctx->fused_mix_sum = false;
         ctx->fused_rms_norm_mode = RMS_NORM_COUNT;
         ctx->fused_concat_tail = -1;
@@ -21400,6 +21520,12 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                                    : (hc_moe_inj ? "HC_MOE_EPI_INJ" : cpy ? "HC_MOE_EPI" : "HC_MOE_EPI_F32");
                 std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, false);
                 op_srcs_fused_elementwise[hc_moe_front + 6] = cpy;
+            } else if (ggml_vk_can_fuse_loop_ctrl(ctx, cgraph, i)) {
+                ctx->num_additional_fused_ops = 5;
+                ctx->fused_loop_ctrl = true;
+                fusion_string = "LOOP_CTRL";
+                // every input is read at the output's own index (same shape, contiguous)
+                std::fill_n(op_srcs_fused_elementwise, 6, true);
             } else if (const int mix_k = ggml_vk_can_fuse_mix_sum(ctx, cgraph, i)) {
                 ctx->num_additional_fused_ops = 2 * mix_k - 2;
                 ctx->fused_mix_sum = true;
@@ -21833,6 +21959,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_mmid_pair_glu = false;
                 ctx->fused_mmid_pair_glu_f32 = false;
                 ctx->fused_situ = false;
+                ctx->fused_loop_ctrl = false;
                 ctx->fused_mix_sum = false;
                 ctx->fused_rms_norm_mode = RMS_NORM_COUNT;
                 fusion_string = nullptr;
@@ -21906,6 +22033,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->fused_mmid_pair_glu = false;
         ctx->fused_mmid_pair_glu_f32 = false;
         ctx->fused_situ = false;
+        ctx->fused_loop_ctrl = false;
         ctx->fused_mix_sum = false;
     }
 
@@ -23022,6 +23150,15 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                 const ggml_tensor * gate = graph->nodes[i]->src[0];
                 const ggml_tensor * up   = graph->nodes[idx[5]]->src[0];
                 i = make_consecutive(i, idx, n, { gate, up });
+            }
+        }
+    }
+    if (!ctx->device->disable_fusion && ctx->device->pipeline_loop_ctrl_f32 != nullptr) {
+        for (int i = 0; i < graph->n_nodes; ++i) {
+            int idx[6];
+            if (graph->nodes[i]->op == GGML_OP_UNARY && ggml_vk_match_loop_ctrl(graph, i, 48, idx)) {
+                const ggml_tensor * const * n = graph->nodes;
+                i = make_consecutive(i, idx, 6, { n[idx[0]]->src[0], n[idx[2]]->src[0], n[idx[1]]->src[1], n[idx[3]]->src[1] });
             }
         }
     }

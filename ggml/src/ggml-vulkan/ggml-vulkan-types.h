@@ -1013,6 +1013,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_reglu[2];
     vk_pipeline pipeline_swiglu[2];
     vk_pipeline pipeline_swiglu_oai[2];
+    vk_pipeline pipeline_loop_ctrl_f32;   // LOOP_CTRL: Inkling 2's loop controller mix
     vk_pipeline pipeline_situ_f32[2];   // [with the per-channel signs MUL]
     vk_pipeline pipeline_swiglu_clamp[2];
     vk_pipeline pipeline_geglu_erf[2];
@@ -1510,6 +1511,7 @@ struct ggml_backend_vk_context {
     bool fused_mmid_glu {};     // MUL_MAT_ID+CPY(f16)+SWIGLU: the gate GEMM stores silu(gate) * up as f16
     bool fused_mmid_pair_glu {};   // MUL_MAT_ID+CPY(f16) x 2 + SWIGLU: gate, up and the SwiGLU in one weight-streaming launch
     bool fused_mix_sum {};             // MULTI_ADD_W: k weighted MULs + their ADD chain as one multi_add_w pass
+    bool fused_loop_ctrl {};           // LOOP_CTRL: TANH, MUL, TANH, MUL, SUB, ADD as one loop_ctrl pass
     bool fused_situ {};                // SITU(_SIGNS): the SITU expert activation chain as one situ.comp pass
     bool fused_mmid_pair_glu_f32 {};   // ... its f32 chain: MUL_MAT_ID x 2 + an f32 SWIGLU
     bool fused_hc_post_norm_inj {};  // HC_POST_NORM_GATE_CPY + RESHAPE + MUL_MAT: the norm kernel also computes the inject

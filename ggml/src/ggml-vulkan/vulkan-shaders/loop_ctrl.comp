@@ -1,0 +1,83 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+
+#include "types.glsl"
+
+// Inkling 2's loop controller mix, out = (cur - tanh(f)*cur) + tanh(g)*msg, with the unfused shaders' f32 expressions.
+// The products go through an XOR with a zero (rounded as stored); the sum is precise (not reassociated).
+// rms_partials: also the ADD_RMS_NORM partial sums of squares, with add.comp's reduction.
+
+const uint num_threads = 256;
+
+layout(local_size_x = num_threads, local_size_y = 1, local_size_z = 1) in;
+
+layout (push_constant) uniform parameter {
+    uint ne;
+    uint zero;
+    uint rms_partials;
+} p;
+
+layout (binding = 0) readonly buffer F {float data_f[];};
+layout (binding = 1) readonly buffer G {float data_g[];};
+layout (binding = 2) readonly buffer C {float data_c[];};
+layout (binding = 3) readonly buffer M {float data_m[];};
+layout (binding = 4) writeonly buffer D {float data_d[];};
+layout (binding = 5, std430) buffer PartialBuf {float partial_sums[];};
+
+shared float sumsh[num_threads];
+
+float op_tanh(float x) {
+    return 1.0f - 2.0f / (exp(2.0f*x) + 1.0f);
+}
+
+float rounded(float x) {
+    return uintBitsToFloat(floatBitsToUint(x) ^ p.zero);
+}
+
+void main() {
+    uint idx = gl_GlobalInvocationID.z * 262144 + gl_GlobalInvocationID.y * 512 + gl_GlobalInvocationID.x;
+    const uint orig_idx = idx;
+
+    // num_threads * num_iter must equal 512, to match the dispatch's wg_denoms
+    const uint num_iter = 2;
+
+    float sum_sq = 0;
+
+    [[unroll]] for (uint it = 0; it < num_iter; ++it) {
+        if (idx >= p.ne) {
+            continue;
+        }
+        const float cur = data_c[idx];
+        const float fc  = rounded(op_tanh(data_f[idx]) * cur);
+        const float gm  = rounded(op_tanh(data_g[idx]) * data_m[idx]);
+        precise const float sub = cur - fc;
+        precise const float sum = sub + gm;
+        sum_sq += sum*sum;
+        data_d[idx] = sum;
+        idx += num_threads;
+    }
+
+    if (p.rms_partials != 0) {
+        // reduce the sum within each subgroup, then across subgroups
+        const uint NumSubgroups = num_threads / gl_SubgroupSize;
+        sum_sq = subgroupAdd(sum_sq);
+        if (gl_SubgroupInvocationID == 0) {
+            sumsh[gl_SubgroupID] = sum_sq;
+        }
+        barrier();
+        [[unroll]] for (uint s = NumSubgroups / 2; s > 0; s >>= 1) {
+            if (gl_SubgroupID < s && gl_SubgroupInvocationID == 0) {
+                sum_sq += sumsh[gl_SubgroupID + s];
+                sumsh[gl_SubgroupID] = sum_sq;
+            }
+            barrier();
+        }
+
+        if (gl_SubgroupID == 0 && gl_SubgroupInvocationID == 0) {
+            partial_sums[orig_idx / (num_iter * num_threads)] = sum_sq;
+        }
+    }
+}

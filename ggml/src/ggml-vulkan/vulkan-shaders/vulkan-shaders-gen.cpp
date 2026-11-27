@@ -1264,6 +1264,7 @@ void process_shaders() {
     string_to_spv("swiglu_oai_f16", "swiglu_oai.comp",  {{"A_TYPE", "float16_t"},   {"D_TYPE", "float16_t"}, {"D_F16", "1"}});
     string_to_spv("swiglu_oai_f32", "swiglu_oai.comp",  {{"A_TYPE", "float"},       {"D_TYPE", "float"}});
     string_to_spv("situ_f32",       "situ.comp",        {{"A_TYPE", "float"},       {"D_TYPE", "float"}});
+    string_to_spv("loop_ctrl_f32",  "loop_ctrl.comp",   {});
     string_to_spv("swiglu_clamp_f16", "swiglu_clamp.comp", {{"A_TYPE", "float16_t"}, {"D_TYPE", "float16_t"}, {"D_F16", "1"}});
     string_to_spv("swiglu_clamp_f32", "swiglu_clamp.comp", {{"A_TYPE", "float"},     {"D_TYPE", "float"}});
     string_to_spv("geglu_erf_f16",  "geglu_erf.comp",   {{"A_TYPE", "float16_t"},   {"D_TYPE", "float16_t"}, {"D_F16", "1"}});

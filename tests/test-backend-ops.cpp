@@ -4345,6 +4345,38 @@ struct test_cont_sigmoid_mul : public test_case {
     }
 };
 
+// Inkling 2's loop controller mix (models/inkling2.cpp control): (cur - tanh(f)*cur) + tanh(g)*msg, the Vulkan LOOP_CTRL fusion
+struct test_loop_ctrl : public test_case {
+    const int n, tokens;
+    const bool norm;   // the next block's RMS_NORM: one token takes the ADD_RMS_NORM partials
+    test_loop_ctrl(int n, int tokens, bool norm) : n(n), tokens(tokens), norm(norm) {}
+    std::string op_desc(ggml_tensor *) override { return "LOOP_CTRL"; }
+    std::string vars() override { return VARS_TO_STR3(n, tokens, norm); }
+    bool run_whole_graph() override { return true; }
+    bool use_scheduler_allocation() override { return true; }
+    // GGML_VK_TEST_REQUIRE_LOOP_CTRL=1: one fused dispatch
+    bool checks_engagement() override { return true; }
+    bool verify_engagement(ggml_backend_t backend, std::string & msg) override {
+        if (engagement_required(backend, "GGML_VK_TEST_REQUIRE_LOOP_CTRL", "LOOP_CTRL") && dispatch_census_count(backend, "LOOP_CTRL") != 1) {
+            msg = "LOOP_CTRL dispatches: " + std::to_string(dispatch_census_count(backend, "LOOP_CTRL"));
+            return false;
+        }
+        return true;
+    }
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        // computed inputs, as in the model (the forget and gain projections, the mixed input and the message)
+        ggml_tensor * in[4];
+        for (auto & t : in) {
+            t = ggml_scale(ctx, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, tokens), 2.0f);
+        }
+        ggml_tensor * cur = in[2], * message = in[3];
+        ggml_tensor * forget = ggml_tanh(ctx, in[0]);
+        ggml_tensor * gain   = ggml_tanh(ctx, in[1]);
+        ggml_tensor * out = ggml_add(ctx, ggml_sub(ctx, cur, ggml_mul(ctx, forget, cur)), ggml_mul(ctx, gain, message));
+        return norm ? ggml_rms_norm(ctx, out, 1e-6f) : out;
+    }
+};
+
 // a softmax-weighted sum of k [n, T] sources per query, as Inkling 2's depth mix builds it (models/inkling2.cpp mix_split):
 // MUL by a [1, T] view of the scores per source, then an ADD chain: the Vulkan MULTI_ADD_W fusion, one per query
 struct test_mix_sum : public test_case {
@@ -16324,6 +16356,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int tokens : {64, 512, 2049}) {
         test_cases.emplace_back(new test_hc_combine_norm_inject(2560, 4, tokens));
     }
+    for (int tokens : {1, 7, 512}) {
+        for (bool norm : {false, true}) {
+            test_cases.emplace_back(new test_loop_ctrl(2304, tokens, norm));
+        }
+    }
+    test_cases.emplace_back(new test_loop_ctrl(5000, 1, true));
     for (int k : {2, 3, 5, 9, 10}) {
         for (int nq : {1, 3}) {
             test_cases.emplace_back(new test_mix_sum(256, 37, k, nq));
