@@ -737,6 +737,8 @@ struct common_params {
     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
     std::string ctx_checkpoints_dir;     // context checkpoints beyond ctx_checkpoints_ram_mib go to unlinked files here
     int32_t ctx_checkpoints_ram_mib = 8192; // with ctx_checkpoints_dir: checkpoint memory kept before the oldest are written
+    bool     ctx_checkpoint_snapshots = true; // take the end-of-prompt checkpoint from rollback snapshots, without a separate pass
+    uint32_t n_rs_seq_ckpt = 0;          // rollback snapshots wanted by the checkpoints (set by the server)
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
     bool    cache_ram_explicit  = false; // set by --cache-ram, decision models disable the cache otherwise
 
