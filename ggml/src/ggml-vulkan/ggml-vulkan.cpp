@@ -4724,6 +4724,14 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     }
 
     ggml_vk_create_pipeline(device, device->pipeline_argmax_f32, "argmax_f32", argmax_f32_len, argmax_f32_data, "main", 2, sizeof(vk_op_push_constants), {1, 1, 1}, { device->subgroup_size }, 1);
+    {
+        // one subgroup per row scans a 200k vocabulary in ~3000 dependent steps per lane: wide rows get a full workgroup
+        uint32_t argmax_wide = std::min({1024u, device->properties.limits.maxComputeWorkGroupInvocations, device->properties.limits.maxComputeWorkGroupSize[0]});
+        while (argmax_wide & (argmax_wide - 1)) {
+            argmax_wide &= argmax_wide - 1; // the shader's reduction halves BLOCK_SIZE: round down to a power of two
+        }
+        ggml_vk_create_pipeline(device, device->pipeline_argmax_f32_wide, "argmax_f32_wide", argmax_f32_len, argmax_f32_data, "main", 2, sizeof(vk_op_push_constants), {1, 1, 1}, { argmax_wide }, 1);
+    }
 
     ggml_vk_create_pipeline(device, device->pipeline_sum_rows_f32, "sum_rows_f32", sum_rows_f32_len, sum_rows_f32_data, "main", 2, sizeof(vk_op_sum_rows_push_constants), {1, 1, 1}, { device->subgroup_size }, 1, true);
     ggml_vk_create_pipeline(device, device->pipeline_sum_f32, "sum_f32", sum_f32_len, sum_f32_data, "main", 2, sizeof(vk_op_sum_push_constants), {1, 1, 1}, { 256 }, 1);
@@ -13466,7 +13474,7 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
         return nullptr;
     case GGML_OP_ARGMAX:
         if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_I32) {
-            return ctx->device->pipeline_argmax_f32;
+            return src0->ne[0] >= 4096 ? ctx->device->pipeline_argmax_f32_wide : ctx->device->pipeline_argmax_f32;
         }
         return nullptr;
     case GGML_OP_COUNT_EQUAL:

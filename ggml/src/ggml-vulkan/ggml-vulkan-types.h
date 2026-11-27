@@ -1049,6 +1049,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_cumsum_multipass1_f32;
     vk_pipeline pipeline_cumsum_multipass2_f32;
     vk_pipeline pipeline_argmax_f32;
+    vk_pipeline pipeline_argmax_f32_wide; // one full workgroup per row, for rows as wide as a vocabulary
     vk_pipeline pipeline_count_equal_i32;
     vk_pipeline pipeline_dsv4_hc_comb_f32;
     vk_pipeline pipeline_dsv4_hc_pre_f32;
