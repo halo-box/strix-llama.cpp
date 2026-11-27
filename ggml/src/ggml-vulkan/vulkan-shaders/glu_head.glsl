@@ -35,6 +35,7 @@ layout (push_constant) uniform parameter
     uint ne2_012mp; uint ne2_012L;
     uint ne2_01mp;  uint ne2_01L;
     uint ne2_0mp;   uint ne2_0L;
+    float su1; float su2; float zero;
 } p;
 
 uint get_aoffset() { return p.misalign_offsets >> 16; }
