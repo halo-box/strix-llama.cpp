@@ -10294,8 +10294,10 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             }
         }
         case GGML_OP_SSM_CONV: {
-            // assumes d_inner % threads == 0
-            return op->src[0]->ne[1] % 128 == 0;
+            // assumes d_inner % threads == 0; kernel sizes as instantiated in ssm-conv.cu
+            const int64_t nc = op->src[1]->ne[0];
+            return op->src[0]->ne[1] % 128 == 0 &&
+                   (nc == 3 || nc == 4 || nc == 5 || nc == 7 || nc == 9 || nc == 15);
         }
         case GGML_OP_CONT:
             return true;
